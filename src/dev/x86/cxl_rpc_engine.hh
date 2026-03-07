@@ -29,22 +29,24 @@ namespace gem5
 /**
  * Doorbell entry structure (16 bytes)
  *
- * Byte 0:    method(2b) + inline(1b) + phase_bit(1b) + reserved(4b)
- * Byte 1-2:  service_id (16b)
- * Byte 3-4:  method_id (16b)
- * Byte 5-6:  request_id (16b)
- * Byte 7:    payload_len (8b)
+ * Bits 0-1:    method (2b)
+ * Bit 2:       inline (1b)
+ * Bit 3:       phase_bit (1b)
+ * Bits 4-23:   payload_len (20b)
+ * Bits 24-35:  service_id (12b)
+ * Bits 36-47:  method_id (12b)
+ * Bits 48-63:  request_id (16b)
  * Byte 8-15: inline message or request_data address
  */
 struct DoorbellEntry {
     // Parsed fields (populated by parseFromBuffer)
-    uint8_t method;       // 0=request, 1=response, 2=HEAD_UPDATE
+    uint8_t method;       // 0=request, 1=response, 2=HEAD_UPDATE, 3=CONTROL
     uint8_t is_inline;    // 1=inline message, 0=pointer to request_data
     uint8_t phase_bit;    // Phase bit for wrap-around detection
-    uint16_t service_id;
-    uint16_t method_id;
-    uint32_t request_id;  // Only low 16 bits used
-    uint8_t payload_len;
+    uint16_t service_id;  // low 12 bits used
+    uint16_t method_id;   // low 12 bits used
+    uint32_t request_id;  // low 16 bits used
+    uint32_t payload_len; // low 20 bits used
     uint64_t data;        // Inline message or address
 
     DoorbellEntry() : method(0), is_inline(0), phase_bit(0),

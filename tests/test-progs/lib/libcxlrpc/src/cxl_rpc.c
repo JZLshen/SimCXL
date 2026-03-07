@@ -97,12 +97,6 @@ cxl_request_entry_size(size_t payload_len)
     return ((payload_len + 63) / 64) * 64;
 }
 
-static inline uint32_t
-cxl_pack_request_meta(uint16_t request_id, uint8_t payload_len)
-{
-    return (uint32_t)request_id | ((uint32_t)payload_len << 16);
-}
-
 static inline void
 cxl_invalidate_cacheline(volatile uint8_t *line_addr)
 {
@@ -168,17 +162,20 @@ cxl_mq_invalidate_lines(volatile uint8_t *metadata_queue,
 
 static void cxl_build_doorbell(uint8_t *buf, uint8_t method, uint8_t is_inline,
                                uint16_t service_id, uint16_t method_id,
-                               uint32_t request_meta, uint64_t data)
+                               uint16_t request_id, uint32_t payload_len,
+                               uint64_t data)
 {
     if (!buf)
         return;
 
     /* Fill all 16 bytes directly: [0..7]=header, [8..15]=data (LE). */
     uint64_t header_lo = 0;
-    header_lo |= ((uint64_t)((method & 0x03) | ((is_inline & 0x01) << 2)));
-    header_lo |= ((uint64_t)service_id << 8);
-    header_lo |= ((uint64_t)method_id << 24);
-    header_lo |= ((uint64_t)(request_meta & 0x00FFFFFFu) << 40);
+    header_lo |= ((uint64_t)(method & 0x03u));
+    header_lo |= ((uint64_t)(is_inline & 0x01u) << 2);
+    header_lo |= ((uint64_t)(payload_len & CXL_REQ_META_LEN_MAX) << 4);
+    header_lo |= ((uint64_t)(service_id & 0x0FFFu) << 24);
+    header_lo |= ((uint64_t)(method_id & 0x0FFFu) << 36);
+    header_lo |= ((uint64_t)(request_id & 0xFFFFu) << 48);
 
     memcpy(buf, &header_lo, sizeof(header_lo));
     memcpy(buf + 8, &data, sizeof(data));
@@ -526,7 +523,7 @@ connection_register_remote_translation(cxl_connection_t *conn)
     cxl_build_doorbell(doorbell_buf, CXL_METHOD_CONTROL, 1,
                        CXL_CONTROL_SERVICE_INTERNAL,
                        CXL_CONTROL_METHOD_REGISTER_TRANSLATION,
-                       0, conn->addrs.doorbell_addr);
+                       0, 0, conn->addrs.doorbell_addr);
     /* Publish order: store payload, flush touched cacheline(s), then sfence. */
     memcpy((void *)conn->doorbell, doorbell_buf, CXL_DOORBELL_PUBLISH_LEN);
     uintptr_t line_start = ((uintptr_t)conn->doorbell) & ~((uintptr_t)63);
@@ -604,19 +601,19 @@ cxl_virt_to_phys_local(const void *vaddr, uint64_t *phys_out)
 
 static int
 connection_register_metadata_page_translation(cxl_connection_t *conn,
-                                              uint32_t page_index,
+                                              uint64_t page_index,
                                               uint64_t observed_page_base)
 {
     if (!conn || !conn->doorbell)
         return -1;
 
     uint8_t doorbell_buf[16] __attribute__((aligned(16)));
-    uint32_t page_meta = cxl_pack_request_meta((uint16_t)(page_index & 0xFFFFu),
-                                               (uint8_t)((page_index >> 16) & 0xFFu));
     cxl_build_doorbell(doorbell_buf, CXL_METHOD_CONTROL, 1,
                        CXL_CONTROL_SERVICE_INTERNAL,
                        CXL_CONTROL_METHOD_REGISTER_METADATA_PAGE_TRANSLATION,
-                       page_meta, observed_page_base);
+                       (uint16_t)(page_index & 0xFFFFu),
+                       (uint32_t)((page_index >> 16) & CXL_REQ_META_LEN_MAX),
+                       observed_page_base);
 
     memcpy((void *)conn->doorbell, doorbell_buf, CXL_DOORBELL_PUBLISH_LEN);
     uintptr_t line_start = ((uintptr_t)conn->doorbell) & ~((uintptr_t)63);
@@ -675,7 +672,7 @@ connection_register_metadata_translation_pages(cxl_connection_t *conn,
         observed_page &= page_mask;
 
         const uint64_t page_index64 = (logical_page - page_start) / page_size;
-        if (page_index64 > 0xFFFFFFu) {
+        if (page_index64 > (((uint64_t)CXL_REQ_META_LEN_MAX << 16) | 0xFFFFu)) {
             cxl_lib_errorf("metadata_translation_pages: page index overflow index=%#llx logical_page=%#llx",
                            (unsigned long long)page_index64,
                            (unsigned long long)logical_page);
@@ -683,9 +680,9 @@ connection_register_metadata_translation_pages(cxl_connection_t *conn,
         }
 
         if (connection_register_metadata_page_translation(
-                conn, (uint32_t)page_index64, observed_page) != 0) {
-            cxl_lib_errorf("metadata_translation_pages: register failed page_index=%u observed_page=%#llx",
-                           (unsigned int)page_index64,
+                conn, page_index64, observed_page) != 0) {
+            cxl_lib_errorf("metadata_translation_pages: register failed page_index=%#llx observed_page=%#llx",
+                           (unsigned long long)page_index64,
                            (unsigned long long)observed_page);
             return -1;
         }
@@ -701,7 +698,7 @@ static int connection_reset_remote_state(cxl_connection_t *conn)
 
     uint8_t doorbell_buf[16] __attribute__((aligned(16)));
     cxl_build_doorbell(doorbell_buf, CXL_METHOD_CONTROL, 1,
-                        0, 0, 0, CXL_CONTROL_RESET_STATE);
+                        0, 0, 0, 0, CXL_CONTROL_RESET_STATE);
     /* Publish order: store payload, flush touched cacheline(s), then sfence. */
     memcpy((void *)conn->doorbell, doorbell_buf, CXL_DOORBELL_PUBLISH_LEN);
     uintptr_t line_start = ((uintptr_t)conn->doorbell) & ~((uintptr_t)63);
@@ -1024,11 +1021,13 @@ int32_t cxl_send_request(cxl_connection_t *conn,
                    (unsigned long long)conn->addrs.doorbell_addr,
                    (unsigned long long)conn->addrs.request_data_addr);
 
-    if (len > CXL_REQ_LEN_MAX)
+    if (service_id > 0x0FFFu || method_id > 0x0FFFu)
+        return -1;
+
+    if (len > CXL_REQ_PAYLOAD_SOFT_MAX || len > (size_t)CXL_REQ_META_LEN_MAX)
         return -1;
 
     uint16_t req_id = cxl_generate_request_id(conn);
-    uint32_t req_meta = cxl_pack_request_meta(req_id, (uint8_t)len);
 
     uint8_t doorbell_buf[16] __attribute__((aligned(16)));
 
@@ -1039,7 +1038,8 @@ int32_t cxl_send_request(cxl_connection_t *conn,
             memcpy(&inline_data, data, len);
 
         cxl_build_doorbell(doorbell_buf, CXL_METHOD_REQUEST, 1,
-                            service_id, method_id, req_meta, inline_data);
+                            service_id, method_id, req_id,
+                            (uint32_t)len, inline_data);
     } else {
         /* Non-inline: write request_data entry, then doorbell */
         if (!conn->request_data || conn->addrs.request_data_size == 0)
@@ -1047,7 +1047,8 @@ int32_t cxl_send_request(cxl_connection_t *conn,
 
         /*
          * request_data publish uses 64B cacheline slots.
-         * Metadata byte7 still carries real payload length.
+         * Doorbell header carries full payload length (20 bits), while
+         * request_data stores payload bytes only (no in-band length header).
          */
         size_t entry_size = cxl_request_entry_size(len);
         size_t offset = conn->req_write_offset;
@@ -1058,10 +1059,9 @@ int32_t cxl_send_request(cxl_connection_t *conn,
             offset = 0;
         }
         uint8_t *entry_ptr = (uint8_t *)conn->request_data + offset;
-        uint8_t entry_buf[CXL_REQ_LEN_MAX + 1] __attribute__((aligned(64)));
-        memcpy(entry_buf, data, len);
-        if (entry_size > len)
-            memset(entry_buf + len, 0, entry_size - len);
+        if (len > 0) {
+            memcpy((void *)entry_ptr, data, len);
+        }
 
         /*
          * Publish request_data with exactly the same primitive sequence as
@@ -1069,10 +1069,9 @@ int32_t cxl_send_request(cxl_connection_t *conn,
          */
         uintptr_t req_line_start = ((uintptr_t)entry_ptr) & ~((uintptr_t)63);
         uintptr_t req_line_end =
-            (((uintptr_t)entry_ptr + entry_size) + 63u) & ~((uintptr_t)63);
+            (((uintptr_t)entry_ptr + len) + 63u) & ~((uintptr_t)63);
 
         /* Publish order: store payload, flush touched cacheline(s), then sfence. */
-        memcpy((void *)entry_ptr, entry_buf, entry_size);
         for (uintptr_t line = req_line_start; line < req_line_end;
              line += 64u) {
             __asm__ __volatile__(
@@ -1093,7 +1092,8 @@ int32_t cxl_send_request(cxl_connection_t *conn,
         }
 
         cxl_build_doorbell(doorbell_buf, CXL_METHOD_REQUEST, 0,
-                            service_id, method_id, req_meta, entry_phys);
+                            service_id, method_id, req_id,
+                            (uint32_t)len, entry_phys);
     }
 
     /* Publish doorbell via the same store+flush semantic path as payload. */
@@ -1318,16 +1318,14 @@ int cxl_poll_request(cxl_connection_t *conn,
 
     uint64_t meta_lo = *(volatile uint64_t *)entry;
     uint64_t meta_hi = 0;
-    uint8_t flags = (uint8_t)(meta_lo & 0xFFu);
-
-    uint8_t entry_phase = (flags >> 3) & 0x01;
+    uint8_t entry_phase = (uint8_t)((meta_lo >> 3) & 0x01u);
     uint8_t expected_phase = conn->mq_phase & 0x01;
 
     if (cxl_lib_trace_polls_enabled()) {
-        cxl_lib_debugf("poll_request probe head=%u meta_lo=%#llx flags=%#x entry_phase=%u expected_phase=%u",
+        cxl_lib_debugf("poll_request probe head=%u meta_lo=%#llx flags4=%#x entry_phase=%u expected_phase=%u",
                        head_idx,
                        (unsigned long long)meta_lo,
-                       (unsigned)flags,
+                       (unsigned)(meta_lo & 0x0Fu),
                        (unsigned)entry_phase,
                        (unsigned)expected_phase);
     }
@@ -1366,12 +1364,12 @@ int cxl_poll_request(cxl_connection_t *conn,
     }
 
     /* Parse entry fields */
-    uint8_t mq_method  = flags & 0x03;
-    uint8_t mq_inline  = (flags >> 2) & 0x01;
-    uint16_t svc = (uint16_t)((meta_lo >> 8) & 0xFFFFu);
-    uint16_t mid = (uint16_t)((meta_lo >> 24) & 0xFFFFu);
-    uint32_t rid = (uint32_t)((meta_lo >> 40) & 0xFFFFu);
-    uint8_t mq_len = (uint8_t)((meta_lo >> 56) & 0xFFu);
+    uint8_t mq_method  = (uint8_t)(meta_lo & 0x03u);
+    uint8_t mq_inline  = (uint8_t)((meta_lo >> 2) & 0x01u);
+    uint32_t mq_len = (uint32_t)((meta_lo >> 4) & CXL_REQ_META_LEN_MAX);
+    uint16_t svc = (uint16_t)((meta_lo >> 24) & 0x0FFFu);
+    uint16_t mid = (uint16_t)((meta_lo >> 36) & 0x0FFFu);
+    uint32_t rid = (uint32_t)((meta_lo >> 48) & 0xFFFFu);
 
     if (service_id) *service_id = svc;
     if (method_id)  *method_id  = mid;
@@ -1421,8 +1419,7 @@ int cxl_poll_request(cxl_connection_t *conn,
             }
 
             uint64_t entry_offset = data_addr - region_base;
-            if (entry_offset > region_size ||
-                (uint64_t)mq_len > (region_size - entry_offset)) {
+            if (entry_offset > region_size) {
                 cxl_advance_mq_head_with_policy(conn, head_idx, head_line_idx,
                                                 mq_entries_per_line,
                                                 mq_total_lines,
@@ -1434,17 +1431,24 @@ int cxl_poll_request(cxl_connection_t *conn,
             volatile uint8_t *data_ptr = cxl_rpc_phys_to_virt(conn->ctx,
                                                                 data_addr);
             if (data_ptr) {
-                const volatile uint8_t *payload_ptr = data_ptr;
                 size_t msg_len = (size_t)mq_len;
+                const volatile uint8_t *payload_ptr = data_ptr;
+
+                if (msg_len == 0 ||
+                    (uint64_t)msg_len > (region_size - entry_offset)) {
+                    ret = -1;
+                    goto out;
+                }
+
                 if (msg_len > sizeof(conn->request_local_buf)) {
                     ret = -1;
                     goto out;
                 }
 
                 /* Invalidate payload cacheline(s) before demand-load. */
-                uintptr_t line_start = ((uintptr_t)data_ptr) & ~((uintptr_t)63);
+                uintptr_t line_start = ((uintptr_t)payload_ptr) & ~((uintptr_t)63);
                 uintptr_t line_end =
-                    (((uintptr_t)data_ptr + msg_len) + 63u) &
+                    (((uintptr_t)payload_ptr + msg_len) + 63u) &
                     ~((uintptr_t)63);
                 for (uintptr_t line = line_start; line < line_end;
                      line += 64u) {

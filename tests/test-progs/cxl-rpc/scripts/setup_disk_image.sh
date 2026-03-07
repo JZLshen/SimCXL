@@ -183,6 +183,9 @@ CLIENT_LOG="${CXL_RPC_CLIENT_LOG:-/home/test_code/cxl_rpc_client_runtime.log}"
 CLIENT_LOG_PREFIX="${CXL_RPC_CLIENT_LOG_PREFIX:-/home/test_code/cxl_rpc_client_runtime}"
 SERVER_READY_MARKER="${CXL_RPC_SERVER_READY_MARKER:-server_ready=1}"
 SERVER_READY_TIMEOUT_SEC="${CXL_RPC_SERVER_READY_TIMEOUT_SEC:-60}"
+PIN_CORES="${CXL_RPC_PIN_CORES:-0}"
+SERVER_CORE="${CXL_RPC_SERVER_CORE:-0}"
+CLIENT_CORE_BASE="${CXL_RPC_CLIENT_CORE_BASE:-1}"
 
 if ! [[ "$CLIENT_COUNT" =~ ^[0-9]+$ ]] || [ "$CLIENT_COUNT" -le 0 ]; then
     echo "ERROR: CXL_RPC_CLIENT_COUNT must be a positive integer"
@@ -197,6 +200,19 @@ fi
 if [ "$CLIENT_TIMEOUT_SEC" -gt 0 ] && ! command -v timeout >/dev/null 2>&1; then
     echo "ERROR: timeout command not found in guest while timeout is enabled"
     exit 2
+fi
+
+if [ "$PIN_CORES" != "0" ]; then
+    if ! command -v taskset >/dev/null 2>&1; then
+        echo "ERROR: taskset command not found in guest while CXL_RPC_PIN_CORES is enabled"
+        exit 2
+    fi
+    cpu_total="$(nproc 2>/dev/null || echo 0)"
+    cpu_need=$((CLIENT_COUNT + 1))
+    if [[ "$cpu_total" =~ ^[0-9]+$ ]] && [ "$cpu_total" -lt "$cpu_need" ]; then
+        echo "ERROR: need at least ${cpu_need} CPUs (server+clients), but nproc=${cpu_total}"
+        exit 2
+    fi
 fi
 
 if [ -z "$SERVER_MAX_REQUESTS" ]; then
@@ -259,6 +275,11 @@ echo "Client count: $CLIENT_COUNT"
 echo "Client timeout sec: $CLIENT_TIMEOUT_SEC"
 echo "Server CXL map node: $SERVER_NUMA_NODE"
 echo "Client CXL map node: $CLIENT_NUMA_NODE"
+echo "Pin cores: $PIN_CORES"
+if [ "$PIN_CORES" != "0" ]; then
+    echo "Server core: $SERVER_CORE"
+    echo "Client core base: $CLIENT_CORE_BASE"
+fi
 echo "Server log: $SERVER_LOG"
 if [ "$CLIENT_COUNT" -eq 1 ]; then
     echo "Client log: $CLIENT_LOG"
@@ -273,8 +294,14 @@ echo ""
 
 echo "Starting server..."
 : > "$SERVER_LOG"
-# shellcheck disable=SC2086
-CXL_RPC_NUMA_NODE="$SERVER_NUMA_NODE" "$SERVER" $SERVER_ARGS >"$SERVER_LOG" 2>&1 &
+if [ "$PIN_CORES" != "0" ]; then
+    # shellcheck disable=SC2086
+    CXL_RPC_NUMA_NODE="$SERVER_NUMA_NODE" taskset -c "$SERVER_CORE" \
+        "$SERVER" $SERVER_ARGS >"$SERVER_LOG" 2>&1 &
+else
+    # shellcheck disable=SC2086
+    CXL_RPC_NUMA_NODE="$SERVER_NUMA_NODE" "$SERVER" $SERVER_ARGS >"$SERVER_LOG" 2>&1 &
+fi
 SERVER_PID=$!
 
 echo "Waiting for server ready marker: $SERVER_READY_MARKER"
@@ -308,6 +335,7 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
     CLIENT_LOGS[$i]="$log"
     : > "$log"
     echo "Starting client[$i]..."
+    client_core=$((CLIENT_CORE_BASE + i))
 
     client_cmd=("$CLIENT" "$@")
     if [ "$CLIENT_COUNT" -gt 1 ]; then
@@ -315,12 +343,23 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
     fi
 
     if [ "$CLIENT_TIMEOUT_SEC" -gt 0 ]; then
-        CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" timeout --signal=TERM --kill-after=2 \
-            "${CLIENT_TIMEOUT_SEC}s" \
-            "${client_cmd[@]}" >"$log" 2>&1 &
+        if [ "$PIN_CORES" != "0" ]; then
+            CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" timeout --signal=TERM --kill-after=2 \
+                "${CLIENT_TIMEOUT_SEC}s" \
+                taskset -c "$client_core" "${client_cmd[@]}" >"$log" 2>&1 &
+        else
+            CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" timeout --signal=TERM --kill-after=2 \
+                "${CLIENT_TIMEOUT_SEC}s" \
+                "${client_cmd[@]}" >"$log" 2>&1 &
+        fi
     else
-        CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-            "${client_cmd[@]}" >"$log" 2>&1 &
+        if [ "$PIN_CORES" != "0" ]; then
+            CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                taskset -c "$client_core" "${client_cmd[@]}" >"$log" 2>&1 &
+        else
+            CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                "${client_cmd[@]}" >"$log" 2>&1 &
+        fi
     fi
     CLIENT_PIDS[$i]=$!
 done

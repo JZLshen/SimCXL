@@ -38,10 +38,10 @@ extern "C" {
  *
  * REGISTER_METADATA_PAGE_TRANSLATION keeps the api-numa backend and teaches
  * the controller the observed GPA of each metadata page explicitly.
- * request_id[15:0] + payload_len[7:0] encode the metadata page index relative
+ * request_id[15:0] + payload_len[19:0] encode the metadata page index relative
  * to metadata_queue_addr, while data[63:0] carries the observed page base GPA.
  */
-#define CXL_CONTROL_SERVICE_INTERNAL                      0xC7A1u
+#define CXL_CONTROL_SERVICE_INTERNAL                      0x07A1u
 #define CXL_CONTROL_METHOD_REGISTER_TRANSLATION           0x0001u
 #define CXL_CONTROL_METHOD_REGISTER_METADATA_PAGE_TRANSLATION 0x0002u
 #define CXL_CONTROL_RESET_STATE 1
@@ -56,12 +56,13 @@ extern "C" {
 /*
  * Request entry format (non-inline request_data entries):
  *
- * Byte 0- : payload bytes only (no request header).
- * Storage slot is cacheline-rounded (64B aligned start, 64B-multiple span).
- * Bytes after payload_len in the slot are padding bytes.
+ * - byte 0.. : payload bytes only (no request header).
  *
- * Request payload length is carried in metadata byte 7 for both inline and
- * non-inline request doorbells.
+ * Storage slot is cacheline-rounded (64B aligned start, 64B-multiple span).
+ * Bytes after the published payload region in the slot are reserved.
+ *
+ * Request payload length is carried in metadata header bits [23:4] (20 bits)
+ * for both inline and non-inline requests.
  *
  */
 /* Metadata queue entry size: 16B (4 entries per 64B cacheline). */
@@ -195,8 +196,9 @@ int cxl_connection_set_request_id_prefix(cxl_connection_t *conn,
  * If len <= 8, uses inline mode (data in doorbell).
  * Otherwise, writes request_data payload + doorbell reference.
  *
- * Metadata byte 7 carries payload length for both modes, so current
- * implementation supports len in [0, 255].
+ * Payload length is encoded in metadata header bits [23:4] (20 bits).
+ * Current software limit is 256 KiB.
+ * service_id and method_id are encoded as 12-bit fields.
  *
  * @param conn       Connection handle
  * @param service_id Target service

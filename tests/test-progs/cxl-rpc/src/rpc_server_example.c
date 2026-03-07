@@ -6,6 +6,7 @@
  */
 
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -50,22 +51,17 @@
 
 #define DEFAULT_MAX_REQUESTS 0
 #define DEFAULT_IDLE_PAUSE_ITERS 0
-
-#define ADD_REQ_MAGIC 0xADDA110Cu
-#define ADD_RESP_OK 0x600DCAFEu
-#define ADD_RESP_BAD 0xBAD00BADu
+#define DEFAULT_RESPONSE_SIZE 16
+#define MIN_RESPONSE_SIZE 8
+#define MAX_RESPONSE_SIZE (256u * 1024u)
 
 typedef struct __attribute__((packed)) {
-    int64_t a;
-    int64_t b;
-    uint32_t seq;
-    uint32_t magic;
+    uint32_t lhs;
+    uint32_t rhs;
 } add_request_t;
 
 typedef struct __attribute__((packed)) {
-    int64_t sum;
-    uint32_t seq;
-    uint32_t status;
+    uint64_t sum;
 } add_response_t;
 
 static volatile int keep_running = 1;
@@ -96,6 +92,69 @@ parse_int_arg_range(int argc, char **argv, const char *flag, int default_val,
         }
     }
     return default_val;
+}
+
+static int
+parse_size_literal(const char *s, size_t min_val, size_t max_val, size_t *out)
+{
+    if (!s || !out)
+        return -1;
+
+    char *end = NULL;
+    unsigned long long raw = strtoull(s, &end, 10);
+    if (end == s)
+        return -1;
+
+    unsigned long long mul = 1;
+    if (*end != '\0') {
+        char c0 = (char)toupper((unsigned char)end[0]);
+        if (c0 == 'B' && end[1] == '\0') {
+            mul = 1;
+        } else if (c0 == 'K') {
+            if (end[1] == '\0' ||
+                (toupper((unsigned char)end[1]) == 'B' && end[2] == '\0')) {
+                mul = 1024ULL;
+            } else {
+                return -1;
+            }
+        } else if (c0 == 'M') {
+            if (end[1] == '\0' ||
+                (toupper((unsigned char)end[1]) == 'B' && end[2] == '\0')) {
+                mul = 1024ULL * 1024ULL;
+            } else {
+                return -1;
+            }
+        } else {
+            return -1;
+        }
+    }
+
+    unsigned long long v = raw * mul;
+    if (mul != 0 && raw != 0 && (v / mul) != raw)
+        return -1;
+    if (v < (unsigned long long)min_val || v > (unsigned long long)max_val)
+        return -1;
+
+    *out = (size_t)v;
+    return 0;
+}
+
+static int
+parse_size_arg(int argc, char **argv, const char *flag, size_t default_val,
+               size_t min_val, size_t max_val, size_t *out)
+{
+    if (!out)
+        return -1;
+    *out = default_val;
+
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], flag) == 0) {
+            if (parse_size_literal(argv[i + 1], min_val, max_val, out) != 0)
+                return -1;
+            return 0;
+        }
+    }
+    return 0;
 }
 
 static inline uint64_t
@@ -147,6 +206,7 @@ main(int argc, char **argv)
     cxl_context_t *ctx = NULL;
     cxl_connection_t *poll_conn = NULL;
     cxl_connection_t *resp_conns[MAX_CLIENTS] = {0};
+    uint8_t *resp_payload = NULL;
 
     int max_requests = parse_int_arg(argc, argv, "--max-requests",
                                      DEFAULT_MAX_REQUESTS);
@@ -154,6 +214,13 @@ main(int argc, char **argv)
                                          DEFAULT_IDLE_PAUSE_ITERS);
     int num_clients = parse_int_arg_range(argc, argv, "--num-clients", 1,
                                           1, MAX_CLIENTS);
+    size_t response_size = DEFAULT_RESPONSE_SIZE;
+    if (parse_size_arg(argc, argv, "--response-size", DEFAULT_RESPONSE_SIZE,
+                       MIN_RESPONSE_SIZE, MAX_RESPONSE_SIZE,
+                       &response_size) != 0) {
+        fprintf(stderr, "server: invalid --response-size\n");
+        return 1;
+    }
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -222,6 +289,13 @@ main(int argc, char **argv)
         }
     }
 
+    resp_payload = (uint8_t *)malloc(response_size);
+    if (!resp_payload) {
+        fprintf(stderr, "server: allocate response buffer failed\n");
+        rc = 1;
+        goto cleanup;
+    }
+
     printf("server_ready=1\n");
 
     uint8_t req_id_tag_bits = client_tag_bits(num_clients);
@@ -253,15 +327,14 @@ main(int argc, char **argv)
 
             const volatile add_request_t *req_view =
                 (const volatile add_request_t *)req_data_view;
-            add_response_t resp = {
-                .sum = req_view->a + req_view->b,
-                .seq = req_view->seq,
-                .status = (req_view->magic == ADD_REQ_MAGIC) ?
-                          ADD_RESP_OK : ADD_RESP_BAD,
+            add_response_t add_resp = {
+                .sum = (uint64_t)req_view->lhs + (uint64_t)req_view->rhs,
             };
+            memset(resp_payload, 0, response_size);
+            memcpy(resp_payload, &add_resp, sizeof(add_resp));
 
             if (cxl_send_response(resp_conns[client_id], request_id,
-                                  &resp, sizeof(resp)) < 0) {
+                                  resp_payload, response_size) < 0) {
                 fprintf(stderr, "server: send response failed\n");
                 rc = 1;
                 break;
@@ -283,6 +356,8 @@ main(int argc, char **argv)
     }
 
 cleanup:
+    free(resp_payload);
+
     for (int i = 0; i < num_clients; i++) {
         if (resp_conns[i] && resp_conns[i] != poll_conn) {
             cxl_connection_destroy(resp_conns[i]);
@@ -301,4 +376,3 @@ cleanup:
 
     return rc ? 1 : 0;
 }
-

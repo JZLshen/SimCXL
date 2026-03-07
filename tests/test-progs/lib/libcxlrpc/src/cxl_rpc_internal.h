@@ -7,7 +7,9 @@
 #include "cxl_rpc.h"
 
 #define CXL_REQ_ID_MASK            0x0000FFFFu
-#define CXL_REQ_LEN_MAX            0xFFu
+#define CXL_REQ_META_LEN_BITS      20u
+#define CXL_REQ_META_LEN_MAX       ((1u << CXL_REQ_META_LEN_BITS) - 1u)
+#define CXL_REQ_PAYLOAD_SOFT_MAX   (256u * 1024u)
 #define CXL_DOORBELL_ENTRY_LEN     16u
 #define CXL_DOORBELL_PUBLISH_LEN   16u
 #define CXL_FLAG_PUBLISH_LEN       4u
@@ -57,7 +59,7 @@ struct cxl_connection {
 
     uint64_t peer_request_data_addr;
     size_t peer_request_data_size;
-    uint8_t request_local_buf[CXL_REQ_LEN_MAX + 1];
+    uint8_t request_local_buf[CXL_REQ_PAYLOAD_SOFT_MAX + 1];
 
     int ce_init_attempted;
     int ce_ready;

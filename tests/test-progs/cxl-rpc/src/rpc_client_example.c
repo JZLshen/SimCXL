@@ -8,6 +8,7 @@
  */
 
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -55,18 +56,21 @@
 #define DEFAULT_NUM_REQUESTS 20
 #define DEFAULT_MAX_POLLS 1000000
 #define DEFAULT_POLL_PAUSE_ITERS 0
+#define DEFAULT_REQUEST_SIZE 64
+#define DEFAULT_RESPONSE_SIZE 16
+#define MIN_REQUEST_SIZE 8
+#define MIN_RESPONSE_SIZE 8
+#define MAX_REQUEST_SIZE (256u * 1024u)
+#define MAX_RESPONSE_SIZE (256u * 1024u)
 
 #define SERVICE_ID 1
 #define METHOD_ID_ADD 100
 
 typedef struct __attribute__((packed)) {
-    int64_t a;
-    int64_t b;
-    uint32_t seq;
-    uint32_t magic;
+    uint32_t lhs;
+    uint32_t rhs;
 } add_request_t;
 
-#define ADD_REQ_MAGIC 0xADDA110Cu
 #define REQ_ID_SPACE (1u << 16)
 
 static volatile int keep_running = 1;
@@ -75,6 +79,18 @@ static inline uint64_t
 current_tick(void)
 {
     return m5_rpns();
+}
+
+static inline uint32_t
+next_random_u32(uint32_t *state)
+{
+    uint32_t value = (state && *state != 0) ? *state : 0x6D2B79F5u;
+    value ^= value << 13;
+    value ^= value >> 17;
+    value ^= value << 5;
+    if (state)
+        *state = value;
+    return value;
 }
 
 static int
@@ -117,6 +133,69 @@ parse_int_arg_range(int argc, char **argv, const char *flag, int default_val,
     return default_val;
 }
 
+static int
+parse_size_literal(const char *s, size_t min_val, size_t max_val, size_t *out)
+{
+    if (!s || !out)
+        return -1;
+
+    char *end = NULL;
+    unsigned long long raw = strtoull(s, &end, 10);
+    if (end == s)
+        return -1;
+
+    unsigned long long mul = 1;
+    if (*end != '\0') {
+        char c0 = (char)toupper((unsigned char)end[0]);
+        if (c0 == 'B' && end[1] == '\0') {
+            mul = 1;
+        } else if (c0 == 'K') {
+            if (end[1] == '\0' ||
+                (toupper((unsigned char)end[1]) == 'B' && end[2] == '\0')) {
+                mul = 1024ULL;
+            } else {
+                return -1;
+            }
+        } else if (c0 == 'M') {
+            if (end[1] == '\0' ||
+                (toupper((unsigned char)end[1]) == 'B' && end[2] == '\0')) {
+                mul = 1024ULL * 1024ULL;
+            } else {
+                return -1;
+            }
+        } else {
+            return -1;
+        }
+    }
+
+    unsigned long long v = raw * mul;
+    if (mul != 0 && raw != 0 && (v / mul) != raw)
+        return -1;
+    if (v < (unsigned long long)min_val || v > (unsigned long long)max_val)
+        return -1;
+
+    *out = (size_t)v;
+    return 0;
+}
+
+static int
+parse_size_arg(int argc, char **argv, const char *flag, size_t default_val,
+               size_t min_val, size_t max_val, size_t *out)
+{
+    if (!out)
+        return -1;
+    *out = default_val;
+
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], flag) == 0) {
+            if (parse_size_literal(argv[i + 1], min_val, max_val, out) != 0)
+                return -1;
+            return 0;
+        }
+    }
+    return 0;
+}
+
 static inline uint64_t
 client_region_base(int client_id)
 {
@@ -139,6 +218,7 @@ client_tag_bits(int num_clients)
 static int
 wait_for_response_tick(cxl_connection_t *conn, int32_t req_id,
                        int max_polls, int poll_pause_iters,
+                       size_t expected_resp_len,
                        uint64_t *end_tick_out)
 {
     if (end_tick_out)
@@ -156,6 +236,12 @@ wait_for_response_tick(cxl_connection_t *conn, int32_t req_id,
                                               &payload_view, &resp_len,
                                               &got_req_id);
         if (poll_ret == 1) {
+            if (expected_resp_len > 0 && resp_len != expected_resp_len) {
+                fprintf(stderr,
+                        "client: response size mismatch expect=%zu got=%zu\n",
+                        expected_resp_len, resp_len);
+                return -1;
+            }
             if (end_tick_out)
                 *end_tick_out = current_tick();
             return 1;
@@ -188,6 +274,7 @@ main(int argc, char **argv)
     cxl_connection_t *conn = NULL;
     uint64_t *start_ticks = NULL;
     uint64_t *end_ticks = NULL;
+    uint8_t *req_payload = NULL;
 
     int num_requests = parse_int_arg(argc, argv, "--requests",
                                      DEFAULT_NUM_REQUESTS);
@@ -208,6 +295,22 @@ main(int argc, char **argv)
         fprintf(stderr,
                 "client: client_id=%d must be < num_clients=%d\n",
                 client_id, num_clients);
+        return 1;
+    }
+
+    size_t request_size = DEFAULT_REQUEST_SIZE;
+    if (parse_size_arg(argc, argv, "--request-size", DEFAULT_REQUEST_SIZE,
+                       MIN_REQUEST_SIZE, MAX_REQUEST_SIZE,
+                       &request_size) != 0) {
+        fprintf(stderr, "client: invalid --request-size (range 8B..256KB)\n");
+        return 1;
+    }
+
+    size_t response_size = DEFAULT_RESPONSE_SIZE;
+    if (parse_size_arg(argc, argv, "--response-size", DEFAULT_RESPONSE_SIZE,
+                       MIN_RESPONSE_SIZE, MAX_RESPONSE_SIZE,
+                       &response_size) != 0) {
+        fprintf(stderr, "client: invalid --response-size\n");
         return 1;
     }
 
@@ -261,17 +364,38 @@ main(int argc, char **argv)
         goto cleanup;
     }
 
+    req_payload = (uint8_t *)malloc(request_size);
+    if (!req_payload) {
+        fprintf(stderr, "client: allocate request payload failed\n");
+        rc = 1;
+        goto cleanup;
+    }
+
+    uint32_t rng_state =
+        (uint32_t)(current_tick() ^
+                   ((uint64_t)(client_id + 1) * 0x9E3779B97F4A7C15ULL));
+    if (rng_state == 0)
+        rng_state = 0xA5A5A5A5u ^ (uint32_t)(client_id + 1);
+
     for (int i = 0; keep_running && i < num_requests; i++) {
-        add_request_t req = {
-            .a = (int64_t)(i + 1),
-            .b = (int64_t)(0x10000 + i),
-            .seq = (uint32_t)i,
-            .magic = ADD_REQ_MAGIC,
+        add_request_t add_req = {
+            .lhs = next_random_u32(&rng_state),
+            .rhs = next_random_u32(&rng_state),
         };
+        memcpy(req_payload, &add_req, sizeof(add_req));
+
+        for (size_t k = sizeof(add_req); k < request_size;) {
+            uint32_t random_word = next_random_u32(&rng_state);
+            size_t remain = request_size - k;
+            size_t chunk = remain < sizeof(random_word) ? remain :
+                           sizeof(random_word);
+            memcpy(req_payload + k, &random_word, chunk);
+            k += chunk;
+        }
 
         uint64_t start_tick = current_tick();
         int32_t req_id = cxl_send_request(conn, SERVICE_ID, METHOD_ID_ADD,
-                                          &req, sizeof(req));
+                                          req_payload, request_size);
         if (req_id <= 0 || req_id >= (int32_t)REQ_ID_SPACE) {
             fprintf(stderr, "client: cxl_send_request failed\n");
             rc = 1;
@@ -280,7 +404,8 @@ main(int argc, char **argv)
 
         uint64_t end_tick = 0;
         int poll_rc = wait_for_response_tick(conn, req_id, max_polls,
-                                             poll_pause_iters, &end_tick);
+                                             poll_pause_iters, response_size,
+                                             &end_tick);
         if (poll_rc < 0) {
             rc = 1;
             break;
@@ -331,7 +456,7 @@ cleanup:
 
     free(start_ticks);
     free(end_ticks);
+    free(req_payload);
 
     return rc ? 1 : 0;
 }
-

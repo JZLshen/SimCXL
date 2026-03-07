@@ -19,7 +19,7 @@ namespace
 {
 
 constexpr uint32_t kControlResetClientState = 1u;
-constexpr uint16_t kControlInternalService = 0xC7A1u;
+constexpr uint16_t kControlInternalService = 0x07A1u;
 constexpr uint16_t kControlRegisterTranslation = 0x0001u;
 constexpr uint16_t kControlRegisterMetadataPageTranslation = 0x0002u;
 constexpr Addr kDoorbellSlotStride = 0x40;
@@ -64,22 +64,15 @@ rangesOverlap(Addr aStart, Addr aEnd, Addr bStart, Addr bEnd)
 // DoorbellEntry methods
 void DoorbellEntry::parseFromBuffer(const uint8_t* buf)
 {
-    // Byte 0: flags
-    uint8_t flags = buf[0];
-    method = flags & 0x03;
-    is_inline = (flags >> 2) & 0x01;
-    phase_bit = (flags >> 3) & 0x01;
-
-    // Bytes 1-2: service_id (little endian)
-    service_id = buf[1] | (static_cast<uint16_t>(buf[2]) << 8);
-
-    // Bytes 3-4: method_id (little endian)
-    method_id = buf[3] | (static_cast<uint16_t>(buf[4]) << 8);
-
-    // Bytes 5-6: request_id (16-bit, little endian)
-    request_id = buf[5] | (static_cast<uint32_t>(buf[6]) << 8);
-    // Byte 7: payload length
-    payload_len = buf[7];
+    uint64_t header = 0;
+    std::memcpy(&header, buf, sizeof(header));
+    method = static_cast<uint8_t>(header & 0x03u);
+    is_inline = static_cast<uint8_t>((header >> 2) & 0x01u);
+    phase_bit = static_cast<uint8_t>((header >> 3) & 0x01u);
+    payload_len = static_cast<uint32_t>((header >> 4) & 0xFFFFFu);
+    service_id = static_cast<uint16_t>((header >> 24) & 0x0FFFu);
+    method_id = static_cast<uint16_t>((header >> 36) & 0x0FFFu);
+    request_id = static_cast<uint32_t>((header >> 48) & 0xFFFFu);
 
     // Bytes 8-15: data (64-bit, little endian)
     std::memcpy(&data, buf + 8, sizeof(data));
@@ -87,24 +80,15 @@ void DoorbellEntry::parseFromBuffer(const uint8_t* buf)
 
 void DoorbellEntry::serializeToBuffer(uint8_t* buf) const
 {
-    // Byte 0: flags
-    buf[0] = (method & 0x03) |
-             ((is_inline & 0x01) << 2) |
-             ((phase_bit & 0x01) << 3);
-
-    // Bytes 1-2: service_id (little endian)
-    buf[1] = service_id & 0xFF;
-    buf[2] = (service_id >> 8) & 0xFF;
-
-    // Bytes 3-4: method_id (little endian)
-    buf[3] = method_id & 0xFF;
-    buf[4] = (method_id >> 8) & 0xFF;
-
-    // Bytes 5-6: request_id (16-bit, little endian)
-    buf[5] = request_id & 0xFF;
-    buf[6] = (request_id >> 8) & 0xFF;
-    // Byte 7: payload length
-    buf[7] = payload_len;
+    uint64_t header = 0;
+    header |= static_cast<uint64_t>(method & 0x03u);
+    header |= static_cast<uint64_t>(is_inline & 0x01u) << 2;
+    header |= static_cast<uint64_t>(phase_bit & 0x01u) << 3;
+    header |= static_cast<uint64_t>(payload_len & 0xFFFFFu) << 4;
+    header |= static_cast<uint64_t>(service_id & 0x0FFFu) << 24;
+    header |= static_cast<uint64_t>(method_id & 0x0FFFu) << 36;
+    header |= static_cast<uint64_t>(request_id & 0xFFFFu) << 48;
+    std::memcpy(buf, &header, sizeof(header));
 
     // Bytes 8-15: data (64-bit, little endian)
     std::memcpy(buf + 8, &data, sizeof(data));
@@ -399,10 +383,14 @@ CXLRPCEngine::handleDoorbellWrite(PacketPtr pkt)
     DoorbellEntry entry;
     entry.parseFromBuffer(raw);
 
-    DPRINTF(CXLRPCEngine, "Doorbell write: method=%d, service=%d, method_id=%d, "
-            "request_id=%d, len=%d, inline=%d\n",
-            entry.method, entry.service_id, entry.method_id,
-            entry.request_id, entry.payload_len, entry.is_inline);
+    DPRINTF(CXLRPCEngine, "Doorbell write: method=%u, service=%u, method_id=%u, "
+            "request_id=%u, len=%u, inline=%u\n",
+            static_cast<unsigned>(entry.method),
+            static_cast<unsigned>(entry.service_id),
+            static_cast<unsigned>(entry.method_id),
+            static_cast<unsigned>(entry.request_id),
+            static_cast<unsigned>(entry.payload_len),
+            static_cast<unsigned>(entry.is_inline));
 
     return processDoorbellEntry(*conn, base_addr, entry, pkt);
 }
@@ -649,9 +637,9 @@ CXLRPCEngine::processControl(ClientConnection& conn, const DoorbellEntry& entry)
         entry.method_id == kControlRegisterMetadataPageTranslation) {
         constexpr Addr kMetadataPageSize = 0x1000;
         constexpr Addr kMetadataPageMask = ~(kMetadataPageSize - 1);
-        const uint32_t pageIndex =
-            (entry.request_id & 0xFFFFu) |
-            (static_cast<uint32_t>(entry.payload_len) << 16);
+        const uint64_t pageIndex =
+            (static_cast<uint64_t>(entry.request_id & 0xFFFFu)) |
+            (static_cast<uint64_t>(entry.payload_len & 0xFFFFFu) << 16);
         const Addr logicalPage =
             (conn.metadata_queue_logical_base & kMetadataPageMask) +
             (static_cast<Addr>(pageIndex) * kMetadataPageSize);
@@ -663,8 +651,10 @@ CXLRPCEngine::processControl(ClientConnection& conn, const DoorbellEntry& entry)
 
         DPRINTF(CXLRPCEngine,
                 "Control REGISTER_METADATA_PAGE_TRANSLATION for client %u "
-                "page=%u logical=%#x observed=%#x\n",
-                conn.client_id, pageIndex, logicalPage, observedPage);
+                "page=%#llx logical=%#x observed=%#x\n",
+                conn.client_id,
+                static_cast<unsigned long long>(pageIndex),
+                logicalPage, observedPage);
         return DoorbellHandleResult::Handled;
     }
 
