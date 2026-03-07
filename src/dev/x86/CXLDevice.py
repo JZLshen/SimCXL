@@ -1,6 +1,7 @@
 from m5.params import *
 from m5.objects.PciDevice import *
 from m5.objects.XBar import CXLMemBar
+from m5.objects.CXLRPCEngine import CXLRPCEngine
 
 
 class CXLMemCtrl(PciDevice):
@@ -17,9 +18,12 @@ class CXLMemCtrl(PciDevice):
 
     rsp_size = Param.Unsigned(48, "The number of responses to buffer")
     req_size = Param.Unsigned(48, "The number of requests to buffer")
-    
+
     proto_proc_lat = Param.Latency("15ns", "Latency of the CXL controller processing CXL.mem sub-protocol packets")
     cxl_mem_range = Param.AddrRange("2GB", "CXL expander memory range that can be identified as system memory")
+
+    # RPC Engine for shared memory RPC (optional)
+    rpc_engine = Param.CXLRPCEngine(NULL, "RPC Engine for doorbell interception")
 
     VendorID = 0x8086
     DeviceID = 0X7890

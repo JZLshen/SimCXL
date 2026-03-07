@@ -1,2 +1,13 @@
 testing-results
 gem5/resources
+
+# Object/archive outputs under tests.
+**/*.o
+**/*.a
+
+# cxl-rpc test binaries.
+test-progs/cxl-rpc/rpc_client_example
+test-progs/cxl-rpc/rpc_server_example
+test-progs/cxl-rpc/cxl_mem_ldst_latency
+test-progs/cxl-rpc/cxl_mem_paper_latency
+test-progs/cxl-rpc/cxl_mem_copy_cmp

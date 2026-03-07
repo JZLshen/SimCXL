@@ -29,6 +29,7 @@
 #ifndef __CPU_KVM_X86_CPU_HH__
 #define __CPU_KVM_X86_CPU_HH__
 
+#include <mutex>
 #include <vector>
 
 #include "arch/x86/pcstate.hh"
@@ -253,6 +254,8 @@ class X86KvmCPU : public BaseKvmCPU
 
     /** Cached intersection of supported MSRs */
     mutable Kvm::MSRIndexVector cachedMsrIntersection;
+    mutable std::mutex cachedMsrIntersectionMutex;
+    mutable bool cachedMsrIntersectionValid = false;
 
     /** @{ */
     /** Kvm::capDebugRegs() available? */

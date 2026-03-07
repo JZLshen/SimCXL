@@ -200,7 +200,8 @@ class PrivateL1PrivateL2SharedL3CacheHierarchy(
             size="256kB",
             tgts_per_mshr=12,
             write_buffers=32,
-            addr_ranges=board.mem_ranges,
+            # Cache only real DRAM data range; avoid claiming PCI/MMIO hole.
+            addr_ranges=[board.mem_ranges[0]],
         )
         self.iocache.mem_side = self.membus.cpu_side_ports
         self.iocache.cpu_side = board.get_mem_side_coherent_io_port()

@@ -39,6 +39,7 @@
 #ifndef __CPU_KVM_KVMVM_HH__
 #define __CPU_KVM_KVMVM_HH__
 
+#include <mutex>
 #include <vector>
 
 #include "base/addr_range.hh"
@@ -202,9 +203,13 @@ class Kvm
   private: // x86-specific
     /** Cached vector of supported CPUID entries. */
     mutable CPUIDVector supportedCPUIDCache;
+    /** Thread-safe one-time init for supportedCPUIDCache. */
+    mutable std::once_flag supportedCPUIDOnce;
 
     /** Cached vector of supported MSRs. */
     mutable MSRIndexVector supportedMSRCache;
+    /** Thread-safe one-time init for supportedMSRCache. */
+    mutable std::once_flag supportedMSROnce;
 
 
     /** @} */

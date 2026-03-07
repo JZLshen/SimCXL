@@ -135,7 +135,7 @@ class BaseKvmCPU : public BaseCPU
      * Send a signal to the thread owning this vCPU to get it to exit
      * from KVM. Ignored if the vCPU is not executing.
      */
-    void kick() const { pthread_kill(vcpuThread, KVM_KICK_SIGNAL); }
+    void kick() const;
 
     /**
      * A cached copy of a thread's state in the form of a SimpleThread
@@ -661,6 +661,9 @@ class BaseKvmCPU : public BaseCPU
 
     /** ID of the vCPU thread */
     pthread_t vcpuThread;
+
+    /** True once restartEqThread() bound vcpuThread to an event-queue thread. */
+    bool vcpuThreadValid;
 
   private:
     /**

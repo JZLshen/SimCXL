@@ -217,8 +217,18 @@ class DmaPort : public RequestPort, public Drainable
 
 class DmaDevice : public PioDevice
 {
-   protected:
+  protected:
     DmaPort dmaPort;
+
+    /**
+     * Override in devices that exclusively use other DMA ports (e.g. vector
+     * channel ports) and therefore do not require this default scalar port.
+     */
+    virtual bool
+    allowUnconnectedDefaultDmaPort() const
+    {
+        return false;
+    }
 
   public:
     typedef DmaDeviceParams Params;

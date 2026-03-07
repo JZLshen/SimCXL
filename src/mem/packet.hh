@@ -1466,7 +1466,12 @@ class Packet : public Printable, public Extensible<Packet>
     bool
     isMaskedWrite() const
     {
-        return (cmd == MemCmd::WriteReq && req->isMasked());
+        /*
+         * Masked writes are not limited to CPU-originated WriteReq packets.
+         * CXL RPC doorbell remap can mark writeback-class packets with byte
+         * enables so metadata queue updates only touch the intended bytes.
+         */
+        return isWrite() && req->isMasked();
     }
 
     /**

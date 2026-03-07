@@ -169,6 +169,13 @@ class CopyEngine : public PciDevice
     CopyEngine(const Params &params);
     ~CopyEngine();
 
+  protected:
+    bool
+    allowUnconnectedDefaultDmaPort() const override
+    {
+        return true;
+    }
+
     Port &getPort(const std::string &if_name,
             PortID idx = InvalidPortID) override;
 

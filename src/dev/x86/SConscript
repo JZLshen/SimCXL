@@ -47,6 +47,11 @@ DebugFlag('CXLMemCtrl', tags='x86 isa')
 DebugFlag('CXLRange', tags='x86 isa')
 DebugFlag('CXLType1Accel', tags='x86 isa')
 
+# CXL RPC Engine for shared memory RPC
+SimObject('CXLRPCEngine.py', sim_objects=['CXLRPCEngine'], tags='x86 isa')
+Source('cxl_rpc_engine.cc', tags='x86 isa')
+DebugFlag('CXLRPCEngine', 'CXL RPC Engine doorbell and metadata queue', tags='x86 isa')
+
 SimObject('I8259.py', sim_objects=['I8259'], enums=['X86I8259CascadeMode'],
     tags='x86 isa')
 Source('i8259.cc', tags='x86 isa')

@@ -40,6 +40,7 @@ from m5.objects import (
     CowDiskImage,
     IdeDisk,
     IOXBar,
+    CopyEngine,
     Pc,
     Port,
     RawDiskImage,
@@ -52,6 +53,7 @@ from m5.objects import (
     X86IntelMPProcessor,
     X86SMBiosBiosInformation,
 )
+from m5.objects.CXLRPCEngine import CXLRPCEngine
 from m5.params import Latency
 from m5.util.convert import toMemorySize
 
@@ -105,6 +107,10 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         self.pc = Pc()
         # cxl_device is dynamically initialized and attached
         self.pc.south_bridge.cxl_device = CXLMemCtrl(pci_func=0, pci_dev=6, pci_bus=0)
+        # Dedicated DMA copy engine (IOAT-like) for async payload offload.
+        self.pc.south_bridge.copy_engine = CopyEngine(
+            pci_func=0, pci_dev=7, pci_bus=0, ChanCnt=1,
+        )
 
         self.workload = X86FsLinux()
 
@@ -133,7 +139,10 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
 
         # Configure CXL Device
         cxl_dram = self._cxl_memory_ptr
-        cxl_mem_range = AddrRange(Addr(0x100000000), size=cxl_dram.get_size())
+        # Place CXL memory starting at 4GB and keep software-visible addresses
+        # aligned to this direct range (NUMA/system-memory path).
+        cxl_mem_size = cxl_dram.get_size()
+        cxl_mem_range = AddrRange(Addr(0x100000000), size=cxl_mem_size)
         cxl_dram.set_memory_range([cxl_mem_range])
         cxl_mem_ctrl = self.pc.south_bridge.cxl_device
         cxl_mem_ctrl.connectMemory(cxl_mem_range, cxl_dram)
@@ -147,16 +156,33 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         else:
             cxl_mem_ctrl.configCXL(Latency("60ns"), 36)
 
+        # CPU-to-CPU mode uses the server-facing doorbell at region 0 base.
+        # Keep a narrow window so client metadata/response traffic
+        # (also in CXL memory) is not treated as doorbell writes.
+        doorbell_range = AddrRange(0x100000000, size='4kB')
+
+        self.rpc_engine = CXLRPCEngine()
+        self.rpc_engine.doorbell_range = doorbell_range
+        self.rpc_engine.auto_register = True
+
+        # Use a single server doorbell segment at region 0.
+
+        # Attach to CXLMemCtrl
+        cxl_mem_ctrl.rpc_engine = self.rpc_engine
+
         # Setup memory system specific settings.
         if self.get_cache_hierarchy().is_ruby():
-            self.pc.attachIO(self.get_io_bus(), [self.pc.south_bridge.ide.dma, cxl_mem_ctrl.dma])
+            self.pc.attachIO(
+                self.get_io_bus(),
+                [
+                    self.pc.south_bridge.ide.dma,
+                    cxl_mem_ctrl.dma,
+                ],
+            )
+            # Ruby path passes cxl DMA explicitly, so SouthBridge.attachIO does
+            # not auto-wire cxl_rsp_port. Connect it explicitly.
+            cxl_mem_ctrl.cxl_rsp_port = self.get_io_bus().mem_side_ports
         else:
-            # # Constants similar to x86_traits.hh
-            IO_address_space_base = 0x8000000000000000
-            pci_config_address_space_base = 0xC000000000000000
-            interrupts_address_space_base = 0xA000000000000000
-            APIC_range_size = 1 << 12
-
             # Configure CXLBridge
             self.bridge = CXLBridge(bridge_lat="50ns", proto_proc_lat="12ns", req_fifo_depth=128, resp_fifo_depth=128)
             self.bridge.mem_side_port = self.get_io_bus().cpu_side_ports
@@ -164,6 +190,9 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                 self.get_cache_hierarchy().get_mem_side_port()
             )
 
+            # Keep CXL bridge routing aligned with the configured CXL memory
+            # aperture so CXL traffic follows the same path as the original
+            # Type-3 board setup.
             self.bridge.ranges = [
                 AddrRange(0xC0000000, 0xFFFF0000),
                 AddrRange(
@@ -186,7 +215,16 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                     - 1,
                 )
             ]
+
             self.pc.attachIO(self.get_io_bus())
+            self.pc.south_bridge.copy_engine.dma = [
+                self.get_io_bus().cpu_side_ports
+                for _ in range(self.pc.south_bridge.copy_engine.ChanCnt)
+            ]
+
+            # SouthBridge.attachIO does not wire CopyEngine PIO by default.
+            # Explicitly connect it so MMIO BAR accesses reach the device.
+            self.pc.south_bridge.copy_engine.pio = self.get_io_bus().mem_side_ports
 
         # Add in a Bios information structure.
         self.workload.smbios_table.structures = [X86SMBiosBiosInformation()]
@@ -281,8 +319,13 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             X86E820Entry(addr=0xFFFF0000, size="64kB", range_type=2)
         )
 
+        # Expose CXL memory as a discoverable system memory range.
         entries.append(
-            X86E820Entry(addr=0x100000000, size=f"{cxl_mem_range.size()}B", range_type=20)
+            X86E820Entry(
+                addr=0x100000000,
+                size=f"{cxl_mem_range.size()}B",
+                range_type=20,
+            )
         )
 
         self.workload.e820_table.entries = entries
@@ -301,8 +344,12 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
 
     @overrides(AbstractSystemBoard)
     def get_dma_ports(self) -> Sequence[Port]:
-        return [self.pc.south_bridge.ide.dma, self.iobus.mem_side_ports, 
-                self.pc.south_bridge.cxl_device.dma]
+        dma_ports = [
+            self.pc.south_bridge.ide.dma,
+            self.iobus.mem_side_ports,
+            self.pc.south_bridge.cxl_device.dma,
+        ]
+        return dma_ports
 
     @overrides(AbstractSystemBoard)
     def has_coherent_io(self) -> bool:

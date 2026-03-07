@@ -230,7 +230,7 @@ Kvm::getSupportedCPUID(struct kvm_cpuid2 &cpuid) const
 const Kvm::CPUIDVector &
 Kvm::getSupportedCPUID() const
 {
-    if (supportedCPUIDCache.empty()) {
+    std::call_once(supportedCPUIDOnce, [this]() {
         std::unique_ptr<struct kvm_cpuid2, void(*)(void *p)>
             cpuid(nullptr, [](void *p) { operator delete(p); });
         int i(1);
@@ -243,7 +243,7 @@ Kvm::getSupportedCPUID() const
         } while (!getSupportedCPUID(*cpuid));
         supportedCPUIDCache.assign(cpuid->entries,
                                    cpuid->entries + cpuid->nent);
-    }
+    });
 
     return supportedCPUIDCache;
 }
@@ -263,7 +263,7 @@ Kvm::getSupportedMSRs(struct kvm_msr_list &msrs) const
 const Kvm::MSRIndexVector &
 Kvm::getSupportedMSRs() const
 {
-    if (supportedMSRCache.empty()) {
+    std::call_once(supportedMSROnce, [this]() {
         std::unique_ptr<struct kvm_msr_list, void(*)(void *p)>
             msrs(nullptr, [](void *p) { operator delete(p); });
         int i(0);
@@ -275,7 +275,7 @@ Kvm::getSupportedMSRs() const
             ++i;
         } while (!getSupportedMSRs(*msrs));
         supportedMSRCache.assign(msrs->indices, msrs->indices + msrs->nmsrs);
-    }
+    });
 
     return supportedMSRCache;
 }

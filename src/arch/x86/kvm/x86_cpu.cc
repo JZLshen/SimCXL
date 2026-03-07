@@ -817,6 +817,12 @@ X86KvmCPU::updateKvmStateSRegs()
 #undef APPLY_SEGMENT
 #undef APPLY_DTABLE
 
+    // APICBASE.BSP is synthesized in ISA::readMiscReg() for full-system x86.
+    // The generic SREG path above uses readMiscRegNoEffect(), which leaves
+    // the BSP bit cleared and can make recent Linux kernels collapse SMP
+    // topology to a single CPU.
+    sregs.apic_base = tc->readMiscReg(misc_reg::ApicBase);
+
     // Clear the interrupt bitmap
     memset(&sregs.interrupt_bitmap, 0, sizeof(sregs.interrupt_bitmap));
 
@@ -983,10 +989,18 @@ X86KvmCPU::updateKvmStateMSRs()
 
     for (auto it = indices.cbegin(); it != indices.cend(); ++it) {
         struct kvm_msr_entry e;
+        const auto map_it = msrMap.find(*it);
+        if (map_it == msrMap.end()) {
+            DPRINTF(Kvm,
+                    "kvm-x86: MSR (0x%x) missing in gem5 msrMap during "
+                    "updateKvmStateMSRs, skipping.\n",
+                    *it);
+            continue;
+        }
 
         e.index = *it;
         e.reserved = 0;
-        e.data = tc->readMiscReg(msrMap.at(*it));
+        e.data = tc->readMiscReg(map_it->second);
         DPRINTF(KvmContext, "Adding MSR: idx: 0x%x, data: 0x%x\n",
                 e.index, e.data);
 
@@ -1182,10 +1196,19 @@ X86KvmCPU::updateThreadContextMSRs()
     // Update M5's state
     entry = &kvm_msrs->entries[0];
     for (int i = 0; i < kvm_msrs->nmsrs; ++i, ++entry) {
+        const auto map_it = X86ISA::msrMap.find(entry->index);
+        if (map_it == X86ISA::msrMap.end()) {
+            DPRINTF(Kvm,
+                    "kvm-x86: MSR (0x%x) missing in gem5 msrMap during "
+                    "updateThreadContextMSRs, skipping.\n",
+                    entry->index);
+            continue;
+        }
+
         DPRINTF(KvmContext, "Setting M5 MSR: idx: 0x%x, data: 0x%x\n",
                 entry->index, entry->data);
 
-        tc->setMiscReg(X86ISA::msrMap.at(entry->index), entry->data);
+        tc->setMiscReg(map_it->second, entry->data);
     }
 }
 
@@ -1641,21 +1664,40 @@ X86KvmCPU::getMSR(uint32_t index) const
 const Kvm::MSRIndexVector &
 X86KvmCPU::getMsrIntersection() const
 {
-    if (cachedMsrIntersection.empty()) {
-        const Kvm::MSRIndexVector &kvm_msrs = vm->kvm->getSupportedMSRs();
+    std::lock_guard<std::mutex> guard(cachedMsrIntersectionMutex);
 
-        DPRINTF(Kvm, "kvm-x86: Updating MSR intersection\n");
-        for (auto it = kvm_msrs.cbegin(); it != kvm_msrs.cend(); ++it) {
-            if (X86ISA::msrMap.find(*it) != X86ISA::msrMap.end()) {
-                cachedMsrIntersection.push_back(*it);
-                DPRINTF(Kvm, "kvm-x86: Adding MSR 0x%x\n", *it);
-            } else {
-                warn("kvm-x86: MSR (0x%x) unsupported by gem5. Skipping.\n",
-                     *it);
+    if (cachedMsrIntersectionValid) {
+        return cachedMsrIntersection;
+    }
+
+    if (!vm || !vm->kvm) {
+        warn("kvm-x86: KVM VM not ready while building MSR intersection; "
+             "using empty intersection.\n");
+        return cachedMsrIntersection;
+    }
+
+    const Kvm::MSRIndexVector &kvm_msrs = vm->kvm->getSupportedMSRs();
+    int unsupported_warn_budget = 16;
+    cachedMsrIntersection.clear();
+    cachedMsrIntersection.reserve(kvm_msrs.size());
+
+    DPRINTF(Kvm, "kvm-x86: Updating MSR intersection\n");
+    for (auto it = kvm_msrs.cbegin(); it != kvm_msrs.cend(); ++it) {
+        if (X86ISA::msrMap.find(*it) != X86ISA::msrMap.end()) {
+            cachedMsrIntersection.push_back(*it);
+            DPRINTF(Kvm, "kvm-x86: Adding MSR 0x%x\n", *it);
+        } else if (unsupported_warn_budget > 0) {
+            warn("kvm-x86: MSR (0x%x) unsupported by gem5. Skipping.\n",
+                 *it);
+            --unsupported_warn_budget;
+            if (unsupported_warn_budget == 0) {
+                warn("kvm-x86: suppressing additional unsupported MSR "
+                     "warnings for this CPU.\n");
             }
         }
     }
 
+    cachedMsrIntersectionValid = true;
     return cachedMsrIntersection;
 }
 

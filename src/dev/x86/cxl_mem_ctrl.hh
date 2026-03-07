@@ -8,6 +8,7 @@
 #include "base/types.hh"
 #include "base/statistics.hh"
 #include "dev/pci/device.hh"
+#include "dev/x86/cxl_rpc_engine.hh"
 #include "mem/packet.hh"
 #include "mem/packet_access.hh"
 #include "mem/port.hh"
@@ -129,10 +130,10 @@ class CXLMemCtrl : public PciDevice
                 void schedTimingResp(PacketPtr pkt, Tick when);
 
                 /**
-                * Retry any stalled request that we have failed to accept at
-                * an earlier point in time. This call will do nothing if no
-                * request is waiting.
-                */
+                 * Retry any stalled request that we have failed to accept at
+                 * an earlier point in time. This call will do nothing if no
+                 * request is waiting.
+                 */
                 void retryStalledReq();
 
             // protected:
@@ -154,7 +155,7 @@ class CXLMemCtrl : public PciDevice
                 void recvMemBackdoorReq(
                     const MemBackdoorReq &req, MemBackdoorPtr &backdoor) override {};
 
-                void recvFunctional(PacketPtr pkt) override {};
+                void recvFunctional(PacketPtr pkt) override;
 
                 /** When receiving a address range request the Host,
                     pass it to the back-end memory media. */
@@ -258,8 +259,8 @@ class CXLMemCtrl : public PciDevice
             statistics::Scalar reqQueFullEvents;
             statistics::Scalar reqRetryCounts;
             statistics::Scalar rspQueFullEvents;
-            statistics::Scalar reqSendFaild;
-            statistics::Scalar rspSendFaild;
+            statistics::Scalar reqSendFailed;
+            statistics::Scalar rspSendFailed;
             statistics::Scalar reqSendSucceed;
             statistics::Scalar rspSendSucceed;
             statistics::Distribution reqQueueLenDist;
@@ -271,6 +272,9 @@ class CXLMemCtrl : public PciDevice
         };
     
         CXLCtrlStats stats;
+
+        /** RPC Engine for doorbell interception (optional) */
+        CXLRPCEngine* rpcEngine;
 
     public:
         Tick read(PacketPtr pkt) override;

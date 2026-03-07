@@ -514,6 +514,22 @@ BaseCache::recvTimingResp(PacketPtr pkt)
         return;
     }
 
+    // Some uncacheable responses can legitimately bypass MSHR tracking and
+    // therefore carry no sender state. Forward them directly back to CPU.
+    // Keep strict behavior for all cacheable traffic.
+    if (pkt->senderState == nullptr) {
+        if (pkt->req && pkt->req->isUncacheable()) {
+            DPRINTF(Cache,
+                    "%s: uncacheable response without senderState, "
+                    "forwarding directly: %s\n",
+                    __func__, pkt->print());
+            handleUncacheableWriteResp(pkt);
+            return;
+        }
+        panic("%s: response without senderState for cacheable request: %s",
+              name(), pkt->print());
+    }
+
     // we have dealt with any (uncacheable) writes above, from here on
     // we know we are dealing with an MSHR due to a miss or a prefetch
     MSHR *mshr = dynamic_cast<MSHR*>(pkt->popSenderState());

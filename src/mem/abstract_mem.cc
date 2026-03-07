@@ -385,7 +385,8 @@ AbstractMemory::access(PacketPtr pkt)
         return;
     }
 
-    if (pkt->cmd == MemCmd::CleanEvict || pkt->cmd == MemCmd::WritebackClean) {
+    if (pkt->cmd == MemCmd::CleanEvict ||
+        (pkt->cmd == MemCmd::WritebackClean && !pkt->isMaskedWrite())) {
         DPRINTF(MemoryAccess, "CleanEvict  on 0x%x: not responding\n",
                 pkt->getAddr());
       return;

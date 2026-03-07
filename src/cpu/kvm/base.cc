@@ -72,7 +72,8 @@ BaseKvmCPU::BaseKvmCPU(const BaseKvmCPUParams &params)
       threadContextDirty(true),
       kvmStateDirty(false),
       usePerf(params.usePerf),
-      vcpuID(-1), vcpuFD(-1), vcpuMMapSize(0),
+      vcpuID(-1), vcpuThread(), vcpuThreadValid(false),
+      vcpuFD(-1), vcpuMMapSize(0),
       _kvmRun(NULL), mmioRing(NULL),
       pageSize(sysconf(_SC_PAGE_SIZE)),
       tickEvent([this]{ tick(); }, "BaseKvmCPU tick",
@@ -259,6 +260,7 @@ BaseKvmCPU::restartEqThread()
         dynamic_cast<const BaseKvmCPUParams &>(params());
 
     vcpuThread = pthread_self();
+    vcpuThreadValid = true;
 
     // Setup signal handlers. This has to be done after the vCPU is
     // created since it manipulates the vCPU signal mask.
@@ -276,6 +278,20 @@ BaseKvmCPU::restartEqThread()
                                          p.hostFactor,
                                          p.hostFreq));
     }
+}
+
+void
+BaseKvmCPU::kick() const
+{
+    if (!vcpuThreadValid)
+        return;
+
+    int ret = pthread_kill(vcpuThread, KVM_KICK_SIGNAL);
+    if (ret == ESRCH) {
+        // The old event-queue thread may already be gone during resume/migration.
+        return;
+    }
+    panic_if(ret != 0, "KVM: pthread_kill failed in kick() (ret=%d)\n", ret);
 }
 
 BaseKvmCPU::StatGroup::StatGroup(statistics::Group *parent)
@@ -442,6 +458,7 @@ BaseKvmCPU::notifyFork()
 
         vcpuFD = -1;
         _kvmRun = NULL;
+        vcpuThreadValid = false;
 
         if (usePerf) {
             hwInstructions->detach();

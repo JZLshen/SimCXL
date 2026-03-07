@@ -161,7 +161,7 @@ DmaDevice::DmaDevice(const Params &p)
 void
 DmaDevice::init()
 {
-    panic_if(!dmaPort.isConnected(),
+    panic_if(!dmaPort.isConnected() && !allowUnconnectedDefaultDmaPort(),
              "DMA port of %s not connected to anything!", name());
     PioDevice::init();
 }
