@@ -79,7 +79,7 @@ cxl_lib_errorf(const char *fmt, ...)
 }
 
 /* MQ policy is fixed: keep prefetch + invalidate policies always on. */
-#define CXL_MQ_PREFETCH_LINES 4u
+#define CXL_MQ_PREFETCH_LINES 16u
 #define CXL_MQ_INVALIDATE_CONSUMED 1
 #define CXL_MQ_INVALIDATE_PREFETCHED 1
 
@@ -1120,6 +1120,15 @@ int32_t cxl_send_request(cxl_connection_t *conn,
     return (int32_t)((uint32_t)req_id);
 }
 
+/* forward declarations for client response polling helpers */
+int cxl_peek_latest_response_request_id(cxl_connection_t *conn,
+                                         uint32_t *out_request_id);
+
+int cxl_poll_next_response_view(cxl_connection_t *conn,
+                                 const void **out_data_view,
+                                 size_t *out_len,
+                                 uint32_t *out_response_request_id);
+
 static int
 cxl_poll_response_common(cxl_connection_t *conn,
                          int32_t request_id,
@@ -1149,11 +1158,12 @@ cxl_poll_response_common(cxl_connection_t *conn,
     }
 
     volatile uint8_t *resp = conn->response_data + conn->resp_read_offset;
-    volatile uint8_t *flag = conn->flag;
-
-    __asm__ __volatile__("clflushopt (%0)" :: "r"((void *)flag) : "memory");
-    __asm__ __volatile__("sfence" ::: "memory");
-    uint32_t ready_req_id = *(volatile uint32_t *)flag;
+    uint32_t ready_req_id = 0;
+    int ready_rc = cxl_peek_latest_response_request_id(conn, &ready_req_id);
+    if (ready_rc < 0) {
+        ret = -1;
+        goto out;
+    }
 
     /*
      * Single-flag protocol:
@@ -1163,7 +1173,7 @@ cxl_poll_response_common(cxl_connection_t *conn,
      * - Only when flag equals requested request_id do we touch response_data.
      * - Any mismatch stays pending and avoids response_data load.
      */
-    if (ready_req_id == 0) {
+    if (ready_rc == 0 || ready_req_id == 0) {
         ret = 0;
         goto out;
     }
@@ -1251,6 +1261,101 @@ cxl_poll_response_common(cxl_connection_t *conn,
 
 out:
     return ret;
+}
+
+int cxl_peek_latest_response_request_id(cxl_connection_t *conn,
+                                         uint32_t *out_request_id)
+{
+    if (out_request_id)
+        *out_request_id = 0;
+
+    if (!conn || !conn->flag || !out_request_id)
+        return -1;
+
+    volatile uint8_t *flag = conn->flag;
+    __asm__ __volatile__("clflushopt (%0)" :: "r"((void *)flag) : "memory");
+    __asm__ __volatile__("sfence" ::: "memory");
+    uint32_t ready_req_id = *(volatile uint32_t *)flag;
+    *out_request_id = ready_req_id;
+    return (ready_req_id != 0) ? 1 : 0;
+}
+
+int cxl_poll_next_response_view(cxl_connection_t *conn,
+                                 const void **out_data_view,
+                                 size_t *out_len,
+                                 uint32_t *out_response_request_id)
+{
+    if (out_data_view)
+        *out_data_view = NULL;
+    if (out_len)
+        *out_len = 0;
+    if (out_response_request_id)
+        *out_response_request_id = 0;
+
+    if (!conn || !conn->response_data || !conn->flag ||
+        !out_data_view || !out_len || !out_response_request_id)
+        return -1;
+
+    if (conn->resp_read_offset >= conn->addrs.response_data_size) {
+        conn->resp_read_offset = 0;
+        return -1;
+    }
+
+    uint32_t latest_ready_req_id = 0;
+    int ready_rc = cxl_peek_latest_response_request_id(conn, &latest_ready_req_id);
+    if (ready_rc < 0)
+        return -1;
+    if (ready_rc == 0 || latest_ready_req_id == 0)
+        return 0;
+
+    volatile uint8_t *resp = conn->response_data + conn->resp_read_offset;
+    __asm__ __volatile__("clflushopt (%0)" :: "r"((void *)resp) : "memory");
+    __asm__ __volatile__("sfence" ::: "memory");
+
+    uint64_t header_lo = *(volatile uint64_t *)resp;
+    uint32_t payload_len_u32 = (uint32_t)(header_lo & 0xFFFFFFFFu);
+    uint32_t resp_req_id = (uint32_t)(header_lo >> 32);
+
+    if (resp_req_id == 0)
+        return 0;
+
+    *out_response_request_id = resp_req_id;
+
+    size_t msg_len = (size_t)payload_len_u32;
+    size_t entry_size = cxl_response_entry_size(msg_len);
+    if (entry_size > conn->addrs.response_data_size)
+        return -1;
+
+    if (conn->resp_read_offset + entry_size > conn->addrs.response_data_size) {
+        conn->resp_read_offset = 0;
+        return 0;
+    }
+
+    if (entry_size > 64u) {
+        uintptr_t entry_line_start = ((uintptr_t)resp) & ~((uintptr_t)63);
+        uintptr_t entry_line_end =
+            (((uintptr_t)resp + entry_size) + 63u) & ~((uintptr_t)63);
+        for (uintptr_t line = entry_line_start + 64u;
+             line < entry_line_end; line += 64u) {
+            __asm__ __volatile__(
+                "clflushopt (%0)"
+                :
+                : "r"((void *)line)
+                : "memory");
+        }
+        __asm__ __volatile__("sfence" ::: "memory");
+    }
+
+    *out_data_view = (const void *)(resp + 12);
+    *out_len = msg_len;
+
+    conn->resp_read_offset += entry_size;
+    if (conn->addrs.response_data_size > 0 &&
+        conn->resp_read_offset >= conn->addrs.response_data_size) {
+        conn->resp_read_offset = 0;
+    }
+
+    return 1;
 }
 
 int cxl_poll_response(cxl_connection_t *conn,

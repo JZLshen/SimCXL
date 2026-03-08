@@ -2,12 +2,12 @@
 """
 Run CXL RPC matrix experiments with:
   - KVM boot + TIMING CPU test phase
-  - checkpoint restore for every experiment
+  - rebuild checkpoint per experiment (exact CPU count)
   - automatic result extraction from board.pc.com_1.device
 
 Matrix (deduplicated):
-  A) req_size in [8B,64B,256B,1KB,4KB,16KB,64KB,256KB], clients=16, reqs=30
-  B) req_size=64B, clients in [1,2,4,8,16,32], reqs=30
+  A) req_size in [8B,64B,256B,1KB,4KB,16KB,64KB,256KB], clients=16, reqs=15
+  B) req_size=64B, clients in [1,2,4,8,16,32], reqs=15
   response_size is fixed to 16B.
 """
 
@@ -221,9 +221,15 @@ def main() -> int:
     parser.add_argument("--repo-root", type=str, default=None)
     parser.add_argument("--output-base", type=str, default="output")
     parser.add_argument("--batch-name", type=str, default="")
-    parser.add_argument("--requests", type=int, default=30)
+    parser.add_argument("--requests", type=int, default=15)
     parser.add_argument("--response-size", type=int, default=16)
     parser.add_argument("--max-polls", type=int, default=2000000)
+    parser.add_argument(
+        "--start-index",
+        type=int,
+        default=1,
+        help="1-based experiment index to start from (skip earlier ones)",
+    )
     parser.add_argument("--checkpoint", type=str, default="")
     parser.add_argument("--checkpoint-cpus", type=int, default=0)
     parser.add_argument("--skip-inject", action="store_true")
@@ -236,6 +242,9 @@ def main() -> int:
     batch_name = args.batch_name or f"rpc_matrix_kvm_timing_ckpt_{now_tag()}"
     batch_dir = output_base / batch_name
     batch_dir.mkdir(parents=True, exist_ok=True)
+    if args.start_index < 1:
+        print("[fatal] --start-index must be >= 1")
+        return 2
 
     gem5_bin = repo_root / "build/X86/gem5.opt"
     test_cfg = repo_root / "configs/example/gem5_library/x86-cxl-rpc-test.py"
@@ -247,7 +256,7 @@ def main() -> int:
 
     experiments = build_matrix(args.requests, args.response_size)
     max_clients = max(exp.key.clients for exp in experiments)
-    required_cpus = max_clients + 1  # server core + one core per client
+    max_required_cpus = max_clients + 1  # server core + one core per client
 
     plan_csv = batch_dir / "plan.csv"
     with plan_csv.open("w", encoding="utf-8", newline="") as f:
@@ -276,7 +285,8 @@ def main() -> int:
             )
 
     print(f"[matrix] total unique experiments: {len(experiments)}")
-    print(f"[matrix] required cores (server+clients): {required_cpus}")
+    print(f"[matrix] max required cores (server+clients): {max_required_cpus}")
+    print(f"[matrix] start index: {args.start_index}")
     print(f"[matrix] batch dir: {batch_dir}")
 
     if not args.skip_inject:
@@ -290,70 +300,16 @@ def main() -> int:
         else:
             print("[dry-run] skip inject execution")
 
-    checkpoint_dir: Optional[Path] = None
-    checkpoint_cpus: Optional[int] = None
-
     if args.checkpoint:
-        checkpoint_dir = resolve_checkpoint_dir((repo_root / args.checkpoint).resolve())
-        if checkpoint_dir is None:
-            print(f"[warn] checkpoint not found from --checkpoint={args.checkpoint}")
-
-    if checkpoint_dir is not None:
-        checkpoint_cpus = detect_checkpoint_cpus(checkpoint_dir)
-
-    need_rebuild_ckpt = (
-        checkpoint_dir is None
-        or checkpoint_cpus is None
-        or checkpoint_cpus < required_cpus
-    )
-    target_ckpt_cpus = args.checkpoint_cpus if args.checkpoint_cpus > 0 else required_cpus
-    if target_ckpt_cpus < required_cpus:
         print(
-            f"[fatal] checkpoint-cpus={target_ckpt_cpus} < required={required_cpus}"
+            "[matrix] note: --checkpoint is ignored; "
+            "this script rebuilds checkpoint per experiment with exact CPU count."
         )
-        return 2
-
-    if need_rebuild_ckpt:
-        ckpt_outdir = output_base / f"rebuild_ckpt_rpc_matrix_{target_ckpt_cpus}_{now_tag()}" / "cxl_rpc_checkpoint"
-        ckpt_outdir.mkdir(parents=True, exist_ok=True)
-        ckpt_cmd = [
-            str(gem5_bin),
-            "-d",
-            str(ckpt_outdir),
-            str(save_ckpt_cfg),
-            "--num_cpus",
-            str(target_ckpt_cpus),
-        ]
-        if args.dry_run:
-            print("[dry-run] would build checkpoint:", " ".join(ckpt_cmd))
-            checkpoint_dir = ckpt_outdir
-            checkpoint_cpus = target_ckpt_cpus
-        else:
-            ckpt_log = batch_dir / "checkpoint_build.log"
-            rc = run_and_tee(ckpt_cmd, ckpt_log)
-            if rc != 0:
-                print(f"[fatal] checkpoint build failed rc={rc}")
-                return rc
-            resolved = resolve_checkpoint_dir(ckpt_outdir)
-            if resolved is None:
-                print(f"[fatal] checkpoint m5.cpt not found under {ckpt_outdir}")
-                return 2
-            checkpoint_dir = resolved
-            checkpoint_cpus = detect_checkpoint_cpus(checkpoint_dir)
-    else:
-        print(f"[matrix] reusing checkpoint: {checkpoint_dir}")
-
-    if checkpoint_dir is None or checkpoint_cpus is None:
-        print("[fatal] checkpoint resolution failed")
-        return 2
-    if checkpoint_cpus < required_cpus:
+    if args.checkpoint_cpus:
         print(
-            f"[fatal] checkpoint CPUs={checkpoint_cpus} still < required {required_cpus}"
+            "[matrix] note: --checkpoint-cpus is ignored; "
+            "CPU count is derived per experiment as clients+1."
         )
-        return 2
-
-    print(f"[matrix] checkpoint: {checkpoint_dir}")
-    print(f"[matrix] checkpoint cpus: {checkpoint_cpus}")
 
     experiments_csv = batch_dir / "experiments.csv"
     ticks_csv = batch_dir / "results_ticks.csv"
@@ -396,6 +352,12 @@ def main() -> int:
 
     for idx, exp in enumerate(experiments, start=1):
         key = exp.key
+        if idx < args.start_index:
+            print(
+                f"[skip {idx}/{len(experiments)}] "
+                f"before --start-index={args.start_index}: {exp.exp_id}"
+            )
+            continue
         if exp.exp_id in done_ids:
             print(f"[skip {idx}/{len(experiments)}] already done: {exp.exp_id}")
             continue
@@ -403,6 +365,91 @@ def main() -> int:
         run_outdir = batch_dir / f"run_{idx:02d}_{exp.exp_id}"
         run_outdir.mkdir(parents=True, exist_ok=True)
         run_log = run_outdir / "gem5_run.log"
+        required_cpus = key.clients + 1
+        ckpt_outdir = (
+            batch_dir / f"ckpt_{idx:02d}_{exp.exp_id}" / "cxl_rpc_checkpoint"
+        )
+        checkpoint_dir: Path = ckpt_outdir
+
+        ckpt_cmd = [
+            str(gem5_bin),
+            "-d",
+            str(ckpt_outdir),
+            str(save_ckpt_cfg),
+            "--num_cpus",
+            str(required_cpus),
+        ]
+        if args.dry_run:
+            print(
+                "[dry-run] would build checkpoint:",
+                " ".join(shlex.quote(c) for c in ckpt_cmd),
+            )
+        else:
+            ckpt_outdir.mkdir(parents=True, exist_ok=True)
+            ckpt_log = run_outdir / "checkpoint_build.log"
+            ckpt_rc = run_and_tee(ckpt_cmd, ckpt_log)
+            if ckpt_rc != 0:
+                append_row(
+                    experiments_csv,
+                    {
+                        "exp_id": exp.exp_id,
+                        "source": exp.source,
+                        "request_size": key.request_size,
+                        "response_size": key.response_size,
+                        "clients": key.clients,
+                        "requests_per_client": key.requests_per_client,
+                        "checkpoint_dir": str(ckpt_outdir),
+                        "num_cpus": required_cpus,
+                        "output_dir": str(run_outdir),
+                        "start_time": "",
+                        "end_time": "",
+                        "elapsed_sec": "0.000",
+                        "gem5_rc": ckpt_rc,
+                        "test_cmd_exit": "",
+                        "tick_rows": 0,
+                        "expected_rows": key.clients * key.requests_per_client,
+                        "status": "checkpoint_failed",
+                    },
+                    exp_fields,
+                )
+                print(
+                    f"[done] {exp.exp_id} status=checkpoint_failed "
+                    f"gem5_rc={ckpt_rc} test_rc=None ticks=0/"
+                    f"{key.clients * key.requests_per_client} elapsed=0.0s"
+                )
+                continue
+            resolved = resolve_checkpoint_dir(ckpt_outdir)
+            if resolved is None:
+                append_row(
+                    experiments_csv,
+                    {
+                        "exp_id": exp.exp_id,
+                        "source": exp.source,
+                        "request_size": key.request_size,
+                        "response_size": key.response_size,
+                        "clients": key.clients,
+                        "requests_per_client": key.requests_per_client,
+                        "checkpoint_dir": str(ckpt_outdir),
+                        "num_cpus": required_cpus,
+                        "output_dir": str(run_outdir),
+                        "start_time": "",
+                        "end_time": "",
+                        "elapsed_sec": "0.000",
+                        "gem5_rc": 2,
+                        "test_cmd_exit": "",
+                        "tick_rows": 0,
+                        "expected_rows": key.clients * key.requests_per_client,
+                        "status": "checkpoint_missing",
+                    },
+                    exp_fields,
+                )
+                print(
+                    f"[done] {exp.exp_id} status=checkpoint_missing "
+                    f"gem5_rc=2 test_rc=None ticks=0/"
+                    f"{key.clients * key.requests_per_client} elapsed=0.0s"
+                )
+                continue
+            checkpoint_dir = resolved
 
         server_args = f"--silent --response-size {key.response_size}"
         test_cmd = (
@@ -428,7 +475,7 @@ def main() -> int:
             "--cpu_type",
             "TIMING",
             "--num_cpus",
-            str(checkpoint_cpus),
+            str(required_cpus),
             "--checkpoint",
             str(checkpoint_dir),
             "--test_cmd",
@@ -440,7 +487,8 @@ def main() -> int:
         print(
             f"[run {idx}/{len(experiments)}] {exp.exp_id} "
             f"(req={key.request_size}, resp={key.response_size}, "
-            f"clients={key.clients}, reqs/client={key.requests_per_client})"
+            f"clients={key.clients}, reqs/client={key.requests_per_client}, "
+            f"cpus={required_cpus})"
         )
 
         if args.dry_run:
@@ -480,7 +528,7 @@ def main() -> int:
                 "clients": key.clients,
                 "requests_per_client": key.requests_per_client,
                 "checkpoint_dir": str(checkpoint_dir),
-                "num_cpus": checkpoint_cpus,
+                "num_cpus": required_cpus,
                 "output_dir": str(run_outdir),
                 "start_time": start_ts,
                 "end_time": end_ts,
