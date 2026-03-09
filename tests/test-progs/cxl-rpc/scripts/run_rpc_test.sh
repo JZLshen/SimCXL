@@ -11,7 +11,7 @@
 #   all              Run all test scenarios sequentially
 #
 # Options:
-#   --cpu-type TIMING|O3|ATOMIC  CPU type (default: TIMING)
+#   --cpu-type TIMING|O3|KVM  CPU type (default: TIMING)
 #   --num-cpus N                 Number of CPUs (default: 1)
 #   --checkpoint DIR             Restore from checkpoint (skip boot)
 #   --debug                      Enable CXL debug flags
@@ -44,7 +44,7 @@ usage() {
     echo "  all              Run all test scenarios"
     echo ""
     echo "Options:"
-    echo "  --cpu-type TYPE      TIMING, O3, or ATOMIC (default: TIMING)"
+    echo "  --cpu-type TYPE      TIMING, O3, or KVM (default: TIMING)"
     echo "  --num-cpus N         Number of CPUs (default: 1)"
     echo "  --checkpoint DIR     Restore from checkpoint (skip boot)"
     echo "  --debug              Enable CXL debug flags"
@@ -57,8 +57,8 @@ usage() {
     echo "  # Reuse checkpoint to run tests (fast)"
     echo "  $0 server-client --checkpoint $OUTPUT_BASE/cxl_rpc_checkpoint"
     echo ""
-    echo "  # Or: Run with Atomic CPU (fast, no timing accuracy)"
-    echo "  $0 server-client --cpu-type ATOMIC"
+    echo "  # Or: stay on KVM after restore"
+    echo "  $0 server-client --cpu-type KVM"
 }
 
 # Parse scenario
@@ -187,7 +187,7 @@ case "$SCENARIO" in
         echo "=== Saving CXL RPC Boot Checkpoint ==="
         echo "  CPUs:     $NUM_CPUS"
         echo "  Output:   $output_dir"
-        echo "  Note:     Checkpoint saves KVM state, restore can use any CPU type"
+        echo "  Note:     Checkpoint saves KVM state, restore can use TIMING, O3, or KVM"
         echo ""
 
         mkdir -p "$output_dir"
@@ -196,6 +196,7 @@ case "$SCENARIO" in
             -d "$output_dir" \
             "$SAVE_CPT_CONFIG" \
             --num_cpus "$NUM_CPUS" \
+            --rpc_client_count "$(( NUM_CPUS > 1 ? NUM_CPUS - 1 : 1 ))" \
             2>&1 | tee "$console_log"
 
         echo ""

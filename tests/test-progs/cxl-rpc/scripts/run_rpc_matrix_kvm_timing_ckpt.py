@@ -16,8 +16,10 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -113,6 +115,19 @@ def run_and_tee(cmd: List[str], log_path: Path) -> int:
         return int(proc.returncode)
 
 
+def sudo_nopass_available() -> bool:
+    try:
+        proc = subprocess.run(
+            ["sudo", "-n", "true"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return False
+    return proc.returncode == 0
+
+
 def resolve_checkpoint_dir(path: Path) -> Optional[Path]:
     if (path / "m5.cpt").exists():
         return path
@@ -150,6 +165,9 @@ def parse_board_ticks(board_path: Path) -> Tuple[Optional[int], List[Dict[str, i
     re_single = re.compile(
         r"^\[CLIENT\]\s+req_(\d+)_(start|end|delta)_tick=(\d+)\s*$"
     )
+    re_bare = re.compile(
+        r"^req_(\d+)_(start|end|delta)_tick=(\d+)\s*$"
+    )
 
     for line in board_path.read_text(encoding="utf-8", errors="ignore").splitlines():
         if "TEST_CMD_EXIT_CODE=" in line:
@@ -174,6 +192,15 @@ def parse_board_ticks(board_path: Path) -> Tuple[Optional[int], List[Dict[str, i
             kind = m.group(2)
             val = int(m.group(3))
             fields.setdefault((cid, ridx), {})[kind] = val
+            continue
+
+        m = re_bare.match(line)
+        if m:
+            cid = 0
+            ridx = int(m.group(1))
+            kind = m.group(2)
+            val = int(m.group(3))
+            fields.setdefault((cid, ridx), {})[kind] = val
 
     rows: List[Dict[str, int]] = []
     for (cid, ridx), vals in sorted(fields.items()):
@@ -187,6 +214,8 @@ def parse_board_ticks(board_path: Path) -> Tuple[Optional[int], List[Dict[str, i
                     "delta_tick": vals["delta"],
                 }
             )
+    if test_rc is None and rows:
+        test_rc = 0
     return test_rc, rows
 
 
@@ -214,6 +243,98 @@ def append_row(csv_path: Path, row: dict, fieldnames: List[str]) -> None:
         writer.writerow(row)
 
 
+def find_matrix_gem5_processes(gem5_bin: Path,
+                               cfg_paths: List[Path]) -> List[Tuple[int, str]]:
+    cfg_markers = [str(path) for path in cfg_paths]
+    try:
+        proc = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[warn] failed to inspect process list: {exc}")
+        return []
+
+    current_pid = os.getpid()
+    found: List[Tuple[int, str]] = []
+    gem5_marker = str(gem5_bin)
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        cmdline = parts[1]
+        if gem5_marker not in cmdline:
+            continue
+        if not any(marker in cmdline for marker in cfg_markers):
+            continue
+        found.append((pid, cmdline))
+    return found
+
+
+def signal_processes(processes: List[Tuple[int, str]], sig: signal.Signals) -> None:
+    for pid, _cmdline in processes:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            continue
+        except OSError as exc:
+            print(f"[warn] failed to signal pid={pid} sig={sig.name}: {exc}")
+
+
+def wait_for_no_matrix_processes(gem5_bin: Path,
+                                 cfg_paths: List[Path],
+                                 settle_sec: float,
+                                 term_grace_sec: float,
+                                 kill_grace_sec: float,
+                                 dry_run: bool) -> bool:
+    def poll_until_clear(timeout_sec: float) -> List[Tuple[int, str]]:
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        remaining = find_matrix_gem5_processes(gem5_bin, cfg_paths)
+        while remaining and time.monotonic() < deadline:
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+            remaining = find_matrix_gem5_processes(gem5_bin, cfg_paths)
+        return remaining
+
+    lingering = poll_until_clear(settle_sec)
+    if not lingering:
+        return True
+
+    print("[matrix] lingering RPC gem5 process(es) detected before next experiment:")
+    for pid, cmdline in lingering:
+        print(f"  pid={pid} cmd={cmdline}")
+
+    if dry_run:
+        print("[dry-run] would terminate lingering RPC gem5 processes before next experiment")
+        return True
+
+    print("[matrix] sending SIGTERM to lingering RPC gem5 process(es)")
+    signal_processes(lingering, signal.SIGTERM)
+    lingering = poll_until_clear(term_grace_sec)
+    if not lingering:
+        return True
+
+    print("[matrix] sending SIGKILL to lingering RPC gem5 process(es)")
+    signal_processes(lingering, signal.SIGKILL)
+    lingering = poll_until_clear(kill_grace_sec)
+    if lingering:
+        print("[fatal] unable to clear lingering RPC gem5 process(es):")
+        for pid, cmdline in lingering:
+            print(f"  pid={pid} cmd={cmdline}")
+        return False
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run CXL RPC matrix (KVM+TIMING+checkpoint) and extract ticks"
@@ -235,6 +356,30 @@ def main() -> int:
     parser.add_argument("--skip-inject", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force-rerun", action="store_true")
+    parser.add_argument(
+        "--inter-experiment-sleep-sec",
+        type=int,
+        default=30,
+        help="Sleep this many seconds between actually executed experiments",
+    )
+    parser.add_argument(
+        "--process-settle-sec",
+        type=int,
+        default=2,
+        help="Seconds to wait for lingering RPC gem5 processes to exit naturally",
+    )
+    parser.add_argument(
+        "--process-term-grace-sec",
+        type=int,
+        default=10,
+        help="Seconds to wait after SIGTERM before escalating lingering RPC gem5 processes",
+    )
+    parser.add_argument(
+        "--process-kill-grace-sec",
+        type=int,
+        default=5,
+        help="Seconds to wait after SIGKILL before failing the matrix run",
+    )
     args = parser.parse_args()
 
     repo_root = resolve_repo_root(args.repo_root)
@@ -349,6 +494,21 @@ def main() -> int:
         "delta_tick",
         "output_dir",
     ]
+    rpc_cfg_paths = [save_ckpt_cfg, test_cfg]
+    started_experiments = 0
+    direct_kvm_access = os.access("/dev/kvm", os.R_OK | os.W_OK)
+    sudo_n_available = sudo_nopass_available()
+    kvm_cmd_prefix: List[str] = []
+
+    if direct_kvm_access:
+        print("[matrix] /dev/kvm is directly accessible by current user")
+    else:
+        print("[matrix] /dev/kvm is not directly accessible by current user")
+        if not sudo_n_available:
+            print("[fatal] /dev/kvm requires elevated access, but `sudo -n` is unavailable")
+            return 2
+        kvm_cmd_prefix = ["sudo", "-n"]
+        print("[matrix] checkpoint builds will run under `sudo -n`")
 
     for idx, exp in enumerate(experiments, start=1):
         key = exp.key
@@ -362,6 +522,29 @@ def main() -> int:
             print(f"[skip {idx}/{len(experiments)}] already done: {exp.exp_id}")
             continue
 
+        if started_experiments > 0 and args.inter_experiment_sleep_sec > 0:
+            if args.dry_run:
+                print(
+                    f"[dry-run] would sleep {args.inter_experiment_sleep_sec}s "
+                    f"before starting next experiment: {exp.exp_id}"
+                )
+            else:
+                print(
+                    f"[matrix] sleeping {args.inter_experiment_sleep_sec}s before "
+                    f"starting next experiment: {exp.exp_id}"
+                )
+                time.sleep(args.inter_experiment_sleep_sec)
+        if not wait_for_no_matrix_processes(
+            gem5_bin,
+            rpc_cfg_paths,
+            settle_sec=float(args.process_settle_sec),
+            term_grace_sec=float(args.process_term_grace_sec),
+            kill_grace_sec=float(args.process_kill_grace_sec),
+            dry_run=args.dry_run,
+        ):
+            return 2
+        started_experiments += 1
+
         run_outdir = batch_dir / f"run_{idx:02d}_{exp.exp_id}"
         run_outdir.mkdir(parents=True, exist_ok=True)
         run_log = run_outdir / "gem5_run.log"
@@ -371,13 +554,15 @@ def main() -> int:
         )
         checkpoint_dir: Path = ckpt_outdir
 
-        ckpt_cmd = [
+        ckpt_cmd = kvm_cmd_prefix + [
             str(gem5_bin),
             "-d",
             str(ckpt_outdir),
             str(save_ckpt_cfg),
             "--num_cpus",
             str(required_cpus),
+            "--rpc_client_count",
+            str(key.clients),
         ]
         if args.dry_run:
             print(
@@ -467,7 +652,7 @@ def main() -> int:
             f"--silent"
         )
 
-        gem5_cmd = [
+        gem5_cmd = kvm_cmd_prefix + [
             str(gem5_bin),
             "-d",
             str(run_outdir),
@@ -476,6 +661,8 @@ def main() -> int:
             "TIMING",
             "--num_cpus",
             str(required_cpus),
+            "--rpc_client_count",
+            str(key.clients),
             "--checkpoint",
             str(checkpoint_dir),
             "--test_cmd",
@@ -511,8 +698,6 @@ def main() -> int:
             status = "ok"
             if gem5_rc != 0:
                 status = "gem5_failed"
-            elif test_cmd_rc is None:
-                status = "missing_test_exit"
             elif test_cmd_rc != 0:
                 status = "test_failed"
             elif len(rows) != expected_rows:

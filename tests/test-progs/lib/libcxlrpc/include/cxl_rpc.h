@@ -4,7 +4,7 @@
  * Provides user-space API for CXL shared memory RPC:
  *   - Context: KM NUMA-backed allocation (no /dev/cxl_mem0 or /dev/mem)
  *   - Connection: allocated via global allocator, managed regions
- *   - Client: send_request (shared store publish path) + poll_response (flag)
+ *   - Client: send_request + completion-flag probe + ordered response drain
  *   - Server: poll_request (metadata queue) + adaptive head sync
  */
 
@@ -21,8 +21,8 @@
 extern "C" {
 #endif
 
-/* CXL memory default base address (16GB boundary) */
-#define CXL_BASE_DEFAULT        0x400000000ULL
+/* CXL memory default base address (4GB boundary) */
+#define CXL_BASE_DEFAULT        0x100000000ULL
 #define CXL_SIZE_DEFAULT        0x200000000ULL  /* 8GB */
 
 /* Doorbell method types (from pipeline.md) */
@@ -47,10 +47,10 @@ extern "C" {
 #define CXL_CONTROL_RESET_STATE 1
 
 /*
- * Response entry header layout (12 bytes):
+ * Response entry header layout (8 bytes):
  *   bytes 0-3:  payload_len (uint32 LE)
- *   bytes 4-7:  request_id  (uint32 LE)
- *   bytes 8-11: response_id (uint32 LE)
+ *   bytes 4-5:  request_id  (uint16 LE)
+ *   bytes 6-7:  response_id (uint16 LE)
  */
 
 /*
@@ -102,12 +102,12 @@ void cxl_rpc_destroy(cxl_context_t *ctx);
 
 /**
  * Get virtual base pointer for CXL memory.
- * Use for direct memory access (offset from physical base).
+ * Use for direct memory access (offset from logical/protocol base).
  */
 volatile void *cxl_rpc_get_base(const cxl_context_t *ctx);
 
 /**
- * Convert physical address to virtual pointer.
+ * Convert logical/protocol address to virtual pointer inside the shared map.
  */
 volatile void *cxl_rpc_phys_to_virt(const cxl_context_t *ctx,
                                      uint64_t phys_addr);
@@ -167,24 +167,43 @@ const cxl_connection_addrs_t *cxl_connection_get_addrs(
     const cxl_connection_t *conn);
 
 /**
- * Configure request_id prefix bits for this connection.
+ * Select this connection's client-tag value inside the fixed request_id
+ * layout used by the protocol.
  *
- * request_id is carried as 16 bits in metadata. With `prefix_bits > 0`,
- * send_request() encodes:
- *   request_id = (prefix << (16 - prefix_bits)) | random_low_bits
- * where random_low_bits is non-zero.
+ * The 16-bit request_id always uses the high bits as a client tag and the
+ * low bits as a cyclic per-client sequence:
+ *   request_id = (client_tag << (16 - client_tag_bits)) | seq_low_bits
  *
- * This allows N-client:1-server routing (server derives client_id from
- * request_id) and works for both inline/non-inline requests.
+ * seq_low_bits is allocated per-connection and remains reserved until the
+ * corresponding response payload has been consumed into local memory by the
+ * client. For a single-client deployment, the fixed layout degenerates to
+ * client_tag=0 and client_tag_bits=0.
  *
- * @param conn         Connection handle
- * @param prefix       Prefix value (typically client_id)
- * @param prefix_bits  Number of high bits used as prefix (0..15)
- * @return             0 on success, -1 on invalid config
+ * @param conn             Connection handle
+ * @param client_tag       Client identifier carried in request_id high bits
+ * @param client_tag_bits  Number of request_id high bits reserved for tag
+ * @return                 0 on success, -1 on invalid config
  */
-int cxl_connection_set_request_id_prefix(cxl_connection_t *conn,
-                                          uint16_t prefix,
-                                          uint8_t prefix_bits);
+int cxl_connection_set_client_tag(cxl_connection_t *conn,
+                                  uint16_t client_tag,
+                                  uint8_t client_tag_bits);
+
+/**
+ * Bind one dedicated CopyEngine lane for server-side response DMA.
+ *
+ * A lane is one fixed `(engine_index, channel_index)` pair. The current
+ * response path requires explicit binding before peer response-data / flag
+ * setup. Public configs keep `channel_index = 0` and derive
+ * `engine_index = client_id`, i.e. `1 client : 1 engine : 1 channel`.
+ *
+ * @param conn          Connection handle
+ * @param engine_index  CopyEngine device index
+ * @param channel_index Channel index inside that engine
+ * @return              0 on success, -1 on error
+ */
+int cxl_connection_bind_copyengine_lane(cxl_connection_t *conn,
+                                        size_t engine_index,
+                                        uint32_t channel_index);
 
 /* ================================================================
  * Client API
@@ -205,53 +224,54 @@ int cxl_connection_set_request_id_prefix(cxl_connection_t *conn,
  * @param method_id  Target method
  * @param data       Request payload
  * @param len        Payload length in bytes
- * @return           request_id (>= 0) or -1 on error
+ * @return           request_id in [1, 65535], or -1
  */
-int32_t cxl_send_request(cxl_connection_t *conn,
-                          uint16_t service_id,
-                          uint16_t method_id,
-                          const void *data,
-                          size_t len);
+int cxl_send_request(cxl_connection_t *conn,
+                     uint16_t service_id,
+                     uint16_t method_id,
+                     const void *data,
+                     size_t len);
 
 /**
- * Poll for response (non-blocking).
+ * Read completion flag (latest completed request_id) from peer.
  *
- * Drains response ring in producer order from the current read offset.
- * Returns ready only when flag reports exactly the requested request_id;
- * otherwise returns pending (0) without loading response_data.
+ * This is a non-blocking flag probe. The returned request_id is the latest
+ * completed response id visible in the single-flag protocol.
  *
- * @param conn       Connection handle
- * @param request_id Requested response ID (must be > 0)
- * @param out_data   Buffer for response payload
- * @param out_len    In: buffer size, Out: exact response payload size
- * @return           1 if response ready, 0 if pending, -1 on error
+ * @param conn            Connection handle
+ * @param out_request_id  Out: latest request_id from flag
+ * @return                1 if flag is non-zero, 0 if no completion yet, -1 on error
  */
-int cxl_poll_response(cxl_connection_t *conn,
-                       int32_t request_id,
-                       void *out_data,
-                       size_t *out_len);
+int cxl_peek_latest_completed_request_id(cxl_connection_t *conn,
+                                         uint16_t *out_request_id);
 
 /**
- * Poll for response (non-blocking, zero-copy view).
+ * Consume the next response entry in producer order (non-blocking).
  *
- * On success, out_data_view points directly to payload bytes in shared memory
- * (response_data entry body after 12B header), avoiding an extra local memcpy.
- * Drains response ring in producer order from the current read offset.
- * Returns ready only when flag reports exactly the requested request_id;
- * otherwise returns pending (0) without loading response_data.
+ * Copies exactly one response payload from the current response-data head into
+ * caller-owned local memory, then advances the consumer offset.
  *
- * @param conn          Connection handle
- * @param request_id    Requested response ID (must be > 0)
- * @param out_data_view Out: payload view pointer
- * @param out_len       Out: exact payload size
- * @param out_response_request_id Out: response header request_id (optional)
- * @return              1 if response ready, 0 if pending, -1 on error
+ * This API is intended for single-flag multi-outstanding workflows where the
+ * client first calls `cxl_peek_latest_completed_request_id()`, checks the
+ * returned request_id against its pending set, and then drains response_data
+ * in producer order until that request_id is consumed.
+ *
+ * The response is considered consumed only after this local copy completes.
+ *
+ * If `*out_len` is smaller than the payload size, this function returns -1,
+ * updates `*out_len` with the exact required size, and does not consume the
+ * response entry.
+ *
+ * @param conn            Connection handle
+ * @param out_data        Caller-owned local buffer for payload copy
+ * @param out_len         In: buffer size, Out: exact payload size
+ * @param out_request_id  Out: consumed response request_id
+ * @return                1 if one response consumed, 0 if pending, -1 on error
  */
-int cxl_poll_response_view(cxl_connection_t *conn,
-                            int32_t request_id,
-                            const void **out_data_view,
-                            size_t *out_len,
-                            uint32_t *out_response_request_id);
+int cxl_consume_next_response(cxl_connection_t *conn,
+                              void *out_data,
+                              size_t *out_len,
+                              uint16_t *out_request_id);
 
 /* ================================================================
  * Server API
@@ -278,75 +298,59 @@ int cxl_poll_response_view(cxl_connection_t *conn,
  * @return           1 if request available, 0 if empty, -1 on error
  */
 int cxl_poll_request(cxl_connection_t *conn,
-                      uint16_t *service_id,
-                      uint16_t *method_id,
-                      uint32_t *request_id,
-                      const void **out_data_view,
-                      size_t *out_len);
+                     uint16_t *service_id,
+                     uint16_t *method_id,
+                     uint16_t *request_id,
+                     const void **out_data_view,
+                     size_t *out_len);
 
 /**
  * Send an RPC response (server-side).
  *
- * Writes response entry to peer's response_data region, then updates
- * peer's flag with request_id using the standard store+flush+fence publish
- * sequence.
+ * Sends one response entry to peer `response_data` and then publishes the
+ * corresponding `request_id` to peer `flag` through CopyEngine.
  *
  * @param conn       Server-side connection handle (with peer addresses set)
- * @param request_id Request ID to respond to
+ * @param request_id Request ID to respond to (must be 1..65535)
  * @param data       Response payload
- * @param len        Payload length in bytes
+ * @param len        Payload length in bytes (current backend max: 4088)
  * @return           0 on success, -1 on error
  */
 int cxl_send_response(cxl_connection_t *conn,
-                      uint32_t request_id,
+                      uint16_t request_id,
                       const void *data,
                       size_t len);
 
 /**
- * Set peer addresses for server sending responses.
+ * Set peer response-data region for server sending responses.
  *
  * Must be called after connection creation, before send_response.
- * Maps peer response_data into the server virtual address space.
- * Peer flag is configured separately via cxl_connection_set_peer_flag_addr().
+ * Resolves peer response_data into a local observed DMA page map once during
+ * setup so the response send hot path only works with logical offsets.
+ * Peer flag is configured separately via
+ * cxl_connection_set_peer_response_flag_addr().
  *
  * @param conn                   Connection handle
- * @param peer_response_data_addr Physical address of peer's response_data
- * @param peer_response_data_size Size of peer's response_data region
+ * @param peer_response_data_addr Logical/protocol address of peer response-data region
+ * @param peer_response_data_size Size of peer response-data region
  * @return                       0 on success, -1 on error
  */
-int cxl_connection_set_peer_addrs(cxl_connection_t *conn,
-                                   uint64_t peer_response_data_addr,
-                                   size_t peer_response_data_size);
+int cxl_connection_set_peer_response_data(cxl_connection_t *conn,
+                                          uint64_t peer_response_data_addr,
+                                          size_t peer_response_data_size);
 
 /**
- * Set peer flag address for server response completion publish.
+ * Set peer response-flag address for server response completion publish.
  *
- * The server writes request_id to peer flag only after response_data publish
- * has completed, then flushes + fences the flag store.
+ * The response path becomes ready only after both peer `response_data` and
+ * peer `flag` are configured. Responses are then sent through CopyEngine.
  *
  * @param conn            Connection handle
- * @param peer_flag_addr  Physical address of peer's flag region
+ * @param peer_flag_addr  Logical/protocol address of peer's flag region
  * @return                0 on success, -1 on error
  */
-int cxl_connection_set_peer_flag_addr(cxl_connection_t *conn,
-                                       uint64_t peer_flag_addr);
-
-/**
- * Set peer request_data address range for strict server-side request parsing.
- *
- * `cxl_poll_request()` accepts non-inline request pointers only if they fall in
- * either:
- *   1) this connection's own request_data range, or
- *   2) this configured peer request_data range.
- *
- * @param conn                    Connection handle
- * @param peer_request_data_addr  Physical address of peer's request_data
- * @param peer_request_data_size  Size of peer's request_data region
- * @return                        0 on success, -1 on error
- */
-int cxl_connection_set_peer_request_data(cxl_connection_t *conn,
-                                          uint64_t peer_request_data_addr,
-                                          size_t peer_request_data_size);
+int cxl_connection_set_peer_response_flag_addr(cxl_connection_t *conn,
+                                               uint64_t peer_flag_addr);
 
 #ifdef __cplusplus
 }

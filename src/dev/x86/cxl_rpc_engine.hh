@@ -45,7 +45,7 @@ struct DoorbellEntry {
     uint8_t phase_bit;    // Phase bit for wrap-around detection
     uint16_t service_id;  // low 12 bits used
     uint16_t method_id;   // low 12 bits used
-    uint32_t request_id;  // low 16 bits used
+    uint16_t request_id;  // 16-bit request ID
     uint32_t payload_len; // low 20 bits used
     uint64_t data;        // Inline message or address
 
@@ -168,6 +168,10 @@ class CXLRPCEngine : public SimObject
     // Fast lookup index built from connections:
     // - exact slot start -> canonical doorbell address
     std::unordered_map<Addr, Addr> doorbellSlotToCanonical;
+    bool singleDoorbellSegmentValid = false;
+    Addr singleDoorbellCanonicalAddr = 0;
+    Addr singleDoorbellSegmentStart = 0;
+    Addr singleDoorbellSegmentEnd = 0;
 
     // Auto-register parameters
     bool autoRegister;
@@ -265,7 +269,7 @@ class CXLRPCEngine : public SimObject
     void registerConnection(uint32_t client_id,
                             Addr doorbell_addr,
                             Addr metadata_queue_addr,
-                            uint32_t metadata_queue_size,
+                            uint32_t metadata_queue_entries,
                             Addr request_data_addr,
                             uint32_t request_data_capacity,
                             Addr response_data_addr,

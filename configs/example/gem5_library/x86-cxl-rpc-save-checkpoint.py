@@ -2,7 +2,8 @@
 CXL RPC Checkpoint Save
 
 Boot Linux with KVM, save checkpoint in KVM state (before CPU switch).
-This allows checkpoint restore to switch to any CPU type (TIMING/O3/ATOMIC).
+This allows checkpoint restore to switch to the supported post-boot CPU
+types (TIMING/O3/KVM).
 
 Checkpoint is saved after boot completes but BEFORE CPU switch, so:
   - save-checkpoint: KVM boot -> save checkpoint (KVM state)
@@ -20,6 +21,7 @@ Usage:
 """
 
 import argparse
+import os
 import time
 import m5
 from pathlib import Path
@@ -48,14 +50,28 @@ default_disk = repo_root / "files" / "parsec.img"
 
 parser = argparse.ArgumentParser(description='Save CXL RPC boot checkpoint.')
 parser.add_argument('--num_cpus', type=int, default=1, help='Number of CPUs')
+parser.add_argument(
+    '--rpc_client_count',
+    type=int,
+    default=0,
+    help=('RPC client count encoded into the checkpoint hardware topology. '
+          '0 means auto: max(1, num_cpus - 1).'),
+)
+parser.add_argument(
+    '--copy_engine_xfercap',
+    type=str,
+    default='4KiB',
+    help='Per-CopyEngine maximum transfer size advertised through XFERCAP.',
+)
 parser.add_argument('--is_asic', type=str, choices=['True', 'False'],
                     default='True', help='ASIC or FPGA device.')
 parser.add_argument(
     '--fallback_sim_seconds',
     type=int,
     default=90,
-    help=('Fallback checkpoint at simulated seconds if guest readfile path '
-          'does not emit m5 exit. Set 0 to disable.'),
+    help=('Fail checkpoint build after this many simulated seconds if the '
+          'guest readfile path never emits the handoff m5 exit. '
+          'Set 0 to disable.'),
 )
 parser.add_argument(
     '--run_step_ticks',
@@ -71,6 +87,19 @@ parser.add_argument('--disk', type=str, default=str(default_disk),
 
 args = parser.parse_args()
 
+if args.rpc_client_count < 0:
+    parser.error('--rpc_client_count must be >= 0')
+if not os.access('/dev/kvm', os.R_OK | os.W_OK):
+    parser.error(
+        'x86-cxl-rpc-save-checkpoint.py requires read/write access to '
+        '/dev/kvm on the host'
+    )
+
+num_copy_engines = (
+    args.rpc_client_count if args.rpc_client_count > 0 else max(1, args.num_cpus - 1)
+)
+copy_engine_channels = 1
+
 # --- Board/memory/cache config MUST match x86-cxl-rpc-test.py exactly ---
 
 cache_hierarchy = PrivateL1PrivateL2SharedL3CacheHierarchy(
@@ -84,7 +113,7 @@ memory = DIMM_DDR5_4400(size="3GB")
 cxl_dram = DIMM_DDR5_4400(size="8GB")
 
 # Use TIMING as switch target - checkpoint is saved in KVM state,
-# so this doesn't affect the checkpoint. Restore can use any CPU type.
+# so this doesn't affect the checkpoint. Restore can use TIMING/O3/KVM.
 processor = SimpleSwitchableProcessor(
     starting_core_type=CPUTypes.KVM,
     switch_core_type=CPUTypes.TIMING,
@@ -102,6 +131,9 @@ board = X86Board(
     cache_hierarchy=cache_hierarchy,
     cxl_memory=cxl_dram,
     is_asic=(args.is_asic == 'True'),
+    num_copy_engines=num_copy_engines,
+    copy_engine_channels=copy_engine_channels,
+    copy_engine_xfercap=args.copy_engine_xfercap,
 )
 
 # Board-level wiring already handles IDE/CXL DMA and response ports.
@@ -115,39 +147,30 @@ board = X86Board(
 checkpoint_readfile = f"""
 set -u
 CKPT_BOOTSTRAP_MAGIC="CXL_RPC_CKPT_BOOTSTRAP_V2"
-echo "$CKPT_BOOTSTRAP_MAGIC"
-echo "[ckpt] waiting for nproc >= {args.num_cpus}"
 TRIES=300
 while [ "$TRIES" -gt 0 ]; do
   NPROC="$(nproc 2>/dev/null || echo 1)"
   if [ "$NPROC" -ge "{args.num_cpus}" ]; then
-    echo "[ckpt] nproc ready: $NPROC"
     break
   fi
   TRIES=$((TRIES - 1))
   sleep 1
 done
-echo "[ckpt] nproc final: $(nproc 2>/dev/null || echo 1)"
-echo "[ckpt] waiting for systemd boot ready"
 TRIES=300
 while [ "$TRIES" -gt 0 ]; do
   SYS_STATE="$(systemctl is-system-running 2>/dev/null || true)"
   if systemctl is-active --quiet multi-user.target; then
     if [ "$SYS_STATE" = "running" ] || [ "$SYS_STATE" = "degraded" ]; then
-      echo "[ckpt] systemd ready: $SYS_STATE"
       break
     fi
   fi
   TRIES=$((TRIES - 1))
   sleep 1
 done
-echo "[ckpt] systemd final: $(systemctl is-system-running 2>/dev/null || echo unknown)"
-echo "[ckpt] trigger host-side checkpoint via m5 exit"
 m5 exit
 
 RESTORE_SCRIPT=/tmp/gem5_restore_script.sh
 RESTORE_TMP=/tmp/gem5_restore_script.sh.new
-echo "[ckpt] resumed after checkpoint restore; reading new payload once"
 RESTORE_ATTEMPTS=3
 while [ "$RESTORE_ATTEMPTS" -gt 0 ]; do
   /sbin/m5 readfile > "$RESTORE_TMP" 2>/dev/null || true
@@ -156,19 +179,15 @@ while [ "$RESTORE_ATTEMPTS" -gt 0 ]; do
     break
   fi
   if grep -q "$CKPT_BOOTSTRAP_MAGIC" "$RESTORE_TMP" 2>/dev/null; then
-    echo "[ckpt] consumed nested checkpoint bootstrap payload; retrying readfile"
     rm -f "$RESTORE_TMP"
     RESTORE_ATTEMPTS=$((RESTORE_ATTEMPTS - 1))
     continue
   fi
   mv -f "$RESTORE_TMP" "$RESTORE_SCRIPT"
   chmod +x "$RESTORE_SCRIPT"
-  RESTORE_HASH="$(sha256sum "$RESTORE_SCRIPT" | awk '{{print $1}}')"
-  echo "[ckpt] executing restored payload hash=$RESTORE_HASH"
   exec /bin/bash "$RESTORE_SCRIPT"
 done
 rm -f "$RESTORE_TMP"
-echo "[ckpt] no restored payload supplied; exiting"
 m5 exit
 """
 
@@ -228,7 +247,7 @@ def save_checkpoint(reason: str):
     print("Checkpoint saved successfully!")
     print(f"  Location: {checkpoint_dir}")
     print("  State: KVM (bootstrap script paused at handoff EXIT)")
-    print("  Restore can use any CPU type: TIMING, O3, ATOMIC")
+    print("  Restore can use: TIMING, O3, or KVM")
 
 simulator = Simulator(
     board=board,
@@ -243,10 +262,14 @@ print("  Mode: CPU-to-CPU")
 print(f"  Kernel: {args.kernel}")
 print(f"  Disk: {args.disk}")
 print(f"  Checkpoint will be saved in KVM state (before CPU switch)")
-print(f"  This allows restore with any CPU type")
+print("  This allows restore with TIMING, O3, or KVM")
 print(f"  Fallback sim-seconds: {args.fallback_sim_seconds}")
 print("  Save policy: immediate at guest handoff EXIT")
 print(f"  Run step ticks: {run_step_ticks}")
+print(
+    "  CopyEngine topology: "
+    f"{num_copy_engines} engine(s) x {copy_engine_channels} channel(s)"
+)
 
 fallback_ticks = max(0, args.fallback_sim_seconds) * 1_000_000_000_000
 
@@ -259,10 +282,11 @@ while True:
     if fallback_ticks != 0:
         remaining = fallback_ticks - m5.curTick()
         if remaining <= 0:
-            print("Fallback checkpoint trigger:"
-                  f" readfile EXIT not observed by tick {m5.curTick()}.")
-            save_checkpoint("fallback-sim-seconds-expired")
-            break
+            print("ERROR: checkpoint handoff EXIT was not observed before "
+                  f"fallback deadline at tick {m5.curTick()}.")
+            print("ERROR: refusing to save a fallback checkpoint because it "
+                  "would not represent the intended handoff state.")
+            raise SystemExit(2)
         if now_wall - last_status_wall["pre_exit"] >= status_wall_interval_sec:
             print(
                 "[ckpt-host] waiting for guest EXIT "

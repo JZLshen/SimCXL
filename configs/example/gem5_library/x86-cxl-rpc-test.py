@@ -9,6 +9,8 @@ Flow:
 """
 
 import argparse
+import os
+import re
 import shlex
 from pathlib import Path
 
@@ -60,9 +62,24 @@ parser.add_argument(
 )
 parser.add_argument("--num_cpus", type=int, default=1, help="Number of CPUs")
 parser.add_argument(
+    "--rpc_client_count",
+    type=int,
+    default=0,
+    help=(
+        "RPC client count. "
+        "0 means infer from test_cmd and bind one engine per client."
+    ),
+)
+parser.add_argument(
+    "--copy_engine_xfercap",
+    type=str,
+    default="4KiB",
+    help="Per-CopyEngine maximum transfer size advertised through XFERCAP.",
+)
+parser.add_argument(
     "--cpu_type",
     type=str,
-    choices=["TIMING", "O3", "ATOMIC", "KVM"],
+    choices=["TIMING", "O3", "KVM", "ATOMIC"],
     default="TIMING",
     help="CPU type after KVM boot",
 )
@@ -93,6 +110,9 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+if args.rpc_client_count < 0:
+    parser.error("--rpc_client_count must be >= 0")
+
 
 def _validate_test_mode(test_cmd: str) -> None:
     if ("run_rpc_server_client.sh" in test_cmd or
@@ -113,6 +133,79 @@ def _validate_test_mode(test_cmd: str) -> None:
 
 _validate_test_mode(args.test_cmd)
 
+
+def _parse_positive_int(text: str) -> int | None:
+    try:
+        value = int(text, 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _infer_rpc_num_clients(test_cmd: str) -> int:
+    try:
+        tokens = shlex.split(test_cmd, posix=True)
+    except ValueError:
+        return 1
+
+    for token in tokens:
+        if token.startswith("CXL_RPC_CLIENT_COUNT="):
+            value = _parse_positive_int(token.split("=", 1)[1])
+            if value is not None:
+                return value
+
+    for idx, token in enumerate(tokens[:-1]):
+        if token == "--num-clients":
+            value = _parse_positive_int(tokens[idx + 1])
+            if value is not None:
+                return value
+
+    if any(token.endswith("run_rpc_server_multi_client.sh") for token in tokens):
+        return 4
+
+    return 1
+
+
+def _load_checkpoint_copyengine_topology(
+    checkpoint_dir: str | None,
+) -> tuple[int, int] | None:
+    if not checkpoint_dir:
+        return None
+
+    cfg = Path(checkpoint_dir) / "config.ini"
+    if not cfg.is_file():
+        return None
+
+    engine_sections = 0
+    channel_count = 0
+    current_is_engine = False
+
+    with cfg.open("r", encoding="utf-8", errors="ignore") as fp:
+        for raw_line in fp:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if re.match(r"^\[board\.pc\.south_bridge\.copy_engines\d+\]$", line):
+                engine_sections += 1
+                current_is_engine = True
+                continue
+
+            if line.startswith("["):
+                current_is_engine = False
+                continue
+
+            if current_is_engine and line.startswith("ChanCnt="):
+                parsed = _parse_positive_int(line.split("=", 1)[1])
+                if parsed is not None and parsed > channel_count:
+                    channel_count = parsed
+
+    if engine_sections == 0:
+        return None
+    if channel_count == 0:
+        channel_count = 1
+    return engine_sections, channel_count
+
 cache_hierarchy = PrivateL1PrivateL2SharedL3CacheHierarchy(
     l1d_size="48kB",
     l1d_assoc=6,
@@ -129,9 +222,35 @@ cxl_dram = DIMM_DDR5_4400(size="8GB")
 cpu_type_map = {
     "TIMING": CPUTypes.TIMING,
     "O3": CPUTypes.O3,
-    "ATOMIC": CPUTypes.ATOMIC,
     "KVM": CPUTypes.KVM,
+    "ATOMIC": CPUTypes.ATOMIC,
 }
+
+if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+    parser.error(
+        "x86-cxl-rpc-test.py requires read/write access to /dev/kvm for the "
+        "mandatory KVM boot path"
+    )
+
+checkpoint_topology = _load_checkpoint_copyengine_topology(args.checkpoint)
+requested_rpc_clients = (
+    args.rpc_client_count
+    if args.rpc_client_count > 0
+    else _infer_rpc_num_clients(args.test_cmd)
+)
+
+if checkpoint_topology is not None:
+    num_copy_engines, copy_engine_channels = checkpoint_topology
+    if requested_rpc_clients > num_copy_engines:
+        parser.error(
+            "checkpoint CopyEngine topology is smaller than rpc_client_count: "
+            f"{requested_rpc_clients} client(s) need at least "
+            f"{requested_rpc_clients} engine(s), checkpoint has "
+            f"{num_copy_engines}"
+        )
+else:
+    num_copy_engines = max(1, requested_rpc_clients)
+    copy_engine_channels = 1
 
 processor = SimpleSwitchableProcessor(
     starting_core_type=CPUTypes.KVM,
@@ -154,6 +273,9 @@ board = X86Board(
     cache_hierarchy=cache_hierarchy,
     cxl_memory=cxl_dram,
     is_asic=(args.is_asic == "True"),
+    num_copy_engines=num_copy_engines,
+    copy_engine_channels=copy_engine_channels,
+    copy_engine_xfercap=args.copy_engine_xfercap,
 )
 
 pre_switch_settle_sec = max(0, args.pre_switch_settle_sec)
@@ -165,7 +287,6 @@ script_lines = []
 if args.cpu_type != "KVM":
     script_lines.extend(
         [
-            f"echo \"[gem5-test] pre-switch settle: {pre_switch_settle_sec}s\"",
             "sync",
             f"sleep {pre_switch_settle_sec}",
             "m5 exit",
@@ -174,7 +295,6 @@ if args.cpu_type != "KVM":
 elif pre_switch_settle_sec > 0:
     script_lines.extend(
         [
-            f"echo \"[gem5-test] pre-test settle: {pre_switch_settle_sec}s\"",
             "sync",
             f"sleep {pre_switch_settle_sec}",
         ]
@@ -186,9 +306,6 @@ script_lines.extend(
         f"export CXL_RPC_TEST_TIMEOUT_SEC=\"${{CXL_RPC_TEST_TIMEOUT_SEC:-{test_timeout_sec}}}\"",
         "exec >/dev/ttyS0 2>&1",
         f"TEST_CMD={shlex.quote(effective_test_cmd)}",
-        "echo '=== CXL RPC Evaluation ==='",
-        "echo \"Test command: ${TEST_CMD}\"",
-        "echo '[gem5-test] RUN_TEST_CMD_BEGIN'",
         "if [ \"${CXL_RPC_TEST_TIMEOUT_SEC}\" -gt 0 ] && command -v timeout >/dev/null 2>&1; then",
         "  timeout --signal=TERM --kill-after=5 \"${CXL_RPC_TEST_TIMEOUT_SEC}s\" bash -c \"$TEST_CMD\"",
         "  TEST_CMD_RC=$?",
@@ -196,8 +313,6 @@ script_lines.extend(
         "  bash -c \"$TEST_CMD\"",
         "  TEST_CMD_RC=$?",
         "fi",
-        "echo '[gem5-test] RUN_TEST_CMD_END'",
-        "echo \"TEST_CMD_EXIT_CODE=${TEST_CMD_RC}\"",
     ]
 )
 
@@ -213,9 +328,6 @@ if fail_on_test_error:
 else:
     script_lines.extend(
         [
-            "if [ \"$TEST_CMD_RC\" -ne 0 ]; then",
-            "  echo \"[gem5-test] non-zero test rc=${TEST_CMD_RC}; exiting without m5 fail\"",
-            "fi",
         ]
     )
 
@@ -245,11 +357,16 @@ if args.checkpoint:
     print(f"  Checkpoint: {args.checkpoint}")
 else:
     print("Running CXL RPC test simulation...")
-print(f"  CPU type: KVM -> {args.cpu_type}")
+print(f"  CPU type: KVM -> {cpu_type_map[args.cpu_type].name}")
 print(f"  Kernel: {args.kernel}")
 print(f"  Disk: {args.disk}")
 print(f"  Test command: {args.test_cmd}")
 print(f"  Effective command: {effective_test_cmd}")
+print(f"  RPC clients: {requested_rpc_clients}")
+print(
+    "  CopyEngine topology: "
+    f"{num_copy_engines} engine(s) x {copy_engine_channels} channel(s)"
+)
 print(f"  Guest test timeout sec: {test_timeout_sec}")
 
 

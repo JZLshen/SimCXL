@@ -1485,7 +1485,7 @@ X86KvmCPU::ioctlRun()
     BaseKvmCPU::ioctlRun();
 
     tc->setMiscReg(misc_reg::ApicBase, kvm_run.apic_base);
-    kvm_run.cr8 = tc->readMiscReg(misc_reg::Cr8);
+    tc->setMiscReg(misc_reg::Cr8, kvm_run.cr8);
 }
 
 static struct kvm_cpuid_entry2

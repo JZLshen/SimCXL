@@ -53,6 +53,7 @@ from m5.objects import (
     X86IntelMPProcessor,
     X86SMBiosBiosInformation,
 )
+from m5.objects.PciDevice import PciMemBar
 from m5.objects.CXLRPCEngine import CXLRPCEngine
 from m5.params import Latency
 from m5.util.convert import toMemorySize
@@ -65,6 +66,27 @@ from ..memory.abstract_memory_system import AbstractMemorySystem
 from ..processors.abstract_processor import AbstractProcessor
 from .abstract_system_board import AbstractSystemBoard
 from .kernel_disk_workload import KernelDiskWorkload
+
+_COPY_ENGINE_FIRST_PCI_DEV = 7
+_COPY_ENGINE_GENERAL_REG_SIZE = 0x80
+_COPY_ENGINE_CHANNEL_REG_SIZE = 0x80
+_COPY_ENGINE_LEGACY_BAR0_SIZE = 1024
+
+
+def _next_power_of_two(size: int) -> int:
+    if size <= 1:
+        return 1
+    return 1 << (size - 1).bit_length()
+
+
+def _get_copy_engine_bar0_size(channel_count: int) -> int:
+    required_size = _COPY_ENGINE_GENERAL_REG_SIZE + (
+        channel_count * _COPY_ENGINE_CHANNEL_REG_SIZE
+    )
+    return max(
+        _COPY_ENGINE_LEGACY_BAR0_SIZE,
+        _next_power_of_two(required_size),
+    )
 
 
 class X86Board(AbstractSystemBoard, KernelDiskWorkload):
@@ -84,9 +106,30 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         cache_hierarchy: AbstractCacheHierarchy,
         cxl_memory: AbstractMemorySystem,
         is_asic: bool = True,
+        num_copy_engines: int = 1,
+        copy_engine_channels: int = 1,
+        copy_engine_xfercap: str = "4KiB",
     ) -> None:
+        if num_copy_engines < 1:
+            raise ValueError("X86Board requires at least one CopyEngine.")
+        if copy_engine_channels < 1:
+            raise ValueError(
+                "X86Board requires at least one CopyEngine channel."
+            )
+        if copy_engine_channels > 64:
+            raise ValueError(
+                "X86Board only supports up to 64 CopyEngine channels."
+            )
+        if _COPY_ENGINE_FIRST_PCI_DEV + num_copy_engines - 1 > 31:
+            raise ValueError(
+                "X86Board only supports CopyEngine PCI device numbers up to 31."
+            )
+
         self._cxl_memory_ptr = cxl_memory
         self._is_asic = is_asic
+        self._num_copy_engines = num_copy_engines
+        self._copy_engine_channels = copy_engine_channels
+        self._copy_engine_xfercap = copy_engine_xfercap
 
         super().__init__(
             clk_freq=clk_freq,
@@ -107,10 +150,22 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         self.pc = Pc()
         # cxl_device is dynamically initialized and attached
         self.pc.south_bridge.cxl_device = CXLMemCtrl(pci_func=0, pci_dev=6, pci_bus=0)
-        # Dedicated DMA copy engine (IOAT-like) for async payload offload.
-        self.pc.south_bridge.copy_engine = CopyEngine(
-            pci_func=0, pci_dev=7, pci_bus=0, ChanCnt=1,
-        )
+
+        copy_engines = [
+            CopyEngine(
+                pci_func=0,
+                pci_dev=_COPY_ENGINE_FIRST_PCI_DEV + engine_index,
+                pci_bus=0,
+                ChanCnt=self._copy_engine_channels,
+                XferCap=self._copy_engine_xfercap,
+                BAR0=PciMemBar(
+                    size=f"{_get_copy_engine_bar0_size(self._copy_engine_channels)}B"
+                ),
+            )
+            for engine_index in range(self._num_copy_engines)
+        ]
+        self.pc.south_bridge.copy_engines = copy_engines
+        object.__setattr__(self, "copy_engines", copy_engines)
 
         self.workload = X86FsLinux()
 
@@ -121,6 +176,22 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         self._setup_io_devices()
 
         self.m5ops_base = 0xFFFF0000
+
+    def _get_copy_engine_dma_ports(self) -> List[Port]:
+        return [
+            copy_engine.dma[channel_index]
+            for copy_engine in self.copy_engines
+            for channel_index in range(copy_engine.ChanCnt)
+        ]
+
+    def _attach_copy_engines_to_iobus(self, connect_dma: bool) -> None:
+        for copy_engine in self.copy_engines:
+            copy_engine.pio = self.get_io_bus().mem_side_ports
+            if connect_dma:
+                copy_engine.dma = [
+                    self.get_io_bus().cpu_side_ports
+                    for _ in range(copy_engine.ChanCnt)
+                ]
 
     def _setup_io_devices(self):
         """Sets up the x86 IO devices.
@@ -171,12 +242,14 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         cxl_mem_ctrl.rpc_engine = self.rpc_engine
 
         # Setup memory system specific settings.
-        if self.get_cache_hierarchy().is_ruby():
+        is_ruby = self.get_cache_hierarchy().is_ruby()
+        if is_ruby:
             self.pc.attachIO(
                 self.get_io_bus(),
                 [
                     self.pc.south_bridge.ide.dma,
                     cxl_mem_ctrl.dma,
+                    *self._get_copy_engine_dma_ports(),
                 ],
             )
             # Ruby path passes cxl DMA explicitly, so SouthBridge.attachIO does
@@ -217,14 +290,11 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             ]
 
             self.pc.attachIO(self.get_io_bus())
-            self.pc.south_bridge.copy_engine.dma = [
-                self.get_io_bus().cpu_side_ports
-                for _ in range(self.pc.south_bridge.copy_engine.ChanCnt)
-            ]
 
-            # SouthBridge.attachIO does not wire CopyEngine PIO by default.
-            # Explicitly connect it so MMIO BAR accesses reach the device.
-            self.pc.south_bridge.copy_engine.pio = self.get_io_bus().mem_side_ports
+        # SouthBridge.attachIO does not wire CopyEngine instances.
+        # Explicitly connect their BAR MMIO window, and on non-Ruby systems
+        # connect each DMA channel to the I/O bus.
+        self._attach_copy_engines_to_iobus(connect_dma=not is_ruby)
 
         # Add in a Bios information structure.
         self.workload.smbios_table.structures = [X86SMBiosBiosInformation()]
@@ -349,6 +419,7 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             self.iobus.mem_side_ports,
             self.pc.south_bridge.cxl_device.dma,
         ]
+        dma_ports.extend(self._get_copy_engine_dma_ports())
         return dma_ports
 
     @overrides(AbstractSystemBoard)

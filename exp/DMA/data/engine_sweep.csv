@@ -1,0 +1,6 @@
+n,engines,channels,lanes,total_bytes_per_lane,aggregate_bytes,loops,min_ns,avg_ns,p50_ns,p90_ns,p95_ns,p99_ns,max_ns,best_total_gib_per_s,avg_total_gib_per_s,p50_total_gib_per_s,p99_total_gib_per_s,worst_total_gib_per_s,avg_per_lane_gib_per_s,line,board_log
+1,1,1,1,4194304,4194304,3,848016,849066,849163,850021,850021,850021,850021,4.606,4.601,4.600,4.595,4.595,4.601,555,/home/wq/sh/SimCXL/exp/DMA/data/raw/ce_matrix_16e16c_20260310_010640.board.pc.com_1.device
+2,2,1,2,4194304,8388608,3,886203,886575,886438,887085,887085,887085,887085,8.816,8.812,8.813,8.807,8.807,4.406,569,/home/wq/sh/SimCXL/exp/DMA/data/raw/ce_matrix_16e16c_20260310_010640.board.pc.com_1.device
+4,4,1,4,4194304,16777216,3,1252507,1266166,1260646,1285345,1285345,1285345,1285345,12.475,12.340,12.394,12.156,12.156,3.085,589,/home/wq/sh/SimCXL/exp/DMA/data/raw/ce_matrix_16e16c_20260310_010640.board.pc.com_1.device
+8,8,1,8,4194304,33554432,3,2169547,2187496,2184320,2208622,2208622,2208622,2208622,14.404,14.286,14.307,14.149,14.149,1.786,621,/home/wq/sh/SimCXL/exp/DMA/data/raw/ce_matrix_16e16c_20260310_010640.board.pc.com_1.device
+16,16,1,16,4194304,67108864,3,4569558,4657458,4619103,4783714,4783714,4783714,4783714,13.677,13.419,13.531,13.065,13.065,0.839,677,/home/wq/sh/SimCXL/exp/DMA/data/raw/ce_matrix_16e16c_20260310_010640.board.pc.com_1.device

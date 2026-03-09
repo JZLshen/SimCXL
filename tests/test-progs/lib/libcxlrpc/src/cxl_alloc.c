@@ -9,6 +9,7 @@
 
 #include "cxl_alloc.h"
 
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -45,6 +46,17 @@ struct cxl_global_allocator {
 static inline size_t align_up_64(size_t size)
 {
     return (size + 63) & ~(size_t)63;
+}
+
+static size_t
+cxl_connection_span_align(size_t size)
+{
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0)
+        return align_up_64(size);
+
+    size_t page = (size_t)page_size;
+    return (size + page - 1u) & ~(page - 1u);
 }
 
 cxl_global_alloc_t *cxl_global_alloc_init(uint64_t base_addr,
@@ -273,7 +285,8 @@ int cxl_global_alloc_connection(cxl_global_alloc_t *alloc,
     const size_t req_off = CXL_CONN_OFF_REQUEST_DATA;
     const size_t resp_off = align_up_64(req_off + req_size);
     const size_t flag_off = align_up_64(resp_off + resp_size);
-    const size_t conn_span = align_up_64(flag_off + CXL_ALLOC_MIN_SIZE);
+    const size_t conn_span =
+        cxl_connection_span_align(flag_off + CXL_DEFAULT_FLAG_SIZE);
 
     if (mq_off < doorbell_off + CXL_DEFAULT_DOORBELL_SIZE)
         return -1;

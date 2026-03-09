@@ -86,8 +86,7 @@ cxl_lib_errorf(const char *fmt, ...)
 static inline size_t
 cxl_response_entry_size(size_t payload_len)
 {
-    const size_t header_size = 12;
-    const size_t total_size = header_size + payload_len;
+    const size_t total_size = CXL_RESP_HEADER_LEN + payload_len;
     return ((total_size + 63) / 64) * 64;
 }
 
@@ -369,50 +368,286 @@ static int cxl_rpc_phys_range_valid(const cxl_context_t *ctx,
  * Connection Management
  * ================================================================ */
 
-static inline uint32_t
-cxl_req_id_prng_next(cxl_connection_t *conn)
+static inline uint16_t
+cxl_req_id_seq_mask_for_client_tag_bits(uint8_t client_tag_bits)
 {
-    uint32_t x = conn->req_id_prng_state;
-    if (x == 0)
-        x = 0xA341316Cu;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    conn->req_id_prng_state = x;
-    return x;
+    if (client_tag_bits == 0)
+        return (uint16_t)CXL_REQ_ID_MASK;
+    return (uint16_t)((1u << (16u - client_tag_bits)) - 1u);
+}
+
+static inline uint16_t
+cxl_req_id_client_tag_base_for_config(uint16_t client_tag,
+                                      uint8_t client_tag_bits)
+{
+    if (client_tag_bits == 0)
+        return 0;
+    return (uint16_t)(client_tag << (16u - client_tag_bits));
+}
+
+static inline int
+cxl_req_id_inflight_test(const cxl_connection_t *conn, uint16_t req_id)
+{
+    return ((conn->req_id_inflight_bitmap[req_id >> 6] >>
+             (req_id & 0x3Fu)) & 0x1ULL) != 0;
+}
+
+static inline void
+cxl_req_id_inflight_set(cxl_connection_t *conn, uint16_t req_id)
+{
+    conn->req_id_inflight_bitmap[req_id >> 6] |= (1ULL << (req_id & 0x3Fu));
+}
+
+static inline void
+cxl_req_id_inflight_clear(cxl_connection_t *conn, uint16_t req_id)
+{
+    conn->req_id_inflight_bitmap[req_id >> 6] &= ~(1ULL << (req_id & 0x3Fu));
+}
+
+static void cxl_req_id_allocator_release(cxl_connection_t *conn,
+                                         uint16_t req_id);
+
+static int
+cxl_connection_state_arrays_init(cxl_connection_t *conn)
+{
+    if (!conn)
+        return -1;
+
+    if (!conn->req_id_inflight_bitmap) {
+        conn->req_id_inflight_bitmap =
+            (uint64_t *)calloc((size_t)CXL_REQ_ID_BITMAP_WORDS,
+                               sizeof(uint64_t));
+    }
+    if (!conn->req_entry_offsets) {
+        conn->req_entry_offsets =
+            (uint32_t *)calloc((size_t)CXL_REQ_ID_SPACE, sizeof(uint32_t));
+    }
+    if (!conn->req_entry_sizes) {
+        conn->req_entry_sizes =
+            (uint32_t *)calloc((size_t)CXL_REQ_ID_SPACE, sizeof(uint32_t));
+    }
+    if (!conn->req_entry_next) {
+        conn->req_entry_next =
+            (uint16_t *)calloc((size_t)CXL_REQ_ID_SPACE, sizeof(uint16_t));
+    }
+    if (!conn->req_entry_complete) {
+        conn->req_entry_complete =
+            (uint8_t *)calloc((size_t)CXL_REQ_ID_SPACE, sizeof(uint8_t));
+    }
+
+    if (!conn->req_id_inflight_bitmap || !conn->req_entry_offsets ||
+        !conn->req_entry_sizes || !conn->req_entry_next ||
+        !conn->req_entry_complete) {
+        return -1;
+    }
+
+    return 0;
 }
 
 static void
-cxl_req_id_allocator_init(cxl_connection_t *conn)
+cxl_request_ring_state_reset(cxl_connection_t *conn)
 {
     if (!conn)
         return;
 
-    uint64_t mix = 0x9E3779B97F4A7C15ULL ^
-                   conn->addrs.doorbell_addr ^
-                   conn->addrs.metadata_queue_addr ^
-                   conn->addrs.request_data_addr ^
-                   (((uint64_t)(uintptr_t)conn) >> 4);
-    uint32_t seed = (uint32_t)(mix ^ (mix >> 32));
-    if (seed == 0)
-        seed = 0xA5A5A5A5u;
-    conn->req_id_prng_state = seed;
+    if (conn->req_entry_offsets) {
+        memset(conn->req_entry_offsets, 0,
+               (size_t)CXL_REQ_ID_SPACE * sizeof(uint32_t));
+    }
+    if (conn->req_entry_sizes) {
+        memset(conn->req_entry_sizes, 0,
+               (size_t)CXL_REQ_ID_SPACE * sizeof(uint32_t));
+    }
+    if (conn->req_entry_next) {
+        memset(conn->req_entry_next, 0,
+               (size_t)CXL_REQ_ID_SPACE * sizeof(uint16_t));
+    }
+    if (conn->req_entry_complete) {
+        memset(conn->req_entry_complete, 0,
+               (size_t)CXL_REQ_ID_SPACE * sizeof(uint8_t));
+    }
+
+    conn->req_ring_head_id = 0;
+    conn->req_ring_tail_id = 0;
+    conn->req_reclaim_offset = 0;
+    conn->req_ring_used_bytes = 0;
+    conn->req_write_offset = 0;
 }
 
-static inline uint16_t
-cxl_generate_request_id(cxl_connection_t *conn)
+static int
+cxl_req_id_allocator_init(cxl_connection_t *conn)
 {
-    uint8_t prefix_bits = conn->req_id_prefix_bits;
-    uint16_t seq_mask = CXL_REQ_ID_MASK;
-    uint16_t prefix_base = 0;
-    if (prefix_bits > 0) {
-        seq_mask = (uint16_t)((1u << (16u - prefix_bits)) - 1u);
-        prefix_base = (uint16_t)(conn->req_id_prefix << (16u - prefix_bits));
+    uint32_t client_space = 0;
+    uint32_t response_slots = 0;
+
+    if (!conn)
+        return -1;
+
+    if (cxl_connection_state_arrays_init(conn) != 0)
+        return -1;
+
+    memset(conn->req_id_inflight_bitmap, 0,
+           (size_t)CXL_REQ_ID_BITMAP_WORDS * sizeof(uint64_t));
+    cxl_request_ring_state_reset(conn);
+
+    conn->req_id_client_tag_base =
+        cxl_req_id_client_tag_base_for_config(conn->req_id_client_tag,
+                                              conn->req_id_client_tag_bits);
+    conn->req_id_seq_mask =
+        cxl_req_id_seq_mask_for_client_tag_bits(conn->req_id_client_tag_bits);
+    conn->req_id_next_seq = (conn->req_id_client_tag_base == 0) ? 1u : 0u;
+    conn->req_id_inflight_count = 0;
+
+    client_space =
+        (conn->req_id_client_tag_base == 0) ?
+        (uint32_t)conn->req_id_seq_mask :
+        ((uint32_t)conn->req_id_seq_mask + 1u);
+    response_slots =
+        (uint32_t)(conn->addrs.response_data_size / CXL_RESP_SLOT_BYTES);
+    if (response_slots == 0)
+        response_slots = client_space;
+    conn->req_id_capacity =
+        (client_space < response_slots) ? client_space : response_slots;
+
+    return (conn->req_id_capacity > 0) ? 0 : -1;
+}
+
+static int
+cxl_request_ring_reserve(cxl_connection_t *conn,
+                         uint16_t req_id,
+                         size_t entry_size,
+                         size_t *out_offset)
+{
+    size_t offset = 0;
+    size_t region_size = 0;
+
+    if (!conn || !out_offset || req_id == 0 || entry_size == 0)
+        return -1;
+
+    region_size = conn->addrs.request_data_size;
+    if (region_size == 0 || entry_size > region_size)
+        return -1;
+    if ((region_size - conn->req_ring_used_bytes) < entry_size)
+        return -1;
+
+    if (conn->req_ring_used_bytes == 0) {
+        offset = 0;
+    } else {
+        offset = conn->req_write_offset;
+        if (offset >= conn->req_reclaim_offset) {
+            size_t tail_free = region_size - offset;
+            if (entry_size > tail_free) {
+                if (entry_size > conn->req_reclaim_offset)
+                    return -1;
+                offset = 0;
+            }
+        } else if (entry_size > (conn->req_reclaim_offset - offset)) {
+            return -1;
+        }
     }
-    uint16_t seq = (uint16_t)(cxl_req_id_prng_next(conn) & seq_mask);
-    if (seq == 0)
-        seq = 1;
-    return (uint16_t)(prefix_base | seq);
+
+    conn->req_entry_offsets[req_id] = (uint32_t)offset;
+    conn->req_entry_sizes[req_id] = (uint32_t)entry_size;
+    conn->req_entry_next[req_id] = 0;
+    conn->req_entry_complete[req_id] = 0;
+
+    if (conn->req_ring_tail_id != 0) {
+        conn->req_entry_next[conn->req_ring_tail_id] = req_id;
+    } else {
+        conn->req_ring_head_id = req_id;
+        conn->req_reclaim_offset = offset;
+    }
+    conn->req_ring_tail_id = req_id;
+    conn->req_ring_used_bytes += entry_size;
+    conn->req_write_offset = offset + entry_size;
+    if (conn->req_write_offset >= region_size)
+        conn->req_write_offset = 0;
+
+    *out_offset = offset;
+    return 0;
+}
+
+static void
+cxl_request_ring_mark_complete(cxl_connection_t *conn, uint16_t req_id)
+{
+    if (req_id == 0 || conn->req_entry_sizes[req_id] == 0)
+        return;
+
+    conn->req_entry_complete[req_id] = 1;
+
+    while (conn->req_ring_head_id != 0) {
+        uint16_t head_id = conn->req_ring_head_id;
+        uint16_t next_id = conn->req_entry_next[head_id];
+        size_t entry_size = conn->req_entry_sizes[head_id];
+        size_t entry_offset = conn->req_entry_offsets[head_id];
+
+        if (!conn->req_entry_complete[head_id])
+            break;
+
+        conn->req_ring_used_bytes -= entry_size;
+
+        conn->req_reclaim_offset = entry_offset + entry_size;
+        if (conn->req_reclaim_offset >= conn->addrs.request_data_size)
+            conn->req_reclaim_offset = 0;
+
+        conn->req_entry_offsets[head_id] = 0;
+        conn->req_entry_sizes[head_id] = 0;
+        conn->req_entry_next[head_id] = 0;
+        conn->req_entry_complete[head_id] = 0;
+        conn->req_ring_head_id = next_id;
+        if (next_id == 0)
+            conn->req_ring_tail_id = 0;
+    }
+
+    if (conn->req_ring_head_id == 0 && conn->req_ring_used_bytes == 0) {
+        conn->req_reclaim_offset = 0;
+        conn->req_write_offset = 0;
+    }
+}
+
+static int
+cxl_req_id_allocator_alloc(cxl_connection_t *conn, uint16_t *out_req_id)
+{
+    if (!conn || !out_req_id || !conn->req_id_inflight_bitmap)
+        return -1;
+
+    if (conn->req_id_inflight_count >= conn->req_id_capacity)
+        return -1;
+
+    const uint16_t prefix_base = conn->req_id_client_tag_base;
+    const uint16_t seq_mask = conn->req_id_seq_mask;
+    uint16_t seq = (uint16_t)(conn->req_id_next_seq & seq_mask);
+    const uint32_t scan_span = (uint32_t)seq_mask + 1u;
+
+    for (uint32_t i = 0; i < scan_span; i++) {
+        const uint16_t req_id = (uint16_t)(prefix_base | seq);
+        seq = (uint16_t)((seq + 1u) & seq_mask);
+        if (req_id == 0)
+            continue;
+        if (cxl_req_id_inflight_test(conn, req_id))
+            continue;
+
+        cxl_req_id_inflight_set(conn, req_id);
+        conn->req_id_inflight_count++;
+        conn->req_id_next_seq = seq;
+        *out_req_id = req_id;
+        return 0;
+    }
+
+    return -1;
+}
+
+static void
+cxl_req_id_allocator_release(cxl_connection_t *conn, uint16_t req_id)
+{
+    if (!conn || req_id == 0)
+        return;
+
+    if (!cxl_req_id_inflight_test(conn, req_id))
+        return;
+
+    cxl_req_id_inflight_clear(conn, req_id);
+    conn->req_id_inflight_count--;
 }
 
 static void connection_init_virt_ptrs(cxl_connection_t *conn)
@@ -427,40 +662,40 @@ static void connection_init_virt_ptrs(cxl_connection_t *conn)
     conn->flag = cxl_rpc_phys_to_virt(conn->ctx, conn->addrs.flag_addr);
 }
 
-/*
- * Touch the first byte with a read so page-table setup happens before hot-path
- * accesses, without creating dirty cache lines on DMA destination regions.
- */
-static inline void
-cxl_prefault_first_byte_ro(volatile uint8_t *ptr, size_t size)
-{
-    if (!ptr || size == 0)
-        return;
-
-    volatile uint8_t v = ptr[0];
-    (void)v;
-}
-
 static void
-cxl_prefault_each_page_ro(volatile uint8_t *ptr, size_t size)
+cxl_prefault_each_page_ro_and_flush_touched(volatile uint8_t *ptr, size_t size)
 {
     if (!ptr || size == 0)
         return;
 
     long ps = sysconf(_SC_PAGESIZE);
     if (ps <= 0) {
-        cxl_prefault_first_byte_ro(ptr, size);
+        volatile uint8_t v = ptr[0];
+        (void)v;
+        cxl_invalidate_cacheline((volatile uint8_t *)
+                                 (((uintptr_t)ptr) & ~((uintptr_t)63)));
+        __asm__ __volatile__("sfence" ::: "memory");
         return;
     }
 
     size_t page_size = (size_t)ps;
+    uintptr_t last_flushed_line = ~(uintptr_t)0;
     for (size_t off = 0; off < size; off += page_size) {
         volatile uint8_t v = ptr[off];
         (void)v;
+        uintptr_t line = (((uintptr_t)(ptr + off)) & ~((uintptr_t)63));
+        if (line != last_flushed_line) {
+            cxl_invalidate_cacheline((volatile uint8_t *)line);
+            last_flushed_line = line;
+        }
     }
 
     volatile uint8_t tail = ptr[size - 1];
     (void)tail;
+    uintptr_t tail_line = (((uintptr_t)(ptr + size - 1)) & ~((uintptr_t)63));
+    if (tail_line != last_flushed_line)
+        cxl_invalidate_cacheline((volatile uint8_t *)tail_line);
+    __asm__ __volatile__("sfence" ::: "memory");
 }
 
 static void
@@ -644,12 +879,7 @@ connection_register_metadata_translation_pages(cxl_connection_t *conn,
         return -1;
     }
 
-    long ps = sysconf(_SC_PAGESIZE);
-    if (ps <= 0) {
-        cxl_lib_errorf("metadata_translation_pages: sysconf(_SC_PAGESIZE) failed");
-        return -1;
-    }
-    const uint64_t page_size = (uint64_t)ps;
+    const uint64_t page_size = (uint64_t)CXL_METADATA_TRANSLATION_PAGE_BYTES;
     const uint64_t page_mask = ~(page_size - 1u);
     const uint64_t logical_start = conn->addrs.metadata_queue_addr;
     const uint64_t logical_end = logical_start + metadata_size;
@@ -659,13 +889,19 @@ connection_register_metadata_translation_pages(cxl_connection_t *conn,
     for (uint64_t logical_page = page_start;
          logical_page < page_end;
          logical_page += page_size) {
-        size_t page_off = (size_t)(logical_page - logical_start);
-        volatile uint8_t *virt_page = conn->metadata_queue + page_off;
+        volatile uint8_t *virt_page = conn->metadata_queue;
         uint64_t observed_page = 0;
+
+        if (logical_page >= logical_start) {
+            virt_page += (size_t)(logical_page - logical_start);
+        } else {
+            virt_page -= (size_t)(logical_start - logical_page);
+        }
+        (void)mlock((const void *)virt_page, (size_t)page_size);
+
         if (cxl_virt_to_phys_local((const void *)virt_page, &observed_page) != 0) {
-            cxl_lib_errorf("metadata_translation_pages: virt_to_phys failed logical_page=%#llx page_off=%zu virt=%p",
+            cxl_lib_errorf("metadata_translation_pages: virt_to_phys failed logical_page=%#llx virt=%p",
                            (unsigned long long)logical_page,
-                           page_off,
                            (const void *)virt_page);
             return -1;
         }
@@ -725,23 +961,20 @@ connection_finalize_setup(cxl_connection_t *conn,
         return -1;
 
     connection_init_virt_ptrs(conn);
-    cxl_prefault_each_page_ro(conn->metadata_queue, metadata_clear_size);
-    cxl_prefault_first_byte_ro(conn->request_data, conn->addrs.request_data_size);
-    cxl_prefault_first_byte_ro(conn->response_data, conn->addrs.response_data_size);
-    cxl_prefault_first_byte_ro(conn->flag, CXL_DEFAULT_FLAG_SIZE);
-
-    /*
-     * The completion flag must start empty on every connection setup. We do
-     * not eagerly zero the full response ring here because fixed-layout rings
-     * are 10MiB and whole-range zero+flush is prohibitively expensive under
-     * gem5 ATOMIC. Response publish uses CopyEngine source buffers that fully
-     * overwrite the destination entry.
-     */
-
-    cxl_zero_and_flush_range(conn->flag, CXL_DEFAULT_FLAG_SIZE);
+    cxl_prefault_each_page_ro_and_flush_touched(conn->metadata_queue,
+                                                metadata_clear_size);
+    cxl_prefault_each_page_ro_and_flush_touched(conn->flag,
+                                                CXL_DEFAULT_FLAG_SIZE);
 
     const int do_destructive_bootstrap =
         conn->owns_addrs || bootstrap_owner;
+
+    /*
+     * Owner/bootstrap paths reset the completion flag. Attach paths must not
+     * destroy already-published completions on a live shared connection.
+     */
+    if (do_destructive_bootstrap)
+        cxl_zero_and_flush_range(conn->flag, CXL_DEFAULT_FLAG_SIZE);
 
     if (do_destructive_bootstrap && conn->metadata_queue && metadata_clear_size > 0) {
         cxl_zero_and_flush_range(conn->metadata_queue, metadata_clear_size);
@@ -798,8 +1031,8 @@ cxl_connection_t *cxl_connection_create(cxl_context_t *ctx,
     conn->mq_entries = mq_entries;
     conn->owns_addrs = 1;
     conn->mq_phase = 1;  /* Must match RPC engine's initial phase (true=1) */
-    conn->req_id_prefix = 0;
-    conn->req_id_prefix_bits = 0;
+    conn->req_id_client_tag = 0;
+    conn->req_id_client_tag_bits = 0;
 
     /* Allocate regions via global allocator */
     size_t mq_size = (size_t)mq_entries * CXL_METADATA_ENTRY_SIZE;
@@ -810,7 +1043,10 @@ cxl_connection_t *cxl_connection_create(cxl_context_t *ctx,
         free(conn);
         return NULL;
     }
-    cxl_req_id_allocator_init(conn);
+    if (cxl_req_id_allocator_init(conn) != 0) {
+        cxl_connection_destroy(conn);
+        return NULL;
+    }
 
     if (connection_finalize_setup(conn, mq_size, 1) != 0) {
         cxl_connection_destroy(conn);
@@ -911,9 +1147,12 @@ cxl_connection_create_fixed_internal(cxl_context_t *ctx,
     conn->owns_addrs = 0;
     conn->mq_entries = mq_entries;
     conn->mq_phase = 1;  /* Must match RPC engine's initial phase (true=1) */
-    conn->req_id_prefix = 0;
-    conn->req_id_prefix_bits = 0;
-    cxl_req_id_allocator_init(conn);
+    conn->req_id_client_tag = 0;
+    conn->req_id_client_tag_bits = 0;
+    if (cxl_req_id_allocator_init(conn) != 0) {
+        cxl_connection_destroy(conn);
+        return NULL;
+    }
 
     if (connection_finalize_setup(conn, required_mq_size, bootstrap_owner) != 0) {
         cxl_lib_errorf("connection_create_fixed(%s): finalize_setup failed doorbell=%#llx metadata=%#llx request=%#llx response=%#llx flag=%#llx",
@@ -972,6 +1211,11 @@ void cxl_connection_destroy(cxl_connection_t *conn)
     if (conn->owns_addrs && conn->ctx && conn->ctx->allocator)
         cxl_global_free_connection(conn->ctx->allocator, &conn->addrs);
 
+    free(conn->req_id_inflight_bitmap);
+    free(conn->req_entry_offsets);
+    free(conn->req_entry_sizes);
+    free(conn->req_entry_next);
+    free(conn->req_entry_complete);
     free(conn);
 }
 
@@ -981,20 +1225,54 @@ const cxl_connection_addrs_t *cxl_connection_get_addrs(
     return conn ? &conn->addrs : NULL;
 }
 
-int cxl_connection_set_request_id_prefix(cxl_connection_t *conn,
-                                          uint16_t prefix,
-                                          uint8_t prefix_bits)
+int cxl_connection_set_client_tag(cxl_connection_t *conn,
+                                  uint16_t client_tag,
+                                  uint8_t client_tag_bits)
+{
+    uint16_t old_client_tag = 0;
+    uint8_t old_client_tag_bits = 0;
+
+    if (!conn)
+        return -1;
+    if (client_tag_bits > 15)
+        return -1;
+    if (client_tag_bits == 0 && client_tag != 0)
+        return -1;
+    if (client_tag_bits > 0 && client_tag >= (1u << client_tag_bits))
+        return -1;
+    if (conn->req_id_inflight_count != 0)
+        return -1;
+
+    old_client_tag = conn->req_id_client_tag;
+    old_client_tag_bits = conn->req_id_client_tag_bits;
+    conn->req_id_client_tag = client_tag;
+    conn->req_id_client_tag_bits = client_tag_bits;
+    if (cxl_req_id_allocator_init(conn) == 0)
+        return 0;
+
+    conn->req_id_client_tag = old_client_tag;
+    conn->req_id_client_tag_bits = old_client_tag_bits;
+    (void)cxl_req_id_allocator_init(conn);
+    return -1;
+}
+
+int cxl_connection_bind_copyengine_lane(cxl_connection_t *conn,
+                                        size_t engine_index,
+                                        uint32_t channel_index)
 {
     if (!conn)
         return -1;
-    if (prefix_bits > 15)
-        return -1;
-    if (prefix_bits > 0 && prefix >= (1u << prefix_bits))
-        return -1;
+    if (conn->ce_lane_assigned) {
+        if (conn->ce_engine_index != engine_index ||
+            conn->ce_hw_channel_id != channel_index) {
+            return -1;
+        }
+        return 0;
+    }
 
-    conn->req_id_prefix = prefix;
-    conn->req_id_prefix_bits = prefix_bits;
-    cxl_req_id_allocator_init(conn);
+    conn->ce_lane_bind_valid = 1;
+    conn->ce_bind_engine_index = engine_index;
+    conn->ce_bind_channel_id = channel_index;
     return 0;
 }
 
@@ -1002,11 +1280,11 @@ int cxl_connection_set_request_id_prefix(cxl_connection_t *conn,
  * Client API
  * ================================================================ */
 
-int32_t cxl_send_request(cxl_connection_t *conn,
-                          uint16_t service_id,
-                          uint16_t method_id,
-                          const void *data,
-                          size_t len)
+int cxl_send_request(cxl_connection_t *conn,
+                     uint16_t service_id,
+                     uint16_t method_id,
+                     const void *data,
+                     size_t len)
 {
     /* Parameter validation */
     if (!conn || !conn->doorbell)
@@ -1016,18 +1294,15 @@ int32_t cxl_send_request(cxl_connection_t *conn,
     if (len > 0 && !data)
         return -1;
 
-    cxl_lib_debugf("send_request begin svc=%u method=%u len=%zu mq_head=%u mq_phase=%u doorbell=%#llx request_data=%#llx",
-                   service_id, method_id, len, conn->mq_head, conn->mq_phase,
-                   (unsigned long long)conn->addrs.doorbell_addr,
-                   (unsigned long long)conn->addrs.request_data_addr);
-
     if (service_id > 0x0FFFu || method_id > 0x0FFFu)
         return -1;
 
-    if (len > CXL_REQ_PAYLOAD_SOFT_MAX || len > (size_t)CXL_REQ_META_LEN_MAX)
+    if (len > CXL_REQ_PAYLOAD_SOFT_MAX)
         return -1;
 
-    uint16_t req_id = cxl_generate_request_id(conn);
+    uint16_t req_id = 0;
+    if (cxl_req_id_allocator_alloc(conn, &req_id) != 0)
+        return -1;
 
     uint8_t doorbell_buf[16] __attribute__((aligned(16)));
 
@@ -1043,7 +1318,7 @@ int32_t cxl_send_request(cxl_connection_t *conn,
     } else {
         /* Non-inline: write request_data entry, then doorbell */
         if (!conn->request_data || conn->addrs.request_data_size == 0)
-            return -1;
+            goto fail_release_req_id;
 
         /*
          * request_data publish uses 64B cacheline slots.
@@ -1051,13 +1326,9 @@ int32_t cxl_send_request(cxl_connection_t *conn,
          * request_data stores payload bytes only (no in-band length header).
          */
         size_t entry_size = cxl_request_entry_size(len);
-        size_t offset = conn->req_write_offset;
-        size_t region_size = conn->addrs.request_data_size;
-        if (entry_size > region_size)
-            return -1;
-        if (offset + entry_size > region_size) {
-            offset = 0;
-        }
+        size_t offset = 0;
+        if (cxl_request_ring_reserve(conn, req_id, entry_size, &offset) != 0)
+            goto fail_release_req_id;
         uint8_t *entry_ptr = (uint8_t *)conn->request_data + offset;
         if (len > 0) {
             memcpy((void *)entry_ptr, data, len);
@@ -1082,14 +1353,9 @@ int32_t cxl_send_request(cxl_connection_t *conn,
         }
         __asm__ __volatile__("sfence" ::: "memory");
 
-        /* Compute physical address for doorbell data field */
+        /* Compute logical/protocol address for doorbell data field. */
         uint64_t entry_phys = conn->addrs.request_data_addr +
                               ((uint8_t *)entry_ptr - (uint8_t *)conn->request_data);
-
-        conn->req_write_offset = offset + entry_size;
-        if (conn->req_write_offset >= region_size) {
-            conn->req_write_offset = 0;
-        }
 
         cxl_build_doorbell(doorbell_buf, CXL_METHOD_REQUEST, 0,
                             service_id, method_id, req_id,
@@ -1113,120 +1379,100 @@ int32_t cxl_send_request(cxl_connection_t *conn,
     }
     __asm__ __volatile__("sfence" ::: "memory");
 
-    cxl_lib_debugf("send_request done req_id=%u payload_len=%zu inline=%d doorbell_addr=%#llx",
-                   req_id, len, len <= 8 ? 1 : 0,
-                   (unsigned long long)conn->addrs.doorbell_addr);
+    return (int)req_id;
 
-    return (int32_t)((uint32_t)req_id);
+fail_release_req_id:
+    cxl_req_id_allocator_release(conn, req_id);
+    return -1;
 }
 
-/* forward declarations for client response polling helpers */
-int cxl_peek_latest_response_request_id(cxl_connection_t *conn,
-                                         uint32_t *out_request_id);
+/* forward declarations for client response drain helpers */
+int cxl_peek_latest_completed_request_id(cxl_connection_t *conn,
+                                         uint16_t *out_request_id);
 
-int cxl_poll_next_response_view(cxl_connection_t *conn,
-                                 const void **out_data_view,
-                                 size_t *out_len,
-                                 uint32_t *out_response_request_id);
+int cxl_consume_next_response(cxl_connection_t *conn,
+                              void *out_data,
+                              size_t *out_len,
+                              uint16_t *out_request_id);
 
 static int
-cxl_poll_response_common(cxl_connection_t *conn,
-                         int32_t request_id,
-                         void *out_data,
-                         const void **out_data_view,
-                         size_t *out_len,
-                         uint32_t *out_response_request_id)
+cxl_advance_response_scan_offset(cxl_connection_t *conn)
 {
-    int ret = -1;
-    const int use_view = (out_data_view != NULL);
+    if (!conn || conn->addrs.response_data_size == 0)
+        return 0;
 
-    if (out_data_view)
-        *out_data_view = NULL;
-    if (out_response_request_id)
-        *out_response_request_id = 0;
+    if (conn->resp_read_offset == 0)
+        return 0;
 
-    if (!conn || !conn->response_data || !conn->flag ||
-        request_id <= 0 || !out_len ||
-        (!use_view && !out_data)) {
-        goto out;
-    }
+    /*
+     * Response entries are 64B-aligned and tightly packed. An empty slot can
+     * only mean we reached the producer's tail wrap and must restart at 0.
+     */
+    conn->resp_read_offset = 0;
+    return 1;
+}
 
+static int
+cxl_peek_next_response_entry(cxl_connection_t *conn,
+                             const volatile uint8_t **out_payload,
+                             size_t *out_len,
+                             uint16_t *out_request_id)
+{
+    if (out_payload)
+        *out_payload = NULL;
+    if (out_len)
+        *out_len = 0;
+    if (out_request_id)
+        *out_request_id = 0;
+
+    if (!conn || !conn->response_data ||
+        !out_payload || !out_len || !out_request_id)
+        return -1;
+    if (conn->addrs.response_data_size == 0)
+        return -1;
+
+    int advanced_gap_once = 0;
+
+retry_after_gap:
     if (conn->resp_read_offset >= conn->addrs.response_data_size) {
         conn->resp_read_offset = 0;
-        ret = -1;
-        goto out;
     }
 
     volatile uint8_t *resp = conn->response_data + conn->resp_read_offset;
-    uint32_t ready_req_id = 0;
-    int ready_rc = cxl_peek_latest_response_request_id(conn, &ready_req_id);
-    if (ready_rc < 0) {
-        ret = -1;
-        goto out;
-    }
-
-    /*
-     * Single-flag protocol:
-     * - flag carries "latest completed req_id"
-     * - consumer drains response_data ring in-order from resp_read_offset
-     * Exact-match rule:
-     * - Only when flag equals requested request_id do we touch response_data.
-     * - Any mismatch stays pending and avoids response_data load.
-     */
-    if (ready_rc == 0 || ready_req_id == 0) {
-        ret = 0;
-        goto out;
-    }
-    if (ready_req_id != (uint32_t)request_id) {
-        ret = 0;
-        goto out;
-    }
-
     __asm__ __volatile__("clflushopt (%0)" :: "r"((void *)resp) : "memory");
     __asm__ __volatile__("sfence" ::: "memory");
-    uint64_t header_lo = *(volatile uint64_t *)resp;
-    uint32_t payload_len_u32 = (uint32_t)(header_lo & 0xFFFFFFFFu);
-    uint32_t resp_req_id = (uint32_t)(header_lo >> 32);
-    if (out_response_request_id)
-        *out_response_request_id = resp_req_id;
+    uint64_t header = *(volatile uint64_t *)resp;
+    uint32_t payload_len_u32 = (uint32_t)(header & 0xFFFFFFFFu);
+    uint16_t resp_req_id = (uint16_t)((header >> 32) & 0xFFFFu);
+    uint16_t resp_rsp_id = (uint16_t)((header >> 48) & 0xFFFFu);
 
-    /*
-     * Multi-client single-flag protocol can observe a non-zero flag before the
-     * consumer's current response slot is populated. Treat zero header request
-     * id as "not ready" and keep polling without advancing ring offset.
-     */
-    if (resp_req_id == 0) {
-        ret = 0;
-        goto out;
-    }
-
-    if (resp_req_id != (uint32_t)request_id) {
-        cxl_lib_debugf("poll_response header mismatch want=%u flag=%u got=%u offset=%zu",
-                       (uint32_t)request_id, ready_req_id, resp_req_id,
-                       conn->resp_read_offset);
-        ret = 0;
-        goto out;
+    if (resp_req_id == 0 || resp_rsp_id == 0) {
+        if (!advanced_gap_once && cxl_advance_response_scan_offset(conn)) {
+            advanced_gap_once = 1;
+            goto retry_after_gap;
+        }
+        return 0;
     }
 
     size_t msg_len = (size_t)payload_len_u32;
+    if (msg_len > CXL_RESP_PAYLOAD_SOFT_MAX)
+        return -1;
     size_t entry_size = cxl_response_entry_size(msg_len);
-
-    if (entry_size > conn->addrs.response_data_size) {
-        ret = -1;
-        goto out;
-    }
+    if (entry_size > conn->addrs.response_data_size)
+        return -1;
 
     if (conn->resp_read_offset + entry_size > conn->addrs.response_data_size) {
-        conn->resp_read_offset = 0;
-        ret = 0;
-        goto out;
+        if (!advanced_gap_once && cxl_advance_response_scan_offset(conn)) {
+            advanced_gap_once = 1;
+            goto retry_after_gap;
+        }
+        return -1;
     }
+    if (resp_rsp_id != resp_req_id)
+        return -1;
+    if (!cxl_req_id_inflight_test(conn, resp_req_id))
+        return -1;
 
-    /*
-     * First-line invalidate above guarantees header freshness. For payloads
-     * spanning additional cachelines, invalidate the remaining lines before
-     * copy/view handoff so readers never observe stale tail bytes.
-     */
     if (entry_size > 64u) {
         uintptr_t entry_line_start = ((uintptr_t)resp) & ~((uintptr_t)63);
         uintptr_t entry_line_end =
@@ -1242,29 +1488,38 @@ cxl_poll_response_common(cxl_connection_t *conn,
         __asm__ __volatile__("sfence" ::: "memory");
     }
 
-    if (use_view) {
-        *out_data_view = (const void *)(resp + 12);
-        *out_len = msg_len;
-    } else {
-        size_t copy_len = msg_len < *out_len ? msg_len : *out_len;
-        memcpy(out_data, (void *)(resp + 12), copy_len);
-        *out_len = msg_len;
-    }
+    *out_payload = resp + CXL_RESP_HEADER_LEN;
+    *out_len = msg_len;
+    *out_request_id = resp_req_id;
+    return 1;
+}
 
+static inline void
+cxl_commit_response_head(cxl_connection_t *conn,
+                         uint16_t request_id,
+                         size_t msg_len)
+{
+    size_t entry_size = cxl_response_entry_size(msg_len);
+    if (conn->response_data &&
+        conn->resp_read_offset < conn->addrs.response_data_size) {
+        /*
+         * Clear the consumed header so future wraps never reinterpret stale
+         * entries as a still-live response.
+         */
+        cxl_zero_and_flush_range(conn->response_data + conn->resp_read_offset,
+                                 CXL_RESP_HEADER_LEN);
+    }
     conn->resp_read_offset += entry_size;
     if (conn->addrs.response_data_size > 0 &&
         conn->resp_read_offset >= conn->addrs.response_data_size) {
         conn->resp_read_offset = 0;
     }
-
-    ret = 1;
-
-out:
-    return ret;
+    cxl_request_ring_mark_complete(conn, request_id);
+    cxl_req_id_allocator_release(conn, request_id);
 }
 
-int cxl_peek_latest_response_request_id(cxl_connection_t *conn,
-                                         uint32_t *out_request_id)
+int cxl_peek_latest_completed_request_id(cxl_connection_t *conn,
+                                         uint16_t *out_request_id)
 {
     if (out_request_id)
         *out_request_id = 0;
@@ -1275,106 +1530,43 @@ int cxl_peek_latest_response_request_id(cxl_connection_t *conn,
     volatile uint8_t *flag = conn->flag;
     __asm__ __volatile__("clflushopt (%0)" :: "r"((void *)flag) : "memory");
     __asm__ __volatile__("sfence" ::: "memory");
-    uint32_t ready_req_id = *(volatile uint32_t *)flag;
-    *out_request_id = ready_req_id;
-    return (ready_req_id != 0) ? 1 : 0;
+    *out_request_id = *(volatile uint16_t *)flag;
+    return (*out_request_id != 0u) ? 1 : 0;
 }
 
-int cxl_poll_next_response_view(cxl_connection_t *conn,
-                                 const void **out_data_view,
-                                 size_t *out_len,
-                                 uint32_t *out_response_request_id)
+int cxl_consume_next_response(cxl_connection_t *conn,
+                              void *out_data,
+                              size_t *out_len,
+                              uint16_t *out_request_id)
 {
-    if (out_data_view)
-        *out_data_view = NULL;
-    if (out_len)
-        *out_len = 0;
-    if (out_response_request_id)
-        *out_response_request_id = 0;
+    if (out_request_id)
+        *out_request_id = 0;
 
-    if (!conn || !conn->response_data || !conn->flag ||
-        !out_data_view || !out_len || !out_response_request_id)
+    if (!conn || !conn->response_data || !out_data || !out_len ||
+        !out_request_id)
         return -1;
 
-    if (conn->resp_read_offset >= conn->addrs.response_data_size) {
-        conn->resp_read_offset = 0;
-        return -1;
-    }
+    size_t capacity = *out_len;
+    const volatile uint8_t *payload = NULL;
+    int peek_rc = cxl_peek_next_response_entry(conn,
+                                               &payload,
+                                               out_len,
+                                               out_request_id);
+    if (peek_rc != 1)
+        return peek_rc;
 
-    uint32_t latest_ready_req_id = 0;
-    int ready_rc = cxl_peek_latest_response_request_id(conn, &latest_ready_req_id);
-    if (ready_rc < 0)
-        return -1;
-    if (ready_rc == 0 || latest_ready_req_id == 0)
-        return 0;
-
-    volatile uint8_t *resp = conn->response_data + conn->resp_read_offset;
-    __asm__ __volatile__("clflushopt (%0)" :: "r"((void *)resp) : "memory");
-    __asm__ __volatile__("sfence" ::: "memory");
-
-    uint64_t header_lo = *(volatile uint64_t *)resp;
-    uint32_t payload_len_u32 = (uint32_t)(header_lo & 0xFFFFFFFFu);
-    uint32_t resp_req_id = (uint32_t)(header_lo >> 32);
-
-    if (resp_req_id == 0)
-        return 0;
-
-    *out_response_request_id = resp_req_id;
-
-    size_t msg_len = (size_t)payload_len_u32;
-    size_t entry_size = cxl_response_entry_size(msg_len);
-    if (entry_size > conn->addrs.response_data_size)
+    if (capacity < *out_len)
         return -1;
 
-    if (conn->resp_read_offset + entry_size > conn->addrs.response_data_size) {
-        conn->resp_read_offset = 0;
-        return 0;
-    }
+    /*
+     * A response is not considered complete on the client until the payload
+     * has been demand-loaded into caller-owned local memory.
+     */
+    if (*out_len > 0)
+        memcpy(out_data, (const void *)payload, *out_len);
 
-    if (entry_size > 64u) {
-        uintptr_t entry_line_start = ((uintptr_t)resp) & ~((uintptr_t)63);
-        uintptr_t entry_line_end =
-            (((uintptr_t)resp + entry_size) + 63u) & ~((uintptr_t)63);
-        for (uintptr_t line = entry_line_start + 64u;
-             line < entry_line_end; line += 64u) {
-            __asm__ __volatile__(
-                "clflushopt (%0)"
-                :
-                : "r"((void *)line)
-                : "memory");
-        }
-        __asm__ __volatile__("sfence" ::: "memory");
-    }
-
-    *out_data_view = (const void *)(resp + 12);
-    *out_len = msg_len;
-
-    conn->resp_read_offset += entry_size;
-    if (conn->addrs.response_data_size > 0 &&
-        conn->resp_read_offset >= conn->addrs.response_data_size) {
-        conn->resp_read_offset = 0;
-    }
-
+    cxl_commit_response_head(conn, *out_request_id, *out_len);
     return 1;
-}
-
-int cxl_poll_response(cxl_connection_t *conn,
-                       int32_t request_id,
-                       void *out_data,
-                       size_t *out_len)
-{
-    return cxl_poll_response_common(conn, request_id, out_data, NULL, out_len,
-                                    NULL);
-}
-
-int cxl_poll_response_view(cxl_connection_t *conn,
-                            int32_t request_id,
-                            const void **out_data_view,
-                            size_t *out_len,
-                            uint32_t *out_response_request_id)
-{
-    return cxl_poll_response_common(conn, request_id, NULL, out_data_view,
-                                    out_len, out_response_request_id);
 }
 
 /* ================================================================
@@ -1384,7 +1576,7 @@ int cxl_poll_response_view(cxl_connection_t *conn,
 int cxl_poll_request(cxl_connection_t *conn,
                       uint16_t *service_id,
                       uint16_t *method_id,
-                      uint32_t *request_id,
+                      uint16_t *request_id,
                       const void **out_data_view,
                       size_t *out_len)
 {
@@ -1474,7 +1666,7 @@ int cxl_poll_request(cxl_connection_t *conn,
     uint32_t mq_len = (uint32_t)((meta_lo >> 4) & CXL_REQ_META_LEN_MAX);
     uint16_t svc = (uint16_t)((meta_lo >> 24) & 0x0FFFu);
     uint16_t mid = (uint16_t)((meta_lo >> 36) & 0x0FFFu);
-    uint32_t rid = (uint32_t)((meta_lo >> 48) & 0xFFFFu);
+    uint16_t rid = (uint16_t)((meta_lo >> 48) & 0xFFFFu);
 
     if (service_id) *service_id = svc;
     if (method_id)  *method_id  = mid;
@@ -1490,41 +1682,12 @@ int cxl_poll_request(cxl_connection_t *conn,
             *out_data_view = (const void *)(entry + 8);
             *out_len = msg_len;
         } else {
-            /* Non-inline: bytes 8-15 contain request_data physical address */
+            /* Non-inline: bytes 8-15 contain request_data logical address. */
             uint64_t data_addr = meta_hi;
-
-            uint64_t local_base = conn->addrs.request_data_addr;
-            uint64_t local_size = (uint64_t)conn->addrs.request_data_size;
-            uint64_t peer_base = conn->peer_request_data_addr;
-            uint64_t peer_size = (uint64_t)conn->peer_request_data_size;
-
-            /* Strict white-list:
-             *  1) connection-local request_data region
-             *  2) explicitly configured peer request_data region
-             */
-            uint64_t region_base = 0;
-            uint64_t region_size = 0;
-            if (local_size > 0 &&
-                data_addr >= local_base &&
-                (data_addr - local_base) < local_size) {
-                region_base = local_base;
-                region_size = local_size;
-            } else if (peer_size > 0 &&
-                       data_addr >= peer_base &&
-                       (data_addr - peer_base) < peer_size) {
-                region_base = peer_base;
-                region_size = peer_size;
-            } else {
-                cxl_advance_mq_head_with_policy(conn, head_idx, head_line_idx,
-                                                mq_entries_per_line,
-                                                mq_total_lines,
-                                                mq_invalidate_consumed);
-                ret = -1;
-                goto out;
-            }
-
-            uint64_t entry_offset = data_addr - region_base;
-            if (entry_offset > region_size) {
+            size_t msg_len = (size_t)mq_len;
+            if (msg_len == 0 ||
+                msg_len > sizeof(conn->request_local_buf) ||
+                !cxl_rpc_phys_range_valid(conn->ctx, data_addr, msg_len)) {
                 cxl_advance_mq_head_with_policy(conn, head_idx, head_line_idx,
                                                 mq_entries_per_line,
                                                 mq_total_lines,
@@ -1534,21 +1697,9 @@ int cxl_poll_request(cxl_connection_t *conn,
             }
 
             volatile uint8_t *data_ptr = cxl_rpc_phys_to_virt(conn->ctx,
-                                                                data_addr);
+                                                              data_addr);
             if (data_ptr) {
-                size_t msg_len = (size_t)mq_len;
                 const volatile uint8_t *payload_ptr = data_ptr;
-
-                if (msg_len == 0 ||
-                    (uint64_t)msg_len > (region_size - entry_offset)) {
-                    ret = -1;
-                    goto out;
-                }
-
-                if (msg_len > sizeof(conn->request_local_buf)) {
-                    ret = -1;
-                    goto out;
-                }
 
                 /* Invalidate payload cacheline(s) before demand-load. */
                 uintptr_t line_start = ((uintptr_t)payload_ptr) & ~((uintptr_t)63);
@@ -1584,12 +1735,6 @@ int cxl_poll_request(cxl_connection_t *conn,
                                     mq_invalidate_consumed);
 
     ret = 1;
-    cxl_lib_debugf("poll_request hit req_id=%u svc=%u method=%u len=%zu mq_head=%u meta_lo=%#llx meta_hi=%#llx next_head=%u",
-                   rid, svc, mid, *out_len, head_idx,
-                   (unsigned long long)meta_lo,
-                   (unsigned long long)meta_hi,
-                   conn->mq_head);
-
 out:
     return ret;
 }
@@ -1598,9 +1743,56 @@ out:
  * Server Response API
  * ================================================================ */
 
-int cxl_connection_set_peer_addrs(cxl_connection_t *conn,
-                                   uint64_t peer_response_data_addr,
-                                   size_t peer_response_data_size)
+static int
+cxl_prepare_response_tx_path(cxl_connection_t *conn)
+{
+    if (!conn)
+        return -1;
+
+    conn->resp_tx_ready = 0;
+    if (!conn->peer_response_data || conn->peer_response_data_size == 0 ||
+        !conn->peer_flag || conn->peer_flag_addr == 0) {
+        return 0;
+    }
+
+    if (cxl_copyengine_update_peer_response_mapping(conn) != 0)
+        return -1;
+    if (cxl_copyengine_update_peer_flag_mapping(conn) != 0)
+        return -1;
+    if (cxl_copyengine_prepare(conn) != 0)
+        return -1;
+    if (cxl_copyengine_ensure_response_slots(conn) != 0)
+        return -1;
+
+    conn->resp_tx_ready = 1;
+    return 0;
+}
+
+static int
+cxl_pick_peer_response_offset(const cxl_connection_t *conn,
+                              size_t entry_size,
+                              size_t *out_offset)
+{
+    size_t offset = 0;
+
+    if (!conn || !out_offset || entry_size == 0)
+        return -1;
+    if (entry_size > conn->peer_response_data_size)
+        return -1;
+
+    offset = conn->peer_resp_write_offset;
+    if (offset >= conn->peer_response_data_size)
+        offset = 0;
+    if (offset + entry_size > conn->peer_response_data_size)
+        offset = 0;
+
+    *out_offset = offset;
+    return 0;
+}
+
+int cxl_connection_set_peer_response_data(cxl_connection_t *conn,
+                                          uint64_t peer_response_data_addr,
+                                          size_t peer_response_data_size)
 {
     if (!conn || !conn->ctx)
         return -1;
@@ -1614,7 +1806,10 @@ int cxl_connection_set_peer_addrs(cxl_connection_t *conn,
         return -1;
     }
 
-    /* Map virtual pointer */
+    /*
+     * Map peer logical region locally once so setup can observe the runtime
+     * DMA page map. Response submit no longer depends on this virtual pointer.
+     */
     volatile void *response_ptr = cxl_rpc_phys_to_virt(conn->ctx,
                                                         peer_response_data_addr);
 
@@ -1625,26 +1820,19 @@ int cxl_connection_set_peer_addrs(cxl_connection_t *conn,
     conn->peer_response_data_addr = peer_response_data_addr;
     conn->peer_response_data_size = peer_response_data_size;
     conn->peer_response_data = (volatile uint8_t *)response_ptr;
-    conn->peer_flag_addr = 0;
-    conn->peer_flag = NULL;
     conn->peer_resp_write_offset = 0;
-    cxl_prefault_each_page_ro(conn->peer_response_data, peer_response_data_size);
-    cxl_flush_range(conn->peer_response_data, peer_response_data_size);
-    if (cxl_copyengine_update_peer_response_mapping(conn) != 0)
+    /*
+     * Keep setup constant-time. Destination page translation is resolved on
+     * first use when a response segment actually targets that page.
+     */
+    if (cxl_prepare_response_tx_path(conn) != 0)
         return -1;
-    if (cxl_copyengine_update_peer_flag_mapping(conn) != 0)
-        return -1;
-
-    cxl_lib_debugf("set_peer_response_data addr=%#llx size=%zu ptr=%p",
-                   (unsigned long long)peer_response_data_addr,
-                   peer_response_data_size,
-                   (void *)conn->peer_response_data);
 
     return 0;
 }
 
-int cxl_connection_set_peer_flag_addr(cxl_connection_t *conn,
-                                       uint64_t peer_flag_addr)
+int cxl_connection_set_peer_response_flag_addr(cxl_connection_t *conn,
+                                               uint64_t peer_flag_addr)
 {
     if (!conn || !conn->ctx)
         return -1;
@@ -1652,125 +1840,67 @@ int cxl_connection_set_peer_flag_addr(cxl_connection_t *conn,
     if (peer_flag_addr == 0)
         return -1;
 
-    if (!cxl_rpc_phys_range_valid(conn->ctx, peer_flag_addr, CXL_FLAG_PUBLISH_LEN))
+    if (!cxl_rpc_phys_range_valid(conn->ctx, peer_flag_addr,
+                                  CXL_DEFAULT_FLAG_SIZE))
         return -1;
 
+    /*
+     * Map peer logical flag locally once so setup can observe the runtime
+     * DMA destination cacheline.
+     */
     volatile void *flag_ptr = cxl_rpc_phys_to_virt(conn->ctx, peer_flag_addr);
     if (!flag_ptr)
         return -1;
 
     conn->peer_flag_addr = peer_flag_addr;
     conn->peer_flag = (volatile uint8_t *)flag_ptr;
-    cxl_prefault_first_byte_ro(conn->peer_flag, CXL_FLAG_PUBLISH_LEN);
-    cxl_flush_range(conn->peer_flag, CXL_FLAG_PUBLISH_LEN);
-    if (cxl_copyengine_update_peer_flag_mapping(conn) != 0)
+    cxl_prefault_each_page_ro_and_flush_touched(conn->peer_flag,
+                                                CXL_DEFAULT_FLAG_SIZE);
+    if (cxl_prepare_response_tx_path(conn) != 0)
         return -1;
 
-    cxl_lib_debugf("set_peer_flag addr=%#llx ptr=%p",
-                   (unsigned long long)peer_flag_addr,
-                   (void *)conn->peer_flag);
-
-    /*
-     * Response publication is CopyEngine-only. Prepare it during setup so a
-     * missing or broken device is reported before the first response send.
-     */
-    if (cxl_copyengine_prepare(conn) != 0)
-        return -1;
-
-    cxl_lib_debugf("set_peer_flag copyengine ready=%d bar0=%p slots=%zu next_slot=%zu",
-                   conn->ce_ready,
-                   (void *)conn->ce_bar0,
-                   conn->ce_slots,
-                   conn->ce_next_slot);
-
-    return 0;
-}
-
-int cxl_connection_set_peer_request_data(cxl_connection_t *conn,
-                                          uint64_t peer_request_data_addr,
-                                          size_t peer_request_data_size)
-{
-    if (!conn || !conn->ctx)
-        return -1;
-
-    if (peer_request_data_addr == 0 || peer_request_data_size == 0)
-        return -1;
-
-    if (!cxl_rpc_phys_range_valid(conn->ctx,
-                                  peer_request_data_addr,
-                                  peer_request_data_size)) {
-        return -1;
-    }
-
-    volatile uint8_t *request_ptr =
-        (volatile uint8_t *)cxl_rpc_phys_to_virt(conn->ctx,
-                                                 peer_request_data_addr);
-    if (!request_ptr)
-        return -1;
-
-    conn->peer_request_data_addr = peer_request_data_addr;
-    conn->peer_request_data_size = peer_request_data_size;
-    cxl_prefault_first_byte_ro(request_ptr, peer_request_data_size);
-    cxl_lib_debugf("set_peer_request_data addr=%#llx size=%zu ptr=%p",
-                   (unsigned long long)peer_request_data_addr,
-                   peer_request_data_size,
-                   (void *)request_ptr);
     return 0;
 }
 
 int cxl_send_response(cxl_connection_t *conn,
-                      uint32_t request_id,
+                      uint16_t request_id,
                       const void *data,
                       size_t len)
 {
-    /* Comprehensive parameter validation */
-    if (!conn || !conn->peer_response_data || !conn->peer_flag)
+    size_t entry_size = 0;
+    size_t offset = 0;
+
+    if (!conn || !conn->resp_tx_ready)
         return -1;
     if (len > 0 && !data)
         return -1;
-
-    size_t entry_size = cxl_response_entry_size(len);
-    if (len > (size_t)UINT32_MAX)
+    if (request_id == 0)
         return -1;
-    if (entry_size > conn->peer_response_data_size)
+    if (len > CXL_RESP_PAYLOAD_SOFT_MAX)
         return -1;
 
-    /* Pick destination from peer response ring tail. */
-    size_t offset = conn->peer_resp_write_offset;
-    if (offset >= conn->peer_response_data_size)
-        offset = 0;
-    if (offset + entry_size > conn->peer_response_data_size)
-        offset = 0;
-
-    cxl_lib_debugf("send_response begin req_id=%u len=%zu entry_size=%zu offset=%zu dst_resp=%#llx dst_flag=%#llx",
-                   request_id, len, entry_size, offset,
-                   (unsigned long long)(conn->peer_response_data_addr + offset),
-                   (unsigned long long)conn->peer_flag_addr);
+    entry_size = cxl_response_entry_size(len);
+    if (cxl_pick_peer_response_offset(conn, entry_size, &offset) != 0)
+        return -1;
 
     /*
      * Preferred path: asynchronous CopyEngine offload.
      * Submit resp_data then flag in-order without waiting for completion.
-     * Destination readiness is prepared once during peer setup (prefault +
-     * flush), so submit only builds descriptors and rings the engine.
+     * Destination readiness is prepared once during peer setup, so submit only
+     * translates the logical offset into one or two observed DMA segments,
+     * builds descriptors, and rings the engine.
      */
-    const volatile uint8_t *dst_resp_ptr = conn->peer_response_data + offset;
     if (!cxl_copyengine_submit_response_async(conn, request_id, data, len,
-                                              dst_resp_ptr, entry_size)) {
+                                              offset, entry_size)) {
         fprintf(stderr,
                 "cxl_rpc: ERROR: CopyEngine submit path failed (req_id=%u)\n",
                 request_id);
-        cxl_lib_debugf("send_response fail req_id=%u ce_ready=%d ce_slots=%zu ce_next_slot=%zu ce_chain_started=%d",
-                       request_id, conn->ce_ready, conn->ce_slots,
-                       conn->ce_next_slot, conn->ce_chain_started);
         return -1;
     }
 
     conn->peer_resp_write_offset = offset + entry_size;
     if (conn->peer_resp_write_offset >= conn->peer_response_data_size)
         conn->peer_resp_write_offset = 0;
-
-    cxl_lib_debugf("send_response submitted req_id=%u next_offset=%zu",
-                   request_id, conn->peer_resp_write_offset);
 
     return 0;
 }

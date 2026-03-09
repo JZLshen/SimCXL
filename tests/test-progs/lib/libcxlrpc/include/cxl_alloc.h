@@ -26,11 +26,10 @@ extern "C" {
 #define CXL_DEFAULT_REQUEST_DATA_SIZE   (10 * 1024 * 1024)/* 10MB */
 #define CXL_DEFAULT_RESPONSE_DATA_SIZE  (10 * 1024 * 1024)/* 10MB */
 /*
- * Flag carries a 32-bit request_id in the current protocol.
- * Global allocator still rounds every region up to cacheline granularity
- * internally.
+ * Flag publishes a 16-bit request_id, but the storage region is still a full
+ * 64B cacheline because the CopyEngine writes the whole line atomically.
  */
-#define CXL_DEFAULT_FLAG_SIZE           4
+#define CXL_DEFAULT_FLAG_SIZE           64
 
 /*
  * Default per-connection logical layout (relative to connection base).
@@ -53,7 +52,8 @@ typedef struct cxl_global_allocator cxl_global_alloc_t;
 /**
  * Initialize global allocator for CXL memory space.
  *
- * @param base_addr  Physical base address of CXL memory (e.g., 0x100000000)
+ * @param base_addr  Logical/protocol base address of CXL memory
+ *                   (current board default: 0x100000000)
  * @param total_size Total size of CXL memory region
  * @return           Allocator handle, or NULL on failure
  */

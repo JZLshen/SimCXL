@@ -1,0 +1,1 @@
+../../../configs/example/gem5_library/x86-cxl-rpc-test.py

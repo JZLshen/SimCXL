@@ -46,6 +46,7 @@
 #define RESPONSE_DATA_OFFSET 0x00A05000ULL
 #define FLAG_OFFSET 0x01405000ULL
 
+#define METADATA_Q_SIZE_BYTES 16384ULL
 #define REQUEST_DATA_BYTES (10ULL * 1024ULL * 1024ULL)
 #define RESPONSE_DATA_BYTES (10ULL * 1024ULL * 1024ULL)
 
@@ -53,7 +54,7 @@
 #define DEFAULT_IDLE_PAUSE_ITERS 0
 #define DEFAULT_RESPONSE_SIZE 16
 #define MIN_RESPONSE_SIZE 8
-#define MAX_RESPONSE_SIZE (256u * 1024u)
+#define MAX_RESPONSE_SIZE (4096u - 8u)
 
 typedef struct __attribute__((packed)) {
     uint32_t lhs;
@@ -177,7 +178,7 @@ client_tag_bits(int num_clients)
 }
 
 static int
-resolve_client_id_from_request_id(uint32_t request_id, uint8_t bits,
+resolve_client_id_from_request_id(uint16_t request_id, uint8_t bits,
                                   int num_clients)
 {
     if (bits == 0)
@@ -185,7 +186,8 @@ resolve_client_id_from_request_id(uint32_t request_id, uint8_t bits,
     if (bits >= 16)
         return -1;
 
-    uint32_t cid = (request_id >> (16 - bits)) & ((1u << bits) - 1u);
+    uint16_t cid = (uint16_t)((request_id >> (16 - bits)) &
+                              ((1u << bits) - 1u));
     if ((int)cid >= num_clients)
         return -1;
     return (int)cid;
@@ -218,7 +220,7 @@ main(int argc, char **argv)
     if (parse_size_arg(argc, argv, "--response-size", DEFAULT_RESPONSE_SIZE,
                        MIN_RESPONSE_SIZE, MAX_RESPONSE_SIZE,
                        &response_size) != 0) {
-        fprintf(stderr, "server: invalid --response-size\n");
+        fprintf(stderr, "server: invalid --response-size (range 8B..4088B)\n");
         return 1;
     }
 
@@ -238,7 +240,7 @@ main(int argc, char **argv)
     cxl_connection_addrs_t addrs = {
         .doorbell_addr = server_base + DOORBELL_OFFSET,
         .metadata_queue_addr = server_base + METADATA_Q_OFFSET,
-        .metadata_queue_size = 16384,
+        .metadata_queue_size = METADATA_Q_SIZE_BYTES,
         .request_data_addr = server_base + REQUEST_DATA_OFFSET,
         .request_data_size = REQUEST_DATA_BYTES,
         .response_data_addr = server_base + RESPONSE_DATA_OFFSET,
@@ -249,12 +251,6 @@ main(int argc, char **argv)
     poll_conn = cxl_connection_create_fixed_owner(ctx, &addrs, 1024);
     if (!poll_conn) {
         fprintf(stderr, "server: connection_create_fixed_owner failed\n");
-        rc = 1;
-        goto cleanup;
-    }
-
-    if (cxl_connection_set_peer_request_data(poll_conn, CXL_BASE, CXL_SIZE) < 0) {
-        fprintf(stderr, "server: set peer request range failed\n");
         rc = 1;
         goto cleanup;
     }
@@ -271,22 +267,29 @@ main(int argc, char **argv)
             }
         }
 
-        if (cxl_connection_set_peer_addrs(resp_conns[i],
-                                          client_region_base(i) +
-                                              RESPONSE_DATA_OFFSET,
-                                          RESPONSE_DATA_BYTES) < 0) {
+        if (cxl_connection_bind_copyengine_lane(resp_conns[i], (size_t)i, 0) < 0) {
+            fprintf(stderr, "server: bind CopyEngine lane failed for client %d\n", i);
+            rc = 1;
+            goto cleanup;
+        }
+
+        if (cxl_connection_set_peer_response_data(resp_conns[i],
+                                                  client_region_base(i) +
+                                                      RESPONSE_DATA_OFFSET,
+                                                  RESPONSE_DATA_BYTES) < 0) {
             fprintf(stderr, "server: set peer response range failed\n");
             rc = 1;
             goto cleanup;
         }
 
-        if (cxl_connection_set_peer_flag_addr(resp_conns[i],
-                                              client_region_base(i) +
-                                                  FLAG_OFFSET) < 0) {
+        if (cxl_connection_set_peer_response_flag_addr(resp_conns[i],
+                                                       client_region_base(i) +
+                                                           FLAG_OFFSET) < 0) {
             fprintf(stderr, "server: set peer flag failed\n");
             rc = 1;
             goto cleanup;
         }
+
     }
 
     resp_payload = (uint8_t *)malloc(response_size);
@@ -300,7 +303,7 @@ main(int argc, char **argv)
 
     uint8_t req_id_tag_bits = client_tag_bits(num_clients);
     while (keep_running) {
-        uint32_t request_id = 0;
+        uint16_t request_id = 0;
         const void *req_data_view = NULL;
         size_t req_len = 0;
 
@@ -314,7 +317,7 @@ main(int argc, char **argv)
             int client_id = resolve_client_id_from_request_id(
                 request_id, req_id_tag_bits, num_clients);
             if (client_id < 0 || client_id >= num_clients) {
-                fprintf(stderr, "server: invalid request_id prefix\n");
+                fprintf(stderr, "server: invalid request_id client tag\n");
                 rc = 1;
                 break;
             }
@@ -339,7 +342,6 @@ main(int argc, char **argv)
                 rc = 1;
                 break;
             }
-
             requests_processed++;
             if (max_requests > 0 &&
                 requests_processed >= (uint64_t)max_requests) {

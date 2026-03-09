@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="620" viewBox="0 0 980 620">
+<rect width="100%" height="100%" fill="#fbfaf5"/>
+<text x="90" y="38" font-size="28" font-family="monospace" fill="#111">DMA Channel Sweep</text>
+<text x="90" y="62" font-size="16" font-family="monospace" fill="#555">gem5 KVM->TIMING, raw source: data/raw/ce_matrix_16e16c_20260310_010640.board.pc.com_1.device</text>
+<line x1="90" y1="530.0" x2="940" y2="530.0" stroke="#d9d4c7" stroke-width="1"/>
+<text x="78" y="535.0" text-anchor="end" font-size="14" font-family="monospace" fill="#444">0.0</text>
+<line x1="90" y1="455.0" x2="940" y2="455.0" stroke="#d9d4c7" stroke-width="1"/>
+<text x="78" y="460.0" text-anchor="end" font-size="14" font-family="monospace" fill="#444">2.7</text>
+<line x1="90" y1="380.0" x2="940" y2="380.0" stroke="#d9d4c7" stroke-width="1"/>
+<text x="78" y="385.0" text-anchor="end" font-size="14" font-family="monospace" fill="#444">5.3</text>
+<line x1="90" y1="305.0" x2="940" y2="305.0" stroke="#d9d4c7" stroke-width="1"/>
+<text x="78" y="310.0" text-anchor="end" font-size="14" font-family="monospace" fill="#444">8.0</text>
+<line x1="90" y1="230.0" x2="940" y2="230.0" stroke="#d9d4c7" stroke-width="1"/>
+<text x="78" y="235.0" text-anchor="end" font-size="14" font-family="monospace" fill="#444">10.7</text>
+<line x1="90" y1="155.0" x2="940" y2="155.0" stroke="#d9d4c7" stroke-width="1"/>
+<text x="78" y="160.0" text-anchor="end" font-size="14" font-family="monospace" fill="#444">13.3</text>
+<line x1="90" y1="80.0" x2="940" y2="80.0" stroke="#d9d4c7" stroke-width="1"/>
+<text x="78" y="85.0" text-anchor="end" font-size="14" font-family="monospace" fill="#444">16.0</text>
+<line x1="90" y1="80" x2="90" y2="530" stroke="#333" stroke-width="2"/>
+<line x1="90" y1="530" x2="940" y2="530" stroke="#333" stroke-width="2"/>
+<line x1="90.0" y1="530" x2="90.0" y2="538" stroke="#333" stroke-width="2"/>
+<text x="90.0" y="558" text-anchor="middle" font-size="15" font-family="monospace" fill="#222">1</text>
+<line x1="302.5" y1="530" x2="302.5" y2="538" stroke="#333" stroke-width="2"/>
+<text x="302.5" y="558" text-anchor="middle" font-size="15" font-family="monospace" fill="#222">2</text>
+<line x1="515.0" y1="530" x2="515.0" y2="538" stroke="#333" stroke-width="2"/>
+<text x="515.0" y="558" text-anchor="middle" font-size="15" font-family="monospace" fill="#222">4</text>
+<line x1="727.5" y1="530" x2="727.5" y2="538" stroke="#333" stroke-width="2"/>
+<text x="727.5" y="558" text-anchor="middle" font-size="15" font-family="monospace" fill="#222">8</text>
+<line x1="940.0" y1="530" x2="940.0" y2="538" stroke="#333" stroke-width="2"/>
+<text x="940.0" y="558" text-anchor="middle" font-size="15" font-family="monospace" fill="#222">16</text>
+<polyline fill="none" stroke="#0c7c59" stroke-width="4" points="90.0,395.4 302.5,282.2 515.0,180.0 727.5,137.6 940.0,132.0"/>
+<circle cx="90.0" cy="395.4" r="5.5" fill="#c43d2f"/>
+<text x="90.0" y="383.4" text-anchor="middle" font-size="14" font-family="monospace" fill="#222">4.786</text>
+<circle cx="302.5" cy="282.2" r="5.5" fill="#c43d2f"/>
+<text x="302.5" y="270.2" text-anchor="middle" font-size="14" font-family="monospace" fill="#222">8.812</text>
+<circle cx="515.0" cy="180.0" r="5.5" fill="#c43d2f"/>
+<text x="515.0" y="168.0" text-anchor="middle" font-size="14" font-family="monospace" fill="#222">12.444</text>
+<circle cx="727.5" cy="137.6" r="5.5" fill="#c43d2f"/>
+<text x="727.5" y="125.6" text-anchor="middle" font-size="14" font-family="monospace" fill="#222">13.951</text>
+<circle cx="940.0" cy="132.0" r="5.5" fill="#c43d2f"/>
+<text x="940.0" y="120.0" text-anchor="middle" font-size="14" font-family="monospace" fill="#222">14.152</text>
+<text x="515.0" y="592" text-anchor="middle" font-size="18" font-family="monospace" fill="#111">N (channel count on a single CopyEngine)</text>
+<text x="26" y="305.0" text-anchor="middle" font-size="18" font-family="monospace" fill="#111" transform="rotate(-90 26 305.0)">Bandwidth (GiB/s)</text>
+</svg>

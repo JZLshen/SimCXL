@@ -9,11 +9,17 @@
 
 #define _GNU_SOURCE
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
 
 #if defined(__has_include)
 #if __has_include(<gem5/m5ops.h>)
@@ -49,7 +55,7 @@
 #define RESPONSE_DATA_OFFSET 0x00A05000ULL
 #define FLAG_OFFSET 0x01405000ULL
 
-#define METADATA_Q_BYTES (16384ULL * 16ULL)
+#define METADATA_Q_SIZE_BYTES 16384ULL
 #define REQUEST_DATA_BYTES (10ULL * 1024ULL * 1024ULL)
 #define RESPONSE_DATA_BYTES (10ULL * 1024ULL * 1024ULL)
 
@@ -58,10 +64,12 @@
 #define DEFAULT_POLL_PAUSE_ITERS 0
 #define DEFAULT_REQUEST_SIZE 64
 #define DEFAULT_RESPONSE_SIZE 16
+#define DEFAULT_FIRST_REQ_BARRIER_TIMEOUT_MS 600000
 #define MIN_REQUEST_SIZE 8
 #define MIN_RESPONSE_SIZE 8
 #define MAX_REQUEST_SIZE (256u * 1024u)
-#define MAX_RESPONSE_SIZE (256u * 1024u)
+#define MAX_RESPONSE_SIZE (4096u - 8u)
+#define FIXED_SLIDING_WINDOW 4
 
 #define SERVICE_ID 1
 #define METHOD_ID_ADD 100
@@ -72,6 +80,14 @@ typedef struct __attribute__((packed)) {
 } add_request_t;
 
 #define REQ_ID_SPACE (1u << 16)
+#define FIRST_REQ_BARRIER_MAGIC 0x46524231u
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t num_clients;
+    uint32_t arrived_mask;
+    uint32_t reserved;
+} first_req_barrier_state_t;
 
 static volatile int keep_running = 1;
 
@@ -215,22 +231,6 @@ client_tag_bits(int num_clients)
     return bits;
 }
 
-static int
-find_pending_request_index(const int32_t *req_ids,
-                           const uint8_t *req_done,
-                           int request_count,
-                           uint32_t req_id)
-{
-    if (!req_ids || !req_done || request_count <= 0 || req_id == 0)
-        return -1;
-
-    for (int i = 0; i < request_count; i++) {
-        if (!req_done[i] && (uint32_t)req_ids[i] == req_id)
-            return i;
-    }
-    return -1;
-}
-
 static inline void
 spin_pause_iters(int poll_pause_iters)
 {
@@ -238,76 +238,262 @@ spin_pause_iters(int poll_pause_iters)
         __asm__ __volatile__("pause" ::: "memory");
 }
 
+static uint64_t
+monotonic_time_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000ULL +
+           (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static uint64_t
+parse_env_u64_or_default(const char *name, uint64_t default_val)
+{
+    const char *val = getenv(name);
+    if (!val || *val == '\0')
+        return default_val;
+
+    char *end = NULL;
+    unsigned long long parsed = strtoull(val, &end, 10);
+    if (!end || *end != '\0')
+        return default_val;
+
+    return (uint64_t)parsed;
+}
+
 static int
-drain_new_responses_round(cxl_connection_t *conn,
-                          const int32_t *req_ids,
-                          const uint64_t *start_ticks,
-                          uint8_t *req_done,
-                          int request_count,
-                          size_t expected_resp_len,
-                          uint64_t *end_ticks,
+build_first_req_barrier_path(char *buf, size_t buf_len, int num_clients)
+{
+    if (!buf || buf_len == 0)
+        return -1;
+
+    const char *env_path = getenv("CXL_RPC_FIRST_REQ_BARRIER_PATH");
+    if (env_path && *env_path != '\0') {
+        int n = snprintf(buf, buf_len, "%s", env_path);
+        return (n > 0 && (size_t)n < buf_len) ? 0 : -1;
+    }
+
+    pid_t sid = getsid(0);
+    if (sid < 0)
+        sid = 0;
+
+    int n = snprintf(buf, buf_len, "/tmp/cxl_rpc_first_req_barrier_s%ld_c%d",
+                     (long)sid, num_clients);
+    return (n > 0 && (size_t)n < buf_len) ? 0 : -1;
+}
+
+static int
+wait_all_clients_first_request(int num_clients, int client_id)
+{
+    if (num_clients <= 1)
+        return 0;
+    if (num_clients > 32 || client_id < 0 || client_id >= num_clients) {
+        fprintf(stderr, "client: invalid first-request barrier arguments\n");
+        return -1;
+    }
+
+    char barrier_path[256];
+    if (build_first_req_barrier_path(barrier_path, sizeof(barrier_path),
+                                     num_clients) != 0) {
+        fprintf(stderr, "client: build first-request barrier path failed\n");
+        return -1;
+    }
+
+    int fd = open(barrier_path, O_RDWR | O_CREAT, 0666);
+    if (fd < 0) {
+        fprintf(stderr,
+                "client: open first-request barrier failed path=%s errno=%d\n",
+                barrier_path, errno);
+        return -1;
+    }
+
+    if (ftruncate(fd, (off_t)sizeof(first_req_barrier_state_t)) != 0) {
+        fprintf(stderr, "client: ftruncate first-request barrier failed\n");
+        close(fd);
+        return -1;
+    }
+
+    first_req_barrier_state_t *state =
+        (first_req_barrier_state_t *)mmap(NULL,
+                                          sizeof(first_req_barrier_state_t),
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_SHARED, fd, 0);
+    if (state == MAP_FAILED) {
+        fprintf(stderr, "client: mmap first-request barrier failed\n");
+        close(fd);
+        return -1;
+    }
+
+    uint32_t full_mask =
+        (num_clients == 32) ? 0xFFFFFFFFu : ((1u << num_clients) - 1u);
+    uint32_t my_bit = (1u << client_id);
+
+    if (flock(fd, LOCK_EX) != 0) {
+        fprintf(stderr, "client: flock first-request barrier failed\n");
+        munmap(state, sizeof(first_req_barrier_state_t));
+        close(fd);
+        return -1;
+    }
+
+    if (state->magic != FIRST_REQ_BARRIER_MAGIC ||
+        state->num_clients != (uint32_t)num_clients ||
+        state->arrived_mask == full_mask) {
+        state->magic = FIRST_REQ_BARRIER_MAGIC;
+        state->num_clients = (uint32_t)num_clients;
+        state->arrived_mask = 0;
+        state->reserved = 0;
+    }
+
+    state->arrived_mask |= my_bit;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+    if (flock(fd, LOCK_UN) != 0) {
+        fprintf(stderr, "client: unlock first-request barrier failed\n");
+        munmap(state, sizeof(first_req_barrier_state_t));
+        close(fd);
+        return -1;
+    }
+
+    uint64_t timeout_ms = parse_env_u64_or_default(
+        "CXL_RPC_FIRST_REQ_BARRIER_TIMEOUT_MS",
+        DEFAULT_FIRST_REQ_BARRIER_TIMEOUT_MS);
+    uint64_t start_ms = monotonic_time_ms();
+
+    while (keep_running) {
+        uint32_t arrived = __atomic_load_n(&state->arrived_mask,
+                                           __ATOMIC_ACQUIRE);
+        if ((arrived & full_mask) == full_mask)
+            break;
+
+        if (timeout_ms > 0) {
+            uint64_t now_ms = monotonic_time_ms();
+            if (now_ms >= start_ms && (now_ms - start_ms) >= timeout_ms) {
+                fprintf(stderr,
+                        "client: first-request barrier timeout path=%s "
+                        "arrived_mask=0x%08x full_mask=0x%08x\n",
+                        barrier_path, arrived, full_mask);
+                munmap(state, sizeof(first_req_barrier_state_t));
+                close(fd);
+                return -1;
+            }
+        }
+        spin_pause_iters(64);
+    }
+
+    munmap(state, sizeof(first_req_barrier_state_t));
+    close(fd);
+    return keep_running ? 0 : -1;
+}
+
+static int
+send_one_request(cxl_connection_t *conn,
+                 uint8_t *req_payload,
+                 size_t request_size,
+                 uint32_t *rng_state,
+                 uint32_t *pending_slot_by_req_id,
+                 uint64_t *request_start_ticks,
+                 int sent_requests)
+{
+    if (!conn || !req_payload || !rng_state || !pending_slot_by_req_id ||
+        !request_start_ticks || sent_requests < 0) {
+        return -1;
+    }
+
+    add_request_t add_req = {
+        .lhs = next_random_u32(rng_state),
+        .rhs = next_random_u32(rng_state),
+    };
+    memcpy(req_payload, &add_req, sizeof(add_req));
+
+    for (size_t k = sizeof(add_req); k < request_size;) {
+        uint32_t random_word = next_random_u32(rng_state);
+        size_t remain = request_size - k;
+        size_t chunk = remain < sizeof(random_word) ? remain :
+                       sizeof(random_word);
+        memcpy(req_payload + k, &random_word, chunk);
+        k += chunk;
+    }
+
+    uint64_t start_tick = current_tick();
+    int req_id = cxl_send_request(conn, SERVICE_ID, METHOD_ID_ADD,
+                                  req_payload, request_size);
+    if (req_id <= 0 || req_id >= (int)REQ_ID_SPACE) {
+        fprintf(stderr, "client: cxl_send_request failed\n");
+        return -1;
+    }
+
+    pending_slot_by_req_id[req_id] = (uint32_t)sent_requests + 1u;
+    request_start_ticks[sent_requests] = start_tick;
+    return req_id;
+}
+
+static int
+drain_completed_responses(cxl_connection_t *conn,
+                          uint8_t *response_buf,
+                          size_t response_buf_size,
+                          uint32_t *pending_slot_by_req_id,
+                          uint64_t *request_end_ticks,
                           int *completed_requests)
 {
-    if (!conn || !req_ids || !start_ticks || !req_done ||
-        !end_ticks || !completed_requests) {
+    if (!conn || !response_buf || response_buf_size == 0 ||
+        !pending_slot_by_req_id || !request_end_ticks ||
+        !completed_requests) {
         return -1;
     }
 
-    uint32_t latest_flag_req_id = 0;
-    int peek_rc = cxl_peek_latest_response_request_id(conn, &latest_flag_req_id);
+    uint16_t latest_completed_req_id = 0;
+    int peek_rc =
+        cxl_peek_latest_completed_request_id(conn, &latest_completed_req_id);
     if (peek_rc < 0) {
-        fprintf(stderr, "client: cxl_peek_latest_response_request_id failed\n");
+        fprintf(stderr, "client: cxl_peek_latest_completed_request_id failed\n");
         return -1;
     }
-    if (peek_rc == 0 || latest_flag_req_id == 0)
+    if (peek_rc == 0)
         return 0;
 
-    int latest_pending_idx =
-        find_pending_request_index(req_ids, req_done,
-                                   request_count, latest_flag_req_id);
-    if (latest_pending_idx < 0)
+    if (pending_slot_by_req_id[latest_completed_req_id] == 0)
         return 0;
 
     int drained = 0;
     while (keep_running) {
-        const void *payload_view = NULL;
-        size_t resp_len = 0;
-        uint32_t got_req_id = 0;
-        int poll_ret = cxl_poll_next_response_view(conn, &payload_view,
-                                                   &resp_len, &got_req_id);
-        if (poll_ret < 0) {
-            fprintf(stderr, "client: cxl_poll_next_response_view failed\n");
+        size_t response_len = response_buf_size;
+        uint16_t consumed_req_id = 0;
+        int consume_rc = cxl_consume_next_response(conn,
+                                                   response_buf,
+                                                   &response_len,
+                                                   &consumed_req_id);
+        if (consume_rc < 0) {
+            fprintf(stderr, "client: cxl_consume_next_response failed\n");
             return -1;
         }
-        if (poll_ret == 0)
+        if (consume_rc == 0) {
             break;
+        }
 
-        if (expected_resp_len > 0 && resp_len != expected_resp_len) {
+        if (response_len != response_buf_size) {
             fprintf(stderr,
                     "client: response size mismatch expect=%zu got=%zu\n",
-                    expected_resp_len, resp_len);
+                    response_buf_size, response_len);
             return -1;
         }
 
-        int idx = find_pending_request_index(req_ids, req_done,
-                                             request_count, got_req_id);
-        if (idx < 0) {
+        uint32_t slot = pending_slot_by_req_id[consumed_req_id];
+        if (slot == 0) {
             fprintf(stderr,
                     "client: unexpected response req_id=%u not in pending list\n",
-                    got_req_id);
+                    consumed_req_id);
             return -1;
         }
+        int idx = (int)(slot - 1u);
 
-        uint64_t end_tick = current_tick();
-        if (end_tick < start_ticks[idx])
-            end_tick = start_ticks[idx];
-
-        end_ticks[idx] = end_tick;
-        req_done[idx] = 1;
+        request_end_ticks[idx] = current_tick();
+        pending_slot_by_req_id[consumed_req_id] = 0;
         (*completed_requests)++;
         drained = 1;
 
-        if (got_req_id == (uint32_t)req_ids[latest_pending_idx])
+        if (consumed_req_id == latest_completed_req_id)
             break;
     }
 
@@ -330,11 +516,11 @@ main(int argc, char **argv)
 
     cxl_context_t *ctx = NULL;
     cxl_connection_t *conn = NULL;
-    uint64_t *start_ticks = NULL;
-    uint64_t *end_ticks = NULL;
-    int32_t *req_ids = NULL;
-    uint8_t *req_done = NULL;
+    uint64_t *request_start_ticks = NULL;
+    uint64_t *request_end_ticks = NULL;
+    uint32_t *pending_slot_by_req_id = NULL;
     uint8_t *req_payload = NULL;
+    uint8_t *response_buf = NULL;
 
     int num_requests = parse_int_arg(argc, argv, "--requests",
                                      DEFAULT_NUM_REQUESTS);
@@ -370,7 +556,7 @@ main(int argc, char **argv)
     if (parse_size_arg(argc, argv, "--response-size", DEFAULT_RESPONSE_SIZE,
                        MIN_RESPONSE_SIZE, MAX_RESPONSE_SIZE,
                        &response_size) != 0) {
-        fprintf(stderr, "client: invalid --response-size\n");
+        fprintf(stderr, "client: invalid --response-size (range 8B..4088B)\n");
         return 1;
     }
 
@@ -393,7 +579,7 @@ main(int argc, char **argv)
         .doorbell_addr = server_base + DOORBELL_OFFSET +
                          ((uint64_t)(client_id + 1) * DOORBELL_STRIDE),
         .metadata_queue_addr = server_base + METADATA_Q_OFFSET,
-        .metadata_queue_size = (uint32_t)(METADATA_Q_BYTES / 16ULL),
+        .metadata_queue_size = (uint32_t)METADATA_Q_SIZE_BYTES,
         .request_data_addr = client_base + REQUEST_DATA_OFFSET,
         .request_data_size = REQUEST_DATA_BYTES,
         .response_data_addr = client_base + RESPONSE_DATA_OFFSET,
@@ -408,27 +594,35 @@ main(int argc, char **argv)
         goto cleanup;
     }
 
-    if (cxl_connection_set_request_id_prefix(conn, (uint16_t)client_id,
-                                             client_tag_bits(num_clients)) < 0) {
-        fprintf(stderr, "client: set request-id prefix failed\n");
+    if (cxl_connection_set_client_tag(conn, (uint16_t)client_id,
+                                      client_tag_bits(num_clients)) < 0) {
+        fprintf(stderr, "client: set client tag failed\n");
         rc = 1;
         goto cleanup;
     }
 
     size_t reserve_n = (num_requests > 0) ? (size_t)num_requests : 1;
-    start_ticks = (uint64_t *)calloc(reserve_n, sizeof(uint64_t));
-    end_ticks = (uint64_t *)calloc(reserve_n, sizeof(uint64_t));
-    req_ids = (int32_t *)calloc(reserve_n, sizeof(int32_t));
-    req_done = (uint8_t *)calloc(reserve_n, sizeof(uint8_t));
-    if (!start_ticks || !end_ticks || !req_ids || !req_done) {
+    request_start_ticks = (uint64_t *)calloc(reserve_n, sizeof(uint64_t));
+    request_end_ticks = (uint64_t *)calloc(reserve_n, sizeof(uint64_t));
+    pending_slot_by_req_id =
+        (uint32_t *)calloc(REQ_ID_SPACE, sizeof(uint32_t));
+    if (!request_start_ticks || !request_end_ticks || !pending_slot_by_req_id) {
         fprintf(stderr, "client: allocate tick buffers failed\n");
         rc = 1;
         goto cleanup;
     }
+    memset(request_end_ticks, 0xFF, reserve_n * sizeof(*request_end_ticks));
 
     req_payload = (uint8_t *)malloc(request_size);
     if (!req_payload) {
         fprintf(stderr, "client: allocate request payload failed\n");
+        rc = 1;
+        goto cleanup;
+    }
+
+    response_buf = (uint8_t *)malloc(response_size);
+    if (!response_buf) {
+        fprintf(stderr, "client: allocate response buffer failed\n");
         rc = 1;
         goto cleanup;
     }
@@ -444,68 +638,77 @@ main(int argc, char **argv)
                              (uint64_t)((max_polls > 0) ? max_polls : 1);
     uint64_t poll_rounds = 0;
 
-    for (int i = 0; keep_running && i < num_requests; i++) {
-        add_request_t add_req = {
-            .lhs = next_random_u32(&rng_state),
-            .rhs = next_random_u32(&rng_state),
-        };
-        memcpy(req_payload, &add_req, sizeof(add_req));
-
-        for (size_t k = sizeof(add_req); k < request_size;) {
-            uint32_t random_word = next_random_u32(&rng_state);
-            size_t remain = request_size - k;
-            size_t chunk = remain < sizeof(random_word) ? remain :
-                           sizeof(random_word);
-            memcpy(req_payload + k, &random_word, chunk);
-            k += chunk;
-        }
-
-        uint64_t start_tick = current_tick();
-        int32_t req_id = cxl_send_request(conn, SERVICE_ID, METHOD_ID_ADD,
-                                          req_payload, request_size);
-        if (req_id <= 0 || req_id >= (int32_t)REQ_ID_SPACE) {
-            fprintf(stderr, "client: cxl_send_request failed\n");
+    if (keep_running && num_requests > 0) {
+        int first_req_id = send_one_request(conn,
+                                            req_payload, request_size,
+                                            &rng_state, pending_slot_by_req_id,
+                                            request_start_ticks,
+                                            sent_requests);
+        if (first_req_id <= 0) {
             rc = 1;
-            break;
+            goto cleanup;
         }
-
-        if (find_pending_request_index(req_ids, req_done, sent_requests,
-                                       (uint32_t)req_id) >= 0) {
-            fprintf(stderr,
-                    "client: duplicate pending req_id=%d not supported\n",
-                    req_id);
-            rc = 1;
-            break;
-        }
-
-        req_ids[sent_requests] = req_id;
-        req_done[sent_requests] = 0;
-        start_ticks[sent_requests] = start_tick;
-        end_ticks[sent_requests] = 0;
         sent_requests++;
 
-        int round_rc = drain_new_responses_round(conn, req_ids, start_ticks,
-                                                 req_done, sent_requests,
-                                                 response_size, end_ticks,
-                                                 &completed_requests);
-        if (round_rc < 0) {
+        if (wait_all_clients_first_request(num_clients, client_id) != 0) {
+            fprintf(stderr, "client: first-request barrier failed\n");
             rc = 1;
-            break;
+            goto cleanup;
         }
-        poll_rounds++;
-        spin_pause_iters(poll_pause_iters);
     }
 
-    while (keep_running && rc == 0 && completed_requests < sent_requests) {
+    while (keep_running && rc == 0 && completed_requests < num_requests) {
+        int inflight = sent_requests - completed_requests;
+        int can_send = (sent_requests < num_requests);
+        int should_poll = (inflight >= FIXED_SLIDING_WINDOW) || !can_send;
+
+        if (can_send && !should_poll) {
+            int req_id = send_one_request(conn,
+                                          req_payload, request_size,
+                                          &rng_state, pending_slot_by_req_id,
+                                          request_start_ticks,
+                                          sent_requests);
+            if (req_id <= 0) {
+                rc = 1;
+                break;
+            }
+            sent_requests++;
+            continue;
+        }
+
         if (poll_rounds >= max_poll_rounds) {
-            fprintf(stderr, "client: timeout waiting response\n");
+            uint16_t latest_completed_req_id = 0;
+            int latest_rc =
+                cxl_peek_latest_completed_request_id(conn,
+                                                     &latest_completed_req_id);
+            int pending_req_id = -1;
+            uint32_t pending_slot = 0;
+            for (int rid = 1; rid < REQ_ID_SPACE; rid++) {
+                if (pending_slot_by_req_id[rid] != 0) {
+                    pending_req_id = rid;
+                    pending_slot = pending_slot_by_req_id[rid];
+                    break;
+                }
+            }
+            fprintf(stderr,
+                    "client[%d]: timeout waiting response sent=%d completed=%d poll_rounds=%lu latest_flag_rc=%d latest_flag_req_id=%u pending_req_id=%d pending_slot=%u\n",
+                    client_id,
+                    sent_requests,
+                    completed_requests,
+                    poll_rounds,
+                    latest_rc,
+                    latest_completed_req_id,
+                    pending_req_id,
+                    pending_slot);
             rc = 1;
             break;
         }
 
-        int round_rc = drain_new_responses_round(conn, req_ids, start_ticks,
-                                                 req_done, sent_requests,
-                                                 response_size, end_ticks,
+        int round_rc = drain_completed_responses(conn,
+                                                 response_buf,
+                                                 response_size,
+                                                 pending_slot_by_req_id,
+                                                 request_end_ticks,
                                                  &completed_requests);
         if (round_rc < 0) {
             rc = 1;
@@ -530,22 +733,23 @@ cleanup:
     }
 
     for (int i = 0; i < sent_requests; i++) {
-        if (!req_done[i])
+        if (request_end_ticks[i] == UINT64_MAX)
             continue;
-        uint64_t delta = (end_ticks[i] >= start_ticks[i]) ?
-                         (end_ticks[i] - start_ticks[i]) : 0;
-        printf("req_%d_start_tick=%lu\n", i, start_ticks[i]);
-        printf("req_%d_end_tick=%lu\n", i, end_ticks[i]);
+        uint64_t delta =
+            (request_end_ticks[i] >= request_start_ticks[i]) ?
+            (request_end_ticks[i] - request_start_ticks[i]) : 0;
+        printf("req_%d_start_tick=%lu\n", i, request_start_ticks[i]);
+        printf("req_%d_end_tick=%lu\n", i, request_end_ticks[i]);
         printf("req_%d_delta_tick=%lu\n", i, delta);
     }
     fflush(stdout);
     fflush(stderr);
 
-    free(start_ticks);
-    free(end_ticks);
-    free(req_ids);
-    free(req_done);
+    free(request_start_ticks);
+    free(request_end_ticks);
+    free(pending_slot_by_req_id);
     free(req_payload);
+    free(response_buf);
 
     return rc ? 1 : 0;
 }

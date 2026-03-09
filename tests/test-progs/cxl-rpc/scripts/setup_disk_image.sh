@@ -17,6 +17,7 @@ DISK_IMAGE="${1:-}"
 MOUNT_POINT="/tmp/gem5_disk_mount_$$"
 DEST_DIR="/home/test_code"
 M5_BIN="$SIMCXL_DIR/util/m5/build/x86/out/m5"
+LOOP_DEVICE=""
 
 # Core binaries to copy (default path).
 BINARIES=(
@@ -36,6 +37,11 @@ if [ "${CXL_RPC_INCLUDE_CE_SANITY:-0}" != "0" ]; then
     BINARIES+=("cxl_copyengine_sanity")
 fi
 
+# Optional standalone CopyEngine bandwidth benchmark.
+if [ "${CXL_RPC_INCLUDE_CE_BW:-0}" != "0" ]; then
+    BINARIES+=("cxl_copyengine_bw")
+fi
+
 # Optional hygiene mode: remove unrelated files under /home/test_code before
 # copying the current whitelist binaries.
 CLEAN_TEST_CODE_DIR="${CXL_RPC_CLEAN_TEST_CODE_DIR:-0}"
@@ -46,6 +52,7 @@ usage() {
     echo "Copy CXL RPC test binaries to gem5 disk image."
     echo "Requires sudo for mounting."
     echo "Set CXL_RPC_INCLUDE_COPY_CMP=1 to also copy cxl_mem_copy_cmp."
+    echo "Set CXL_RPC_INCLUDE_CE_BW=1 to also copy cxl_copyengine_bw."
     echo "Set CXL_RPC_CLEAN_TEST_CODE_DIR=1 to remove non-whitelist files in ${DEST_DIR}."
     echo ""
     echo "Arguments:"
@@ -103,19 +110,27 @@ mkdir -p "$MOUNT_POINT"
 cleanup() {
     echo "[5/5] Unmounting disk image..."
     sudo umount "$MOUNT_POINT" 2>/dev/null || true
+    if [ -n "$LOOP_DEVICE" ]; then
+        sudo losetup -d "$LOOP_DEVICE" 2>/dev/null || true
+    fi
     rmdir "$MOUNT_POINT" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-# Try direct mount first, then with partition offset
+# Try direct mount first, then use a loop device with partition scanning.
 if sudo mount -o loop "$DISK_IMAGE" "$MOUNT_POINT" 2>/dev/null; then
     echo "  Mounted directly"
 else
-    OFFSET=$(sudo fdisk -l "$DISK_IMAGE" 2>/dev/null | \
-             awk '/Linux/ {for(i=2;i<=NF;i++){if($i~/^[0-9]+$/){print $i*512; exit}}}')
-    if [ -n "$OFFSET" ] && [ "$OFFSET" -gt 0 ]; then
-        sudo mount -o loop,offset="$OFFSET" "$DISK_IMAGE" "$MOUNT_POINT"
-        echo "  Mounted with offset=$OFFSET"
+    LOOP_DEVICE="$(sudo losetup --find --show -Pf "$DISK_IMAGE" 2>/dev/null || true)"
+    LOOP_PARTITION=""
+    if [ -n "$LOOP_DEVICE" ]; then
+        LOOP_PARTITION="$(sudo lsblk -lnpo NAME,TYPE "$LOOP_DEVICE" 2>/dev/null | \
+                         awk '$2 == "part" {print $1; exit}')"
+    fi
+
+    if [ -n "$LOOP_PARTITION" ]; then
+        sudo mount "$LOOP_PARTITION" "$MOUNT_POINT"
+        echo "  Mounted via loop partition ${LOOP_PARTITION}"
     else
         echo "ERROR: Failed to mount disk image"
         exit 1
@@ -183,6 +198,7 @@ CLIENT_LOG="${CXL_RPC_CLIENT_LOG:-/home/test_code/cxl_rpc_client_runtime.log}"
 CLIENT_LOG_PREFIX="${CXL_RPC_CLIENT_LOG_PREFIX:-/home/test_code/cxl_rpc_client_runtime}"
 SERVER_READY_MARKER="${CXL_RPC_SERVER_READY_MARKER:-server_ready=1}"
 SERVER_READY_TIMEOUT_SEC="${CXL_RPC_SERVER_READY_TIMEOUT_SEC:-60}"
+FIRST_REQ_BARRIER_PATH="${CXL_RPC_FIRST_REQ_BARRIER_PATH:-/tmp/cxl_rpc_first_req_${$}_$RANDOM}"
 PIN_CORES="${CXL_RPC_PIN_CORES:-0}"
 SERVER_CORE="${CXL_RPC_SERVER_CORE:-0}"
 CLIENT_CORE_BASE="${CXL_RPC_CLIENT_CORE_BASE:-1}"
@@ -255,44 +271,17 @@ wait_for_server_ready() {
         < <(tail -n +1 -F --pid="$SERVER_PID" "$SERVER_LOG" 2>/dev/null)
 }
 
-emit_prefixed_file() {
+emit_tick_lines() {
     local file="$1"
     local prefix="$2"
 
-    if [ -f "$file" ]; then
-        sed -u "s/^/${prefix}/" "$file"
+    if [ ! -f "$file" ]; then
+        return 0
     fi
+
+    sed -nE "s/^req_([0-9]+)_(start|end|delta)_tick=([0-9]+)$/${prefix}req_\\1_\\2_tick=\\3/p" "$file"
 }
 
-if [ "$CLIENT_COUNT" -eq 1 ]; then
-    echo "=== CXL RPC Server-Client Test ==="
-else
-    echo "=== CXL RPC Multi-Client Test ==="
-fi
-echo "Server: $SERVER"
-echo "Client: $CLIENT"
-echo "Client count: $CLIENT_COUNT"
-echo "Client timeout sec: $CLIENT_TIMEOUT_SEC"
-echo "Server CXL map node: $SERVER_NUMA_NODE"
-echo "Client CXL map node: $CLIENT_NUMA_NODE"
-echo "Pin cores: $PIN_CORES"
-if [ "$PIN_CORES" != "0" ]; then
-    echo "Server core: $SERVER_CORE"
-    echo "Client core base: $CLIENT_CORE_BASE"
-fi
-echo "Server log: $SERVER_LOG"
-if [ "$CLIENT_COUNT" -eq 1 ]; then
-    echo "Client log: $CLIENT_LOG"
-else
-    echo "Client log prefix: $CLIENT_LOG_PREFIX"
-fi
-echo "Server args: $SERVER_ARGS"
-if [ "$#" -gt 0 ]; then
-    echo "Client base args: $*"
-fi
-echo ""
-
-echo "Starting server..."
 : > "$SERVER_LOG"
 if [ "$PIN_CORES" != "0" ]; then
     # shellcheck disable=SC2086
@@ -304,9 +293,8 @@ else
 fi
 SERVER_PID=$!
 
-echo "Waiting for server ready marker: $SERVER_READY_MARKER"
 if ! wait_for_server_ready; then
-    echo "[error] server did not report ready marker before timeout/exit"
+    echo "server_ready_timeout" >&2
     if kill -0 "$SERVER_PID" 2>/dev/null; then
         kill -TERM "$SERVER_PID" 2>/dev/null || true
     fi
@@ -314,8 +302,6 @@ if ! wait_for_server_ready; then
     wait "$SERVER_PID"
     SERVER_RC=$?
     set -e
-    emit_prefixed_file "$SERVER_LOG" "[SERVER] "
-    echo "Server exit code: $SERVER_RC"
     if [ "$SERVER_RC" -ne 0 ]; then
         exit "$SERVER_RC"
     fi
@@ -334,7 +320,6 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
     fi
     CLIENT_LOGS[$i]="$log"
     : > "$log"
-    echo "Starting client[$i]..."
     client_core=$((CLIENT_CORE_BASE + i))
 
     client_cmd=("$CLIENT" "$@")
@@ -344,20 +329,26 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
 
     if [ "$CLIENT_TIMEOUT_SEC" -gt 0 ]; then
         if [ "$PIN_CORES" != "0" ]; then
-            CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" timeout --signal=TERM --kill-after=2 \
+            CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                timeout --signal=TERM --kill-after=2 \
                 "${CLIENT_TIMEOUT_SEC}s" \
                 taskset -c "$client_core" "${client_cmd[@]}" >"$log" 2>&1 &
         else
-            CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" timeout --signal=TERM --kill-after=2 \
+            CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                timeout --signal=TERM --kill-after=2 \
                 "${CLIENT_TIMEOUT_SEC}s" \
                 "${client_cmd[@]}" >"$log" 2>&1 &
         fi
     else
         if [ "$PIN_CORES" != "0" ]; then
             CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
                 taskset -c "$client_core" "${client_cmd[@]}" >"$log" 2>&1 &
         else
             CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
                 "${client_cmd[@]}" >"$log" 2>&1 &
         fi
     fi
@@ -370,16 +361,12 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
     wait "${CLIENT_PIDS[$i]}"
     CLIENT_RCS[$i]=$?
     set -e
-    if [ "${CLIENT_RCS[$i]}" -eq 124 ]; then
-        echo "Client[$i] timed out after ${CLIENT_TIMEOUT_SEC}s"
-    fi
     if [ "${CLIENT_RCS[$i]}" -ne 0 ] && [ "$overall_rc" -eq 0 ]; then
         overall_rc="${CLIENT_RCS[$i]}"
     fi
 done
 
 if [ "$overall_rc" -ne 0 ] && kill -0 "$SERVER_PID" 2>/dev/null; then
-    echo "[cleanup] terminating server after client failure"
     kill -TERM "$SERVER_PID" 2>/dev/null || true
 fi
 
@@ -392,25 +379,18 @@ if [ "$SERVER_RC" -ne 0 ] && [ "$overall_rc" -eq 0 ]; then
     overall_rc="$SERVER_RC"
 fi
 
-emit_prefixed_file "$SERVER_LOG" "[SERVER] "
-for ((i = 0; i < CLIENT_COUNT; i++)); do
-    if [ "$CLIENT_COUNT" -eq 1 ]; then
-        emit_prefixed_file "${CLIENT_LOGS[$i]}" "[CLIENT] "
-    else
-        emit_prefixed_file "${CLIENT_LOGS[$i]}" "[CLIENT[$i]] "
-    fi
-done
-
-echo ""
-if [ "$CLIENT_COUNT" -eq 1 ]; then
-    echo "Client exit code: ${CLIENT_RCS[0]}"
-else
+if [ "$overall_rc" -eq 0 ] && [ "$SERVER_RC" -eq 0 ]; then
     for ((i = 0; i < CLIENT_COUNT; i++)); do
-        echo "Client[$i] exit code: ${CLIENT_RCS[$i]}"
+        if [ "$CLIENT_COUNT" -eq 1 ]; then
+            emit_tick_lines "${CLIENT_LOGS[$i]}" ""
+        else
+            emit_tick_lines "${CLIENT_LOGS[$i]}" "[CLIENT[$i]] "
+        fi
     done
+else
+    echo "rpc_test_failed rc=${overall_rc} server_rc=${SERVER_RC}" >&2
 fi
-echo "Server exit code: $SERVER_RC"
-echo "Overall rc: $overall_rc"
+rm -f "$FIRST_REQ_BARRIER_PATH" 2>/dev/null || true
 exit "$overall_rc"
 UNIFIED_HELPER_SCRIPT
 sudo chmod +x "${MOUNT_POINT}${DEST_DIR}/run_rpc_server_clients.sh"
