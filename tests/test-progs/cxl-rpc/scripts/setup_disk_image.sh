@@ -42,6 +42,11 @@ if [ "${CXL_RPC_INCLUDE_CE_BW:-0}" != "0" ]; then
     BINARIES+=("cxl_copyengine_bw")
 fi
 
+# Optional standalone CPU memmove bandwidth benchmark.
+if [ "${CXL_RPC_INCLUDE_CPU_MEMMOVE_BW:-0}" != "0" ]; then
+    BINARIES+=("cpu_memmove_bw")
+fi
+
 # Optional hygiene mode: remove unrelated files under /home/test_code before
 # copying the current whitelist binaries.
 CLEAN_TEST_CODE_DIR="${CXL_RPC_CLEAN_TEST_CODE_DIR:-0}"
@@ -53,6 +58,7 @@ usage() {
     echo "Requires sudo for mounting."
     echo "Set CXL_RPC_INCLUDE_COPY_CMP=1 to also copy cxl_mem_copy_cmp."
     echo "Set CXL_RPC_INCLUDE_CE_BW=1 to also copy cxl_copyengine_bw."
+    echo "Set CXL_RPC_INCLUDE_CPU_MEMMOVE_BW=1 to also copy cpu_memmove_bw."
     echo "Set CXL_RPC_CLEAN_TEST_CODE_DIR=1 to remove non-whitelist files in ${DEST_DIR}."
     echo ""
     echo "Arguments:"
@@ -324,7 +330,7 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
 
     client_cmd=("$CLIENT" "$@")
     if [ "$CLIENT_COUNT" -gt 1 ]; then
-        client_cmd+=("--num-clients" "$CLIENT_COUNT" "--client-id" "$i")
+        client_cmd+=("--num-clients" "$CLIENT_COUNT" "--node-id" "$i")
     fi
 
     if [ "$CLIENT_TIMEOUT_SEC" -gt 0 ]; then

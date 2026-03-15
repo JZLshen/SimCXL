@@ -159,38 +159,10 @@ parse_size_arg(int argc, char **argv, const char *flag, size_t default_val,
 }
 
 static inline uint64_t
-client_region_base(int client_id)
+node_region_base(int node_id)
 {
-    uint64_t slot = (uint64_t)client_id + 1ULL;
+    uint64_t slot = (uint64_t)node_id + 1ULL;
     return CXL_BASE + (slot * CLIENT_REGION_SIZE);
-}
-
-static uint8_t
-client_tag_bits(int num_clients)
-{
-    uint8_t bits = 0;
-    int v = (num_clients > 1) ? (num_clients - 1) : 0;
-    while (v > 0) {
-        bits++;
-        v >>= 1;
-    }
-    return bits;
-}
-
-static int
-resolve_client_id_from_request_id(uint16_t request_id, uint8_t bits,
-                                  int num_clients)
-{
-    if (bits == 0)
-        return 0;
-    if (bits >= 16)
-        return -1;
-
-    uint16_t cid = (uint16_t)((request_id >> (16 - bits)) &
-                              ((1u << bits) - 1u));
-    if ((int)cid >= num_clients)
-        return -1;
-    return (int)cid;
 }
 
 static void
@@ -241,11 +213,12 @@ main(int argc, char **argv)
         .doorbell_addr = server_base + DOORBELL_OFFSET,
         .metadata_queue_addr = server_base + METADATA_Q_OFFSET,
         .metadata_queue_size = METADATA_Q_SIZE_BYTES,
-        .request_data_addr = server_base + REQUEST_DATA_OFFSET,
-        .request_data_size = REQUEST_DATA_BYTES,
+        .request_data_addr = 0,
+        .request_data_size = 0,
         .response_data_addr = server_base + RESPONSE_DATA_OFFSET,
         .response_data_size = RESPONSE_DATA_BYTES,
         .flag_addr = server_base + FLAG_OFFSET,
+        .node_id = 0,
     };
 
     poll_conn = cxl_connection_create_fixed_owner(ctx, &addrs, 1024);
@@ -274,7 +247,7 @@ main(int argc, char **argv)
         }
 
         if (cxl_connection_set_peer_response_data(resp_conns[i],
-                                                  client_region_base(i) +
+                                                  node_region_base(i) +
                                                       RESPONSE_DATA_OFFSET,
                                                   RESPONSE_DATA_BYTES) < 0) {
             fprintf(stderr, "server: set peer response range failed\n");
@@ -283,7 +256,7 @@ main(int argc, char **argv)
         }
 
         if (cxl_connection_set_peer_response_flag_addr(resp_conns[i],
-                                                       client_region_base(i) +
+                                                       node_region_base(i) +
                                                            FLAG_OFFSET) < 0) {
             fprintf(stderr, "server: set peer flag failed\n");
             rc = 1;
@@ -292,7 +265,7 @@ main(int argc, char **argv)
 
     }
 
-    resp_payload = (uint8_t *)malloc(response_size);
+    resp_payload = (uint8_t *)calloc(1, response_size);
     if (!resp_payload) {
         fprintf(stderr, "server: allocate response buffer failed\n");
         rc = 1;
@@ -301,23 +274,20 @@ main(int argc, char **argv)
 
     printf("server_ready=1\n");
 
-    uint8_t req_id_tag_bits = client_tag_bits(num_clients);
     while (keep_running) {
-        uint16_t request_id = 0;
+        uint16_t node_id = 0;
+        uint16_t rpc_id = 0;
         const void *req_data_view = NULL;
         size_t req_len = 0;
 
         int ret = cxl_poll_request(poll_conn,
-                                   NULL,
-                                   NULL,
-                                   &request_id,
+                                   &node_id,
+                                   &rpc_id,
                                    &req_data_view,
                                    &req_len);
         if (ret == 1) {
-            int client_id = resolve_client_id_from_request_id(
-                request_id, req_id_tag_bits, num_clients);
-            if (client_id < 0 || client_id >= num_clients) {
-                fprintf(stderr, "server: invalid request_id client tag\n");
+            if (node_id >= (uint16_t)num_clients) {
+                fprintf(stderr, "server: invalid node_id=%u\n", node_id);
                 rc = 1;
                 break;
             }
@@ -333,10 +303,9 @@ main(int argc, char **argv)
             add_response_t add_resp = {
                 .sum = (uint64_t)req_view->lhs + (uint64_t)req_view->rhs,
             };
-            memset(resp_payload, 0, response_size);
             memcpy(resp_payload, &add_resp, sizeof(add_resp));
 
-            if (cxl_send_response(resp_conns[client_id], request_id,
+            if (cxl_send_response(resp_conns[node_id], rpc_id,
                                   resp_payload, response_size) < 0) {
                 fprintf(stderr, "server: send response failed\n");
                 rc = 1;

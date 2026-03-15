@@ -67,10 +67,16 @@ from ..processors.abstract_processor import AbstractProcessor
 from .abstract_system_board import AbstractSystemBoard
 from .kernel_disk_workload import KernelDiskWorkload
 
-_COPY_ENGINE_FIRST_PCI_DEV = 7
 _COPY_ENGINE_GENERAL_REG_SIZE = 0x80
 _COPY_ENGINE_CHANNEL_REG_SIZE = 0x80
 _COPY_ENGINE_LEGACY_BAR0_SIZE = 1024
+#
+# Keep CopyEngines on bus 0 / function 0 only.
+# Skip:
+# - dev 0 to avoid colliding with the conventional host-bridge slot
+# - dev 4 which is already used by the IDE controller
+# - dev 6 which is already used by the CXL memory controller
+_COPY_ENGINE_PCI_DEVS = tuple([1, 2, 3, 5] + list(range(7, 32)))
 
 
 def _next_power_of_two(size: int) -> int:
@@ -120,9 +126,11 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             raise ValueError(
                 "X86Board only supports up to 64 CopyEngine channels."
             )
-        if _COPY_ENGINE_FIRST_PCI_DEV + num_copy_engines - 1 > 31:
+        if num_copy_engines > len(_COPY_ENGINE_PCI_DEVS):
             raise ValueError(
-                "X86Board only supports CopyEngine PCI device numbers up to 31."
+                "X86Board only supports up to "
+                f"{len(_COPY_ENGINE_PCI_DEVS)} single-function CopyEngines "
+                "on PCI bus 0."
             )
 
         self._cxl_memory_ptr = cxl_memory
@@ -151,10 +159,13 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         # cxl_device is dynamically initialized and attached
         self.pc.south_bridge.cxl_device = CXLMemCtrl(pci_func=0, pci_dev=6, pci_bus=0)
 
+        selected_copy_engine_pci_devs = _COPY_ENGINE_PCI_DEVS[
+            : self._num_copy_engines
+        ]
         copy_engines = [
             CopyEngine(
                 pci_func=0,
-                pci_dev=_COPY_ENGINE_FIRST_PCI_DEV + engine_index,
+                pci_dev=pci_dev,
                 pci_bus=0,
                 ChanCnt=self._copy_engine_channels,
                 XferCap=self._copy_engine_xfercap,
@@ -162,7 +173,7 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                     size=f"{_get_copy_engine_bar0_size(self._copy_engine_channels)}B"
                 ),
             )
-            for engine_index in range(self._num_copy_engines)
+            for pci_dev in selected_copy_engine_pci_devs
         ]
         self.pc.south_bridge.copy_engines = copy_engines
         object.__setattr__(self, "copy_engines", copy_engines)

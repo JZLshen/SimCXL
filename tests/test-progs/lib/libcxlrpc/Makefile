@@ -8,7 +8,6 @@ INCDIR = include
 
 SRCS = $(SRCDIR)/cxl_rpc.c \
        $(SRCDIR)/cxl_copyengine.c \
-       $(SRCDIR)/cxl_alloc.c \
        $(SRCDIR)/cxl_sync.c
 OBJS = $(SRCS:.c=.o)
 

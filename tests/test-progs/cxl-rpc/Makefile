@@ -14,7 +14,8 @@ TARGETS = rpc_client_example \
           cxl_mem_ldst_latency \
           cxl_mem_paper_latency \
           cxl_mem_copy_cmp \
-          cxl_copyengine_bw
+          cxl_copyengine_bw \
+          cpu_memmove_bw
 
 ifneq ($(CXL_RPC_INCLUDE_CE_SANITY),)
 TARGETS += cxl_copyengine_sanity
@@ -44,6 +45,8 @@ cxl_mem_copy_cmp: src/cxl_mem_copy_cmp.c libcxlrpc
 	$(CC) $(CFLAGS) -o $@ $< $(LIBCXLRPC) $(LIBS)
 cxl_copyengine_bw: src/cxl_copyengine_bw.c libcxlrpc
 	$(CC) $(CFLAGS) -o $@ $< $(LIBCXLRPC) $(LIBS)
+cpu_memmove_bw: src/cpu_memmove_bw.c libcxlrpc
+	$(CC) $(CFLAGS) -pthread -o $@ $< $(LIBCXLRPC) $(LIBS)
 
 cxl_copyengine_sanity: src/cxl_copyengine_sanity.c libcxlrpc
 	$(CC) $(CFLAGS) -o $@ $< $(LIBCXLRPC) $(LIBS)

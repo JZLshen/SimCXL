@@ -14,7 +14,7 @@ class CXLRPCEngine(SimObject):
     # Auto-register a default test connection on startup
     auto_register = Param.Bool(False,
         "Auto-register default connection on startup")
-    default_client_id = Param.UInt32(0, "Default test client ID")
+    default_node_id = Param.UInt32(0, "Default test node ID")
     default_doorbell_addr = Param.Addr(0x100000000, "Default doorbell address")
     default_metadata_queue_addr = Param.Addr(0x100001000,
         "Metadata queue base address")

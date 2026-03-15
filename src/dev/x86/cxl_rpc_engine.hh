@@ -11,6 +11,7 @@
 #ifndef __DEV_X86_CXL_RPC_ENGINE_HH__
 #define __DEV_X86_CXL_RPC_ENGINE_HH__
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <unordered_map>
@@ -29,29 +30,26 @@ namespace gem5
 /**
  * Doorbell entry structure (16 bytes)
  *
- * Bits 0-1:    method (2b)
- * Bit 2:       inline (1b)
- * Bit 3:       phase_bit (1b)
- * Bits 4-23:   payload_len (20b)
- * Bits 24-35:  service_id (12b)
- * Bits 36-47:  method_id (12b)
- * Bits 48-63:  request_id (16b)
+ * Bit 0:       method (0=request, 1=head_update)
+ * Bit 1:       inline (1b)
+ * Bit 2:       phase (1b)
+ * Bits 3-34:   length (32b)
+ * Bits 35-48:  node_id (14b)
+ * Bits 49-63:  rpc_id (15b)
  * Byte 8-15: inline message or request_data address
  */
 struct DoorbellEntry {
     // Parsed fields (populated by parseFromBuffer)
-    uint8_t method;       // 0=request, 1=response, 2=HEAD_UPDATE, 3=CONTROL
+    uint8_t method;       // 0=request, 1=head_update
     uint8_t is_inline;    // 1=inline message, 0=pointer to request_data
-    uint8_t phase_bit;    // Phase bit for wrap-around detection
-    uint16_t service_id;  // low 12 bits used
-    uint16_t method_id;   // low 12 bits used
-    uint16_t request_id;  // 16-bit request ID
-    uint32_t payload_len; // low 20 bits used
+    uint8_t phase;        // Valid/phase bit used by metadata queue
+    uint16_t node_id;     // low 14 bits used
+    uint16_t rpc_id;      // low 15 bits used, 0 is invalid
+    uint32_t length;      // full 32-bit request length
     uint64_t data;        // Inline message or address
 
-    DoorbellEntry() : method(0), is_inline(0), phase_bit(0),
-                      service_id(0), method_id(0), request_id(0),
-                      payload_len(0), data(0) {}
+    DoorbellEntry() : method(0), is_inline(0), phase(0),
+                      node_id(0), rpc_id(0), length(0), data(0) {}
 
     // Parse from raw 16-byte buffer
     void parseFromBuffer(const uint8_t* buf);
@@ -63,9 +61,7 @@ struct DoorbellEntry {
 // Method types
 enum DoorbellMethod {
     METHOD_REQUEST = 0,
-    METHOD_RESPONSE = 1,
-    METHOD_HEAD_UPDATE = 2,
-    METHOD_CONTROL = 3
+    METHOD_HEAD_UPDATE = 1
 };
 
 // Result of processing a doorbell write.
@@ -126,7 +122,7 @@ struct MetadataQueue {
  * Per-client connection state
  */
 struct ClientConnection {
-    uint32_t client_id;
+    uint32_t node_id;
 
     // Client-side memory regions
     Addr request_data_addr;
@@ -143,12 +139,23 @@ struct ClientConnection {
     uint32_t request_data_capacity;
     uint32_t response_data_capacity;
 
-    ClientConnection() : client_id(0), request_data_addr(0),
+    ClientConnection() : node_id(0), request_data_addr(0),
                          response_data_addr(0), flag_addr(0),
                          doorbell_addr(0),
                          metadata_queue_logical_base(0),
                          request_data_capacity(0),
                          response_data_capacity(0) {}
+};
+
+struct DoorbellWriteProbe {
+    bool should_probe = false;
+    bool matched_connection = false;
+    bool covers_doorbell = false;
+    bool parsed_entry = false;
+    Addr doorbell_addr = 0;
+    size_t doorbell_offset = 0;
+    const ClientConnection* connection = nullptr;
+    DoorbellEntry entry;
 };
 
 /**
@@ -165,9 +172,6 @@ class CXLRPCEngine : public SimObject
 
     // Registered client connections (doorbell_addr -> connection)
     std::unordered_map<Addr, ClientConnection> connections;
-    // Fast lookup index built from connections:
-    // - exact slot start -> canonical doorbell address
-    std::unordered_map<Addr, Addr> doorbellSlotToCanonical;
     bool singleDoorbellSegmentValid = false;
     Addr singleDoorbellCanonicalAddr = 0;
     Addr singleDoorbellSegmentStart = 0;
@@ -175,7 +179,7 @@ class CXLRPCEngine : public SimObject
 
     // Auto-register parameters
     bool autoRegister;
-    uint32_t defaultClientId;
+    uint32_t defaultNodeId;
     Addr defaultDoorbellAddr;
     Addr defaultMetadataQueueAddr;
     uint32_t defaultMetadataQueueEntries;
@@ -185,29 +189,28 @@ class CXLRPCEngine : public SimObject
     uint32_t defaultResponseDataCapacity;
     Addr defaultFlagAddr;
 
+    /**
+     * Check if an address targets a registered doorbell segment.
+     *
+     * When connections are registered, this checks each connection's
+     * contiguous doorbell segment (base + slot-stride range). Before startup
+     * registration, it falls back to the configured doorbell range.
+     */
+    bool isDoorbell(Addr addr) const;
+
     // Find connection whose doorbell slot overlaps [addr, addr + size).
     // base_addr is set to the matched slot start address.
     ClientConnection* findConnectionForAddr(
-        Addr addr, uint32_t size, Addr& base_addr);
-    // Resolve a logical/observed doorbell address to a connection, including
-    // per-client slot aliases inside the configured doorbell segment.
-    ClientConnection* findConnectionForDoorbellAddr(
-        Addr doorbell_addr, Addr* canonical_addr = nullptr);
-    const ClientConnection* findConnectionForDoorbellAddr(
-        Addr doorbell_addr, Addr* canonical_addr = nullptr) const;
+        Addr addr, uint32_t size, Addr& base_addr,
+        Addr* canonical_addr = nullptr);
+    const ClientConnection* findConnectionForAddr(
+        Addr addr, uint32_t size, Addr& base_addr,
+        Addr* canonical_addr = nullptr) const;
     void rebuildDoorbellSlotIndex();
     Addr resolveMetadataSlotAddr(const ClientConnection& conn,
                                  uint32_t slot) const;
-
-    // Per-packet bookkeeping for request-doorbell remap path.
-    struct RemappedDoorbellState {
-        bool countAsMetadataWrite = true;
-    };
-    std::unordered_map<PacketPtr, RemappedDoorbellState> remappedDoorbells;
+    std::array<std::vector<bool>, 4> remapByteEnableMasks;
     std::vector<bool> remapByteEnableScratch;
-
-    // Dynamic GPA translation learned from the first control-doorbell write.
-    bool addrTranslationLearned = false;
 
     // Statistics
     struct RPCEngineStats : public statistics::Group
@@ -231,24 +234,16 @@ class CXLRPCEngine : public SimObject
     void startup() override;
 
     /**
-     * Check if an address targets a registered doorbell segment.
+     * Classify a write packet for doorbell handling. The result can be passed
+     * to handleDoorbellWrite() to avoid repeating steady-state connection
+     * lookup and doorbell slot derivation on the same packet.
      *
-     * When connections are registered, this checks each connection's
-     * contiguous doorbell segment (base + slot-stride range). Before startup
-     * registration, it falls back to the configured doorbell range.
+     * This is the one shared classification step for the controller hot path.
+     * It identifies whether the write overlaps any registered doorbell slot
+     * and, if so, returns the resolved slot start address plus any already
+     * parsed 16B doorbell payload for reuse by handleDoorbellWrite().
      */
-    bool isDoorbell(Addr addr) const;
-
-    /**
-     * Fast pre-filter: returns true if this write MUST be forwarded to
-     * handleDoorbellWrite(), false when it is definitely a plain data store
-     * that can be skipped entirely.
-     *
-     * During bootstrap this still passes control/marker writes needed by
-     * tryLearnAddressTranslation(), while dropping obvious non-doorbell
-     * payload writes before the expensive parse/remap path.
-     */
-    bool mustProbeWrite(PacketPtr pkt) const;
+    DoorbellWriteProbe probeDoorbellWrite(PacketPtr pkt) const;
 
     /**
      * Handle a doorbell write from client
@@ -256,17 +251,19 @@ class CXLRPCEngine : public SimObject
      * @param pkt The packet containing the doorbell data
      * @return Handling result (handled / not handled / backpressure)
      */
-    DoorbellHandleResult handleDoorbellWrite(PacketPtr pkt);
+    DoorbellHandleResult handleDoorbellWrite(
+        PacketPtr pkt, const DoorbellWriteProbe* probe = nullptr);
 
     /**
-     * Finalize a request-doorbell remap in timing/atomic modes.
+     * Account for a remapped request doorbell that was successfully forwarded
+     * downstream as one metadata queue write.
      */
-    void commitRemappedDoorbell(PacketPtr pkt);
+    void accountRemappedDoorbellForward();
 
     /**
      * Register a new client connection
      */
-    void registerConnection(uint32_t client_id,
+    void registerConnection(uint32_t node_id,
                             Addr doorbell_addr,
                             Addr metadata_queue_addr,
                             uint32_t metadata_queue_entries,
@@ -277,6 +274,12 @@ class CXLRPCEngine : public SimObject
                             Addr flag_addr);
 
   private:
+    bool isBootstrapRequest(const DoorbellEntry& entry) const;
+    DoorbellHandleResult processBootstrapRequest(
+        ClientConnection& conn, Addr doorbell_addr,
+        const DoorbellEntry& entry, PacketPtr pkt);
+    bool tryLearnDoorbellTranslation(PacketPtr pkt);
+
     /**
      * Process a complete doorbell entry (dispatch by method type)
      */
@@ -298,23 +301,6 @@ class CXLRPCEngine : public SimObject
     DoorbellHandleResult processHeadUpdate(
         ClientConnection& conn, Addr doorbell_addr,
         const DoorbellEntry& entry, PacketPtr pkt);
-    DoorbellHandleResult processControl(
-        ClientConnection& conn, const DoorbellEntry& entry);
-
-    /**
-     * Apply a single address delta to all registered connection regions.
-     * This is used when software logical addresses differ from observed
-     * packet GPAs under NUMA/KM allocation paths.
-     */
-    void applyAddressTranslationDelta(int64_t delta);
-
-    /**
-     * Best-effort bootstrap: for unregistered-address writes, detect a
-     * REGISTER_TRANSLATION control doorbell and infer address delta once.
-     *
-     * @return true if translation was applied.
-     */
-    bool tryLearnAddressTranslation(PacketPtr pkt);
 };
 
 } // namespace gem5

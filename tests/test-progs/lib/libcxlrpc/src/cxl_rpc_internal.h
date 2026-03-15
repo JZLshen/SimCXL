@@ -6,11 +6,10 @@
 
 #include "cxl_rpc.h"
 
-#define CXL_REQ_ID_MASK            0x0000FFFFu
-#define CXL_REQ_ID_SPACE           0x00010000u
-#define CXL_REQ_ID_BITMAP_WORDS    (CXL_REQ_ID_SPACE / 64u)
-#define CXL_REQ_META_LEN_BITS      20u
-#define CXL_REQ_META_LEN_MAX       ((1u << CXL_REQ_META_LEN_BITS) - 1u)
+#define CXL_RPC_ID_MASK            0x00007FFFu
+#define CXL_RPC_ID_SPACE           0x00008000u
+#define CXL_RPC_ID_BITMAP_WORDS    (CXL_RPC_ID_SPACE / 64u)
+#define CXL_NODE_ID_MASK           0x00003FFFu
 #define CXL_REQ_PAYLOAD_SOFT_MAX   (256u * 1024u)
 #define CXL_DOORBELL_ENTRY_LEN     16u
 #define CXL_DOORBELL_PUBLISH_LEN   16u
@@ -27,7 +26,6 @@ struct cxl_context {
     volatile uint8_t *base;
     uint64_t phys_base;
     size_t map_size;
-    cxl_global_alloc_t *allocator;
     int numa_node;
     int shm_fd;
     char shm_name[64];
@@ -37,7 +35,6 @@ struct cxl_connection {
     cxl_context_t *ctx;
 
     cxl_connection_addrs_t addrs;
-    int owns_addrs;
 
     volatile uint8_t *doorbell;
     volatile uint8_t *metadata_queue;
@@ -49,14 +46,11 @@ struct cxl_connection {
     uint32_t mq_head;
     uint32_t mq_phase;
 
-    uint16_t req_id_client_tag;
-    uint8_t req_id_client_tag_bits;
-    uint16_t req_id_client_tag_base;
-    uint16_t req_id_seq_mask;
-    uint16_t req_id_next_seq;
-    uint32_t req_id_inflight_count;
-    uint32_t req_id_capacity;
-    uint64_t *req_id_inflight_bitmap;
+    uint16_t rpc_id_seq_mask;
+    uint16_t rpc_id_next;
+    uint32_t rpc_id_inflight_count;
+    uint32_t rpc_id_capacity;
+    uint64_t *rpc_id_inflight_bitmap;
     uint32_t *req_entry_offsets;
     uint32_t *req_entry_sizes;
     uint16_t *req_entry_next;
@@ -117,8 +111,9 @@ int cxl_copyengine_prepare(cxl_connection_t *conn);
 int cxl_copyengine_ensure_response_slots(cxl_connection_t *conn);
 int cxl_copyengine_update_peer_response_mapping(cxl_connection_t *conn);
 int cxl_copyengine_update_peer_flag_mapping(cxl_connection_t *conn);
+int cxl_copyengine_validate_submit_invariants(cxl_connection_t *conn);
 int cxl_copyengine_submit_response_async(cxl_connection_t *conn,
-                                         uint16_t request_id,
+                                         uint16_t rpc_id,
                                          const void *data,
                                          size_t len,
                                          size_t dst_resp_offset,

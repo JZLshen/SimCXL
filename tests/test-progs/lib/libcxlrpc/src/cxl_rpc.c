@@ -7,6 +7,7 @@
 
 #include "cxl_rpc_internal.h"
 
+#include <assert.h>
 #include <numa.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,6 +83,9 @@ cxl_lib_errorf(const char *fmt, ...)
 #define CXL_MQ_PREFETCH_LINES 16u
 #define CXL_MQ_INVALIDATE_CONSUMED 1
 #define CXL_MQ_INVALIDATE_PREFETCHED 1
+#define CXL_BOOTSTRAP_LEN_MAGIC 0xFFFF0000u
+#define CXL_BOOTSTRAP_OP_REGISTER_DOORBELL 0x0001u
+#define CXL_BOOTSTRAP_OP_REGISTER_METADATA_PAGE_BASE 0x0100u
 
 static inline size_t
 cxl_response_entry_size(size_t payload_len)
@@ -106,6 +110,16 @@ cxl_invalidate_cacheline(volatile uint8_t *line_addr)
         :
         : "r"((void *)line_addr)
         : "memory");
+}
+
+static inline void
+cxl_invalidate_load_barrier(void)
+{
+    /*
+     * Read-side invalidate paths must not let the subsequent load observe a
+     * stale cacheline before the invalidate has completed.
+     */
+    __asm__ __volatile__("mfence" ::: "memory");
 }
 
 static void
@@ -155,29 +169,176 @@ cxl_mq_invalidate_lines(volatile uint8_t *metadata_queue,
     __asm__ __volatile__("sfence" ::: "memory");
 }
 
+static int
+cxl_rpc_virt_to_phys_local(const void *vaddr, uint64_t *phys_out)
+{
+    static int pagemap_fd = -2;
+    static uint64_t page_size = 0;
+    uint64_t entry = 0;
+    uint64_t virt = (uint64_t)(uintptr_t)vaddr;
+
+    if (!phys_out)
+        return -1;
+
+    if (page_size == 0) {
+        long ps = sysconf(_SC_PAGESIZE);
+        if (ps <= 0)
+            return -1;
+        page_size = (uint64_t)ps;
+    }
+
+    if (pagemap_fd == -2) {
+        pagemap_fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+        if (pagemap_fd < 0)
+            return -1;
+    }
+    if (pagemap_fd < 0)
+        return -1;
+
+    off_t off = (off_t)((virt / page_size) * sizeof(uint64_t));
+    ssize_t n = pread(pagemap_fd, &entry, sizeof(entry), off);
+    if (n != (ssize_t)sizeof(entry))
+        return -1;
+
+    if ((entry & (1ULL << 63)) == 0)
+        return -1;
+
+    uint64_t pfn = entry & ((1ULL << 55) - 1);
+    *phys_out = pfn * page_size + (virt % page_size);
+    return 0;
+}
+
+static void
+cxl_publish_doorbell_raw(volatile uint8_t *doorbell, const uint8_t *doorbell_buf)
+{
+    if (!doorbell || !doorbell_buf)
+        return;
+
+    memcpy((void *)doorbell, doorbell_buf, CXL_DOORBELL_PUBLISH_LEN);
+    cxl_flush_range(doorbell, CXL_DOORBELL_PUBLISH_LEN);
+}
+
 /* ================================================================
  * Low-level Utilities
  * ================================================================ */
 
 static void cxl_build_doorbell(uint8_t *buf, uint8_t method, uint8_t is_inline,
-                               uint16_t service_id, uint16_t method_id,
-                               uint16_t request_id, uint32_t payload_len,
-                               uint64_t data)
+                               uint32_t length, uint16_t node_id,
+                               uint16_t rpc_id, uint64_t data)
 {
     if (!buf)
         return;
 
     /* Fill all 16 bytes directly: [0..7]=header, [8..15]=data (LE). */
     uint64_t header_lo = 0;
-    header_lo |= ((uint64_t)(method & 0x03u));
-    header_lo |= ((uint64_t)(is_inline & 0x01u) << 2);
-    header_lo |= ((uint64_t)(payload_len & CXL_REQ_META_LEN_MAX) << 4);
-    header_lo |= ((uint64_t)(service_id & 0x0FFFu) << 24);
-    header_lo |= ((uint64_t)(method_id & 0x0FFFu) << 36);
-    header_lo |= ((uint64_t)(request_id & 0xFFFFu) << 48);
+    header_lo |= ((uint64_t)(method & 0x01u));
+    header_lo |= ((uint64_t)(is_inline & 0x01u) << 1);
+    header_lo |= ((uint64_t)length << 3);
+    header_lo |= ((uint64_t)(node_id & CXL_NODE_ID_MASK) << 35);
+    header_lo |= ((uint64_t)(rpc_id & CXL_RPC_ID_MASK) << 49);
 
     memcpy(buf, &header_lo, sizeof(header_lo));
     memcpy(buf + 8, &data, sizeof(data));
+}
+
+static int
+cxl_send_controller_bootstrap_doorbell(cxl_connection_t *conn,
+                                       uint32_t bootstrap_len,
+                                       uint64_t data)
+{
+    uint8_t doorbell_buf[16] __attribute__((aligned(16)));
+    uint64_t header_lo = 0;
+
+    if (!conn || !conn->doorbell)
+        return -1;
+
+    cxl_build_doorbell(doorbell_buf, CXL_METHOD_REQUEST, 1,
+                       bootstrap_len, conn->addrs.node_id, 0, data);
+    memcpy(&header_lo, doorbell_buf, sizeof(header_lo));
+    cxl_lib_debugf("bootstrap publish doorbell=%p node_id=%u len=%#x "
+                   "header_lo=%#llx data=%#llx",
+                   (void *)conn->doorbell,
+                   (unsigned)conn->addrs.node_id,
+                   (unsigned)bootstrap_len,
+                   (unsigned long long)header_lo,
+                   (unsigned long long)data);
+    cxl_publish_doorbell_raw(conn->doorbell, doorbell_buf);
+    return 0;
+}
+
+static int
+cxl_bootstrap_controller_translation(cxl_connection_t *conn,
+                                     size_t metadata_clear_size)
+{
+    uint64_t observed_doorbell = 0;
+
+    if (!conn || !conn->doorbell || !conn->metadata_queue)
+        return -1;
+
+    if (cxl_rpc_virt_to_phys_local((const void *)conn->doorbell,
+                                   &observed_doorbell) == 0) {
+        cxl_lib_debugf("bootstrap observed doorbell gpa=%#llx logical=%#llx "
+                       "metadata=%#llx node_id=%u",
+                       (unsigned long long)observed_doorbell,
+                       (unsigned long long)conn->addrs.doorbell_addr,
+                       (unsigned long long)conn->addrs.metadata_queue_addr,
+                       (unsigned)conn->addrs.node_id);
+    } else {
+        cxl_lib_debugf("bootstrap doorbell gpa unavailable before first "
+                       "publish logical=%#llx node_id=%u",
+                       (unsigned long long)conn->addrs.doorbell_addr,
+                       (unsigned)conn->addrs.node_id);
+    }
+
+    if (cxl_send_controller_bootstrap_doorbell(
+            conn,
+            CXL_BOOTSTRAP_LEN_MAGIC | CXL_BOOTSTRAP_OP_REGISTER_DOORBELL,
+            0) != 0) {
+        return -1;
+    }
+
+    size_t page_count =
+        (metadata_clear_size + CXL_METADATA_TRANSLATION_PAGE_BYTES - 1u) /
+        CXL_METADATA_TRANSLATION_PAGE_BYTES;
+    for (size_t page_index = 0; page_index < page_count; ++page_index) {
+        volatile uint8_t *page_ptr =
+            conn->metadata_queue +
+            page_index * CXL_METADATA_TRANSLATION_PAGE_BYTES;
+        uint64_t observed_page = 0;
+        if (cxl_rpc_virt_to_phys_local((const void *)page_ptr,
+                                       &observed_page) != 0) {
+            cxl_lib_errorf("bootstrap failed to resolve metadata page gpa "
+                           "page=%zu logical=%#llx",
+                           page_index,
+                           (unsigned long long)(conn->addrs.metadata_queue_addr +
+                               page_index * CXL_METADATA_TRANSLATION_PAGE_BYTES));
+            return -1;
+        }
+        observed_page &= ~((uint64_t)CXL_METADATA_TRANSLATION_PAGE_BYTES - 1u);
+        cxl_lib_debugf("bootstrap metadata page=%zu logical=%#llx "
+                       "observed=%#llx",
+                       page_index,
+                       (unsigned long long)(conn->addrs.metadata_queue_addr +
+                           page_index * CXL_METADATA_TRANSLATION_PAGE_BYTES),
+                       (unsigned long long)observed_page);
+
+        if (cxl_send_controller_bootstrap_doorbell(
+                conn,
+                CXL_BOOTSTRAP_LEN_MAGIC |
+                    (CXL_BOOTSTRAP_OP_REGISTER_METADATA_PAGE_BASE |
+                     (uint32_t)page_index),
+                observed_page) != 0) {
+            return -1;
+        }
+    }
+
+    cxl_lib_debugf("controller bootstrap complete doorbell=%#llx metadata=%#llx "
+                   "pages=%zu node_id=%u",
+                   (unsigned long long)conn->addrs.doorbell_addr,
+                   (unsigned long long)conn->addrs.metadata_queue_addr,
+                   page_count,
+                   (unsigned)conn->addrs.node_id);
+    return 0;
 }
 
 /* ================================================================
@@ -291,17 +452,6 @@ cxl_context_t *cxl_rpc_init(uint64_t cxl_base, size_t cxl_size)
     ctx->phys_base = cxl_base;
     ctx->map_size = cxl_size;
 
-    /* Initialize global allocator for this CXL region */
-    ctx->allocator = cxl_global_alloc_init(cxl_base, cxl_size);
-    if (!ctx->allocator) {
-        if (ctx->base && ctx->shm_fd >= 0) {
-            munmap((void *)ctx->base, cxl_size);
-            close(ctx->shm_fd);
-        }
-        free(ctx);
-        return NULL;
-    }
-
     return ctx;
 }
 
@@ -309,9 +459,6 @@ void cxl_rpc_destroy(cxl_context_t *ctx)
 {
     if (!ctx)
         return;
-
-    if (ctx->allocator)
-        cxl_global_alloc_destroy(ctx->allocator);
 
     if (ctx->base && ctx->shm_fd >= 0) {
         munmap((void *)ctx->base, ctx->map_size);
@@ -368,40 +515,23 @@ static int cxl_rpc_phys_range_valid(const cxl_context_t *ctx,
  * Connection Management
  * ================================================================ */
 
-static inline uint16_t
-cxl_req_id_seq_mask_for_client_tag_bits(uint8_t client_tag_bits)
-{
-    if (client_tag_bits == 0)
-        return (uint16_t)CXL_REQ_ID_MASK;
-    return (uint16_t)((1u << (16u - client_tag_bits)) - 1u);
-}
-
-static inline uint16_t
-cxl_req_id_client_tag_base_for_config(uint16_t client_tag,
-                                      uint8_t client_tag_bits)
-{
-    if (client_tag_bits == 0)
-        return 0;
-    return (uint16_t)(client_tag << (16u - client_tag_bits));
-}
-
 static inline int
 cxl_req_id_inflight_test(const cxl_connection_t *conn, uint16_t req_id)
 {
-    return ((conn->req_id_inflight_bitmap[req_id >> 6] >>
+    return ((conn->rpc_id_inflight_bitmap[req_id >> 6] >>
              (req_id & 0x3Fu)) & 0x1ULL) != 0;
 }
 
 static inline void
 cxl_req_id_inflight_set(cxl_connection_t *conn, uint16_t req_id)
 {
-    conn->req_id_inflight_bitmap[req_id >> 6] |= (1ULL << (req_id & 0x3Fu));
+    conn->rpc_id_inflight_bitmap[req_id >> 6] |= (1ULL << (req_id & 0x3Fu));
 }
 
 static inline void
 cxl_req_id_inflight_clear(cxl_connection_t *conn, uint16_t req_id)
 {
-    conn->req_id_inflight_bitmap[req_id >> 6] &= ~(1ULL << (req_id & 0x3Fu));
+    conn->rpc_id_inflight_bitmap[req_id >> 6] &= ~(1ULL << (req_id & 0x3Fu));
 }
 
 static void cxl_req_id_allocator_release(cxl_connection_t *conn,
@@ -413,29 +543,29 @@ cxl_connection_state_arrays_init(cxl_connection_t *conn)
     if (!conn)
         return -1;
 
-    if (!conn->req_id_inflight_bitmap) {
-        conn->req_id_inflight_bitmap =
-            (uint64_t *)calloc((size_t)CXL_REQ_ID_BITMAP_WORDS,
+    if (!conn->rpc_id_inflight_bitmap) {
+        conn->rpc_id_inflight_bitmap =
+            (uint64_t *)calloc((size_t)CXL_RPC_ID_BITMAP_WORDS,
                                sizeof(uint64_t));
     }
     if (!conn->req_entry_offsets) {
         conn->req_entry_offsets =
-            (uint32_t *)calloc((size_t)CXL_REQ_ID_SPACE, sizeof(uint32_t));
+            (uint32_t *)calloc((size_t)CXL_RPC_ID_SPACE, sizeof(uint32_t));
     }
     if (!conn->req_entry_sizes) {
         conn->req_entry_sizes =
-            (uint32_t *)calloc((size_t)CXL_REQ_ID_SPACE, sizeof(uint32_t));
+            (uint32_t *)calloc((size_t)CXL_RPC_ID_SPACE, sizeof(uint32_t));
     }
     if (!conn->req_entry_next) {
         conn->req_entry_next =
-            (uint16_t *)calloc((size_t)CXL_REQ_ID_SPACE, sizeof(uint16_t));
+            (uint16_t *)calloc((size_t)CXL_RPC_ID_SPACE, sizeof(uint16_t));
     }
     if (!conn->req_entry_complete) {
         conn->req_entry_complete =
-            (uint8_t *)calloc((size_t)CXL_REQ_ID_SPACE, sizeof(uint8_t));
+            (uint8_t *)calloc((size_t)CXL_RPC_ID_SPACE, sizeof(uint8_t));
     }
 
-    if (!conn->req_id_inflight_bitmap || !conn->req_entry_offsets ||
+    if (!conn->rpc_id_inflight_bitmap || !conn->req_entry_offsets ||
         !conn->req_entry_sizes || !conn->req_entry_next ||
         !conn->req_entry_complete) {
         return -1;
@@ -452,19 +582,19 @@ cxl_request_ring_state_reset(cxl_connection_t *conn)
 
     if (conn->req_entry_offsets) {
         memset(conn->req_entry_offsets, 0,
-               (size_t)CXL_REQ_ID_SPACE * sizeof(uint32_t));
+               (size_t)CXL_RPC_ID_SPACE * sizeof(uint32_t));
     }
     if (conn->req_entry_sizes) {
         memset(conn->req_entry_sizes, 0,
-               (size_t)CXL_REQ_ID_SPACE * sizeof(uint32_t));
+               (size_t)CXL_RPC_ID_SPACE * sizeof(uint32_t));
     }
     if (conn->req_entry_next) {
         memset(conn->req_entry_next, 0,
-               (size_t)CXL_REQ_ID_SPACE * sizeof(uint16_t));
+               (size_t)CXL_RPC_ID_SPACE * sizeof(uint16_t));
     }
     if (conn->req_entry_complete) {
         memset(conn->req_entry_complete, 0,
-               (size_t)CXL_REQ_ID_SPACE * sizeof(uint8_t));
+               (size_t)CXL_RPC_ID_SPACE * sizeof(uint8_t));
     }
 
     conn->req_ring_head_id = 0;
@@ -477,7 +607,6 @@ cxl_request_ring_state_reset(cxl_connection_t *conn)
 static int
 cxl_req_id_allocator_init(cxl_connection_t *conn)
 {
-    uint32_t client_space = 0;
     uint32_t response_slots = 0;
 
     if (!conn)
@@ -486,30 +615,23 @@ cxl_req_id_allocator_init(cxl_connection_t *conn)
     if (cxl_connection_state_arrays_init(conn) != 0)
         return -1;
 
-    memset(conn->req_id_inflight_bitmap, 0,
-           (size_t)CXL_REQ_ID_BITMAP_WORDS * sizeof(uint64_t));
+    memset(conn->rpc_id_inflight_bitmap, 0,
+           (size_t)CXL_RPC_ID_BITMAP_WORDS * sizeof(uint64_t));
     cxl_request_ring_state_reset(conn);
 
-    conn->req_id_client_tag_base =
-        cxl_req_id_client_tag_base_for_config(conn->req_id_client_tag,
-                                              conn->req_id_client_tag_bits);
-    conn->req_id_seq_mask =
-        cxl_req_id_seq_mask_for_client_tag_bits(conn->req_id_client_tag_bits);
-    conn->req_id_next_seq = (conn->req_id_client_tag_base == 0) ? 1u : 0u;
-    conn->req_id_inflight_count = 0;
+    conn->rpc_id_seq_mask = (uint16_t)CXL_RPC_ID_MASK;
+    conn->rpc_id_next = 1u;
+    conn->rpc_id_inflight_count = 0;
 
-    client_space =
-        (conn->req_id_client_tag_base == 0) ?
-        (uint32_t)conn->req_id_seq_mask :
-        ((uint32_t)conn->req_id_seq_mask + 1u);
     response_slots =
         (uint32_t)(conn->addrs.response_data_size / CXL_RESP_SLOT_BYTES);
     if (response_slots == 0)
-        response_slots = client_space;
-    conn->req_id_capacity =
-        (client_space < response_slots) ? client_space : response_slots;
+        response_slots = (uint32_t)CXL_RPC_ID_MASK;
+    conn->rpc_id_capacity =
+        ((uint32_t)CXL_RPC_ID_MASK < response_slots) ?
+        (uint32_t)CXL_RPC_ID_MASK : response_slots;
 
-    return (conn->req_id_capacity > 0) ? 0 : -1;
+    return (conn->rpc_id_capacity > 0) ? 0 : -1;
 }
 
 static int
@@ -608,19 +730,18 @@ cxl_request_ring_mark_complete(cxl_connection_t *conn, uint16_t req_id)
 static int
 cxl_req_id_allocator_alloc(cxl_connection_t *conn, uint16_t *out_req_id)
 {
-    if (!conn || !out_req_id || !conn->req_id_inflight_bitmap)
+    if (!conn || !out_req_id || !conn->rpc_id_inflight_bitmap)
         return -1;
 
-    if (conn->req_id_inflight_count >= conn->req_id_capacity)
+    if (conn->rpc_id_inflight_count >= conn->rpc_id_capacity)
         return -1;
 
-    const uint16_t prefix_base = conn->req_id_client_tag_base;
-    const uint16_t seq_mask = conn->req_id_seq_mask;
-    uint16_t seq = (uint16_t)(conn->req_id_next_seq & seq_mask);
+    const uint16_t seq_mask = conn->rpc_id_seq_mask;
+    uint16_t seq = (uint16_t)(conn->rpc_id_next & seq_mask);
     const uint32_t scan_span = (uint32_t)seq_mask + 1u;
 
     for (uint32_t i = 0; i < scan_span; i++) {
-        const uint16_t req_id = (uint16_t)(prefix_base | seq);
+        const uint16_t req_id = seq;
         seq = (uint16_t)((seq + 1u) & seq_mask);
         if (req_id == 0)
             continue;
@@ -628,8 +749,8 @@ cxl_req_id_allocator_alloc(cxl_connection_t *conn, uint16_t *out_req_id)
             continue;
 
         cxl_req_id_inflight_set(conn, req_id);
-        conn->req_id_inflight_count++;
-        conn->req_id_next_seq = seq;
+        conn->rpc_id_inflight_count++;
+        conn->rpc_id_next = (seq == 0) ? 1u : seq;
         *out_req_id = req_id;
         return 0;
     }
@@ -647,7 +768,7 @@ cxl_req_id_allocator_release(cxl_connection_t *conn, uint16_t req_id)
         return;
 
     cxl_req_id_inflight_clear(conn, req_id);
-    conn->req_id_inflight_count--;
+    conn->rpc_id_inflight_count--;
 }
 
 static void connection_init_virt_ptrs(cxl_connection_t *conn)
@@ -749,210 +870,6 @@ cxl_advance_mq_head_with_policy(cxl_connection_t *conn,
 }
 
 static int
-connection_register_remote_translation(cxl_connection_t *conn)
-{
-    if (!conn || !conn->doorbell)
-        return -1;
-
-    uint8_t doorbell_buf[16] __attribute__((aligned(16)));
-    cxl_build_doorbell(doorbell_buf, CXL_METHOD_CONTROL, 1,
-                       CXL_CONTROL_SERVICE_INTERNAL,
-                       CXL_CONTROL_METHOD_REGISTER_TRANSLATION,
-                       0, 0, conn->addrs.doorbell_addr);
-    /* Publish order: store payload, flush touched cacheline(s), then sfence. */
-    memcpy((void *)conn->doorbell, doorbell_buf, CXL_DOORBELL_PUBLISH_LEN);
-    uintptr_t line_start = ((uintptr_t)conn->doorbell) & ~((uintptr_t)63);
-    uintptr_t line_end =
-        (((uintptr_t)conn->doorbell + CXL_DOORBELL_PUBLISH_LEN) + 63u) &
-        ~((uintptr_t)63);
-    for (uintptr_t line = line_start; line < line_end; line += 64u) {
-        __asm__ __volatile__(
-            "clflushopt (%0)"
-            :
-            : "r"((void *)line)
-            : "memory");
-    }
-    __asm__ __volatile__("sfence" ::: "memory");
-    return 0;
-}
-
-static int
-cxl_virt_to_phys_local(const void *vaddr, uint64_t *phys_out)
-{
-    static int pagemap_fd = -2;
-    static uint64_t page_size = 0;
-    uint64_t entry = 0;
-    uint64_t virt = (uint64_t)(uintptr_t)vaddr;
-
-    if (!phys_out)
-        return -1;
-
-    if (page_size == 0) {
-        long ps = sysconf(_SC_PAGESIZE);
-        if (ps <= 0)
-            return -1;
-        page_size = (uint64_t)ps;
-    }
-
-    if (pagemap_fd == -2) {
-        pagemap_fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
-        if (pagemap_fd < 0) {
-            cxl_lib_errorf("virt_to_phys: open(/proc/self/pagemap) failed: %s",
-                           strerror(errno));
-            return -1;
-        }
-    }
-    if (pagemap_fd < 0)
-        return -1;
-
-    volatile const uint8_t *page_ptr =
-        (const volatile uint8_t *)(uintptr_t)(virt & ~(page_size - 1u));
-    volatile uint8_t page_touch = *page_ptr;
-    (void)page_touch;
-
-    off_t off = (off_t)((virt / page_size) * sizeof(uint64_t));
-    ssize_t n = pread(pagemap_fd, &entry, sizeof(entry), off);
-    if (n != (ssize_t)sizeof(entry)) {
-        cxl_lib_errorf("virt_to_phys: pread(pagemap) failed vaddr=%p n=%zd err=%s",
-                       vaddr, n, strerror(errno));
-        return -1;
-    }
-    if ((entry & (1ULL << 63)) == 0) {
-        cxl_lib_errorf("virt_to_phys: page not present vaddr=%p entry=%#llx",
-                       vaddr, (unsigned long long)entry);
-        return -1;
-    }
-
-    uint64_t pfn = entry & ((1ULL << 55) - 1);
-    if (pfn == 0) {
-        cxl_lib_errorf("virt_to_phys: PFN resolved to zero vaddr=%p entry=%#llx",
-                       vaddr, (unsigned long long)entry);
-        return -1;
-    }
-
-    *phys_out = pfn * page_size + (virt % page_size);
-    return 0;
-}
-
-static int
-connection_register_metadata_page_translation(cxl_connection_t *conn,
-                                              uint64_t page_index,
-                                              uint64_t observed_page_base)
-{
-    if (!conn || !conn->doorbell)
-        return -1;
-
-    uint8_t doorbell_buf[16] __attribute__((aligned(16)));
-    cxl_build_doorbell(doorbell_buf, CXL_METHOD_CONTROL, 1,
-                       CXL_CONTROL_SERVICE_INTERNAL,
-                       CXL_CONTROL_METHOD_REGISTER_METADATA_PAGE_TRANSLATION,
-                       (uint16_t)(page_index & 0xFFFFu),
-                       (uint32_t)((page_index >> 16) & CXL_REQ_META_LEN_MAX),
-                       observed_page_base);
-
-    memcpy((void *)conn->doorbell, doorbell_buf, CXL_DOORBELL_PUBLISH_LEN);
-    uintptr_t line_start = ((uintptr_t)conn->doorbell) & ~((uintptr_t)63);
-    uintptr_t line_end =
-        (((uintptr_t)conn->doorbell + CXL_DOORBELL_PUBLISH_LEN) + 63u) &
-        ~((uintptr_t)63);
-    for (uintptr_t line = line_start; line < line_end; line += 64u) {
-        __asm__ __volatile__(
-            "clflushopt (%0)"
-            :
-            : "r"((void *)line)
-            : "memory");
-    }
-    __asm__ __volatile__("sfence" ::: "memory");
-    return 0;
-}
-
-static int
-connection_register_metadata_translation_pages(cxl_connection_t *conn,
-                                               size_t metadata_size)
-{
-    if (!conn || !conn->ctx || !conn->metadata_queue || metadata_size == 0) {
-        cxl_lib_errorf("metadata_translation_pages: invalid args conn=%p ctx=%p metadata=%p size=%zu",
-                       (void *)conn,
-                       conn ? (void *)conn->ctx : NULL,
-                       conn ? (void *)conn->metadata_queue : NULL,
-                       metadata_size);
-        return -1;
-    }
-
-    const uint64_t page_size = (uint64_t)CXL_METADATA_TRANSLATION_PAGE_BYTES;
-    const uint64_t page_mask = ~(page_size - 1u);
-    const uint64_t logical_start = conn->addrs.metadata_queue_addr;
-    const uint64_t logical_end = logical_start + metadata_size;
-    const uint64_t page_start = logical_start & page_mask;
-    const uint64_t page_end = (logical_end + page_size - 1u) & page_mask;
-
-    for (uint64_t logical_page = page_start;
-         logical_page < page_end;
-         logical_page += page_size) {
-        volatile uint8_t *virt_page = conn->metadata_queue;
-        uint64_t observed_page = 0;
-
-        if (logical_page >= logical_start) {
-            virt_page += (size_t)(logical_page - logical_start);
-        } else {
-            virt_page -= (size_t)(logical_start - logical_page);
-        }
-        (void)mlock((const void *)virt_page, (size_t)page_size);
-
-        if (cxl_virt_to_phys_local((const void *)virt_page, &observed_page) != 0) {
-            cxl_lib_errorf("metadata_translation_pages: virt_to_phys failed logical_page=%#llx virt=%p",
-                           (unsigned long long)logical_page,
-                           (const void *)virt_page);
-            return -1;
-        }
-        observed_page &= page_mask;
-
-        const uint64_t page_index64 = (logical_page - page_start) / page_size;
-        if (page_index64 > (((uint64_t)CXL_REQ_META_LEN_MAX << 16) | 0xFFFFu)) {
-            cxl_lib_errorf("metadata_translation_pages: page index overflow index=%#llx logical_page=%#llx",
-                           (unsigned long long)page_index64,
-                           (unsigned long long)logical_page);
-            return -1;
-        }
-
-        if (connection_register_metadata_page_translation(
-                conn, page_index64, observed_page) != 0) {
-            cxl_lib_errorf("metadata_translation_pages: register failed page_index=%#llx observed_page=%#llx",
-                           (unsigned long long)page_index64,
-                           (unsigned long long)observed_page);
-            return -1;
-        }
-    }
-
-    return 0;
-}
-
-static int connection_reset_remote_state(cxl_connection_t *conn)
-{
-    if (!conn || !conn->doorbell)
-        return -1;
-
-    uint8_t doorbell_buf[16] __attribute__((aligned(16)));
-    cxl_build_doorbell(doorbell_buf, CXL_METHOD_CONTROL, 1,
-                        0, 0, 0, 0, CXL_CONTROL_RESET_STATE);
-    /* Publish order: store payload, flush touched cacheline(s), then sfence. */
-    memcpy((void *)conn->doorbell, doorbell_buf, CXL_DOORBELL_PUBLISH_LEN);
-    uintptr_t line_start = ((uintptr_t)conn->doorbell) & ~((uintptr_t)63);
-    uintptr_t line_end =
-        (((uintptr_t)conn->doorbell + CXL_DOORBELL_PUBLISH_LEN) + 63u) &
-        ~((uintptr_t)63);
-    for (uintptr_t line = line_start; line < line_end; line += 64u) {
-        __asm__ __volatile__(
-            "clflushopt (%0)"
-            :
-            : "r"((void *)line)
-            : "memory");
-    }
-    __asm__ __volatile__("sfence" ::: "memory");
-    return 0;
-}
-
-static int
 connection_finalize_setup(cxl_connection_t *conn,
                           size_t metadata_clear_size,
                           int bootstrap_owner)
@@ -963,11 +880,12 @@ connection_finalize_setup(cxl_connection_t *conn,
     connection_init_virt_ptrs(conn);
     cxl_prefault_each_page_ro_and_flush_touched(conn->metadata_queue,
                                                 metadata_clear_size);
+    cxl_prefault_each_page_ro_and_flush_touched(conn->response_data,
+                                                conn->addrs.response_data_size);
     cxl_prefault_each_page_ro_and_flush_touched(conn->flag,
                                                 CXL_DEFAULT_FLAG_SIZE);
 
-    const int do_destructive_bootstrap =
-        conn->owns_addrs || bootstrap_owner;
+    const int do_destructive_bootstrap = bootstrap_owner;
 
     /*
      * Owner/bootstrap paths reset the completion flag. Attach paths must not
@@ -984,83 +902,20 @@ connection_finalize_setup(cxl_connection_t *conn,
     if (conn->doorbell) {
         cxl_sync_config_t sync_cfg = {
             .queue_size_n = conn->mq_entries,
-        };
+	    };
         conn->sync = cxl_sync_init(&sync_cfg, (volatile void *)conn->doorbell);
     }
 
-    if (connection_register_remote_translation(conn) != 0) {
-        cxl_lib_errorf("connection_finalize_setup: remote translation register failed doorbell=%#llx",
-                       (unsigned long long)conn->addrs.doorbell_addr);
+    if (do_destructive_bootstrap &&
+        cxl_bootstrap_controller_translation(conn, metadata_clear_size) != 0) {
+        cxl_lib_errorf("connection bootstrap controller translation failed "
+                       "doorbell=%#llx metadata=%#llx",
+                       (unsigned long long)conn->addrs.doorbell_addr,
+                       (unsigned long long)conn->addrs.metadata_queue_addr);
         return -1;
-    }
-    if (connection_register_metadata_translation_pages(conn,
-                                                       metadata_clear_size) != 0) {
-        cxl_lib_errorf("connection_finalize_setup: metadata translation register failed metadata=%#llx size=%zu",
-                       (unsigned long long)conn->addrs.metadata_queue_addr,
-                       metadata_clear_size);
-        return -1;
-    }
-    if (do_destructive_bootstrap) {
-        if (connection_reset_remote_state(conn) != 0) {
-            cxl_lib_errorf("connection_finalize_setup: reset remote state failed doorbell=%#llx",
-                           (unsigned long long)conn->addrs.doorbell_addr);
-            return -1;
-        }
     }
 
     return 0;
-}
-
-cxl_connection_t *cxl_connection_create(cxl_context_t *ctx,
-                                         uint32_t mq_entries)
-{
-    if (!ctx)
-        return NULL;
-
-    if (mq_entries == 0) mq_entries = 1024;
-
-    cxl_connection_t *conn = calloc(1, sizeof(*conn));
-    if (!conn)
-        return NULL;
-    cxl_connection_init_runtime_defaults(conn);
-
-    cxl_lib_debugf("connection_create mq_entries=%u allocator=%p",
-                   mq_entries, (void *)ctx->allocator);
-
-    conn->ctx = ctx;
-    conn->mq_entries = mq_entries;
-    conn->owns_addrs = 1;
-    conn->mq_phase = 1;  /* Must match RPC engine's initial phase (true=1) */
-    conn->req_id_client_tag = 0;
-    conn->req_id_client_tag_bits = 0;
-
-    /* Allocate regions via global allocator */
-    size_t mq_size = (size_t)mq_entries * CXL_METADATA_ENTRY_SIZE;
-    int ret = cxl_global_alloc_connection(ctx->allocator,
-                                           mq_size, 0, 0,
-                                           &conn->addrs);
-    if (ret < 0) {
-        free(conn);
-        return NULL;
-    }
-    if (cxl_req_id_allocator_init(conn) != 0) {
-        cxl_connection_destroy(conn);
-        return NULL;
-    }
-
-    if (connection_finalize_setup(conn, mq_size, 1) != 0) {
-        cxl_connection_destroy(conn);
-        return NULL;
-    }
-
-    cxl_lib_debugf("connection_create done doorbell=%#llx metadata=%#llx request=%#llx response=%#llx flag=%#llx",
-                   (unsigned long long)conn->addrs.doorbell_addr,
-                   (unsigned long long)conn->addrs.metadata_queue_addr,
-                   (unsigned long long)conn->addrs.request_data_addr,
-                   (unsigned long long)conn->addrs.response_data_addr,
-                   (unsigned long long)conn->addrs.flag_addr);
-
-    return conn;
 }
 
 static cxl_connection_t *
@@ -1078,12 +933,14 @@ cxl_connection_create_fixed_internal(cxl_context_t *ctx,
     if (addrs->doorbell_addr == 0 ||
         addrs->metadata_queue_addr == 0 ||
         addrs->flag_addr == 0 ||
+        addrs->node_id > CXL_NODE_ID_MASK ||
         addrs->metadata_queue_size < required_mq_size) {
-        cxl_lib_errorf("connection_create_fixed(%s): invalid addrs doorbell=%#llx metadata=%#llx flag=%#llx metadata_size=%zu required=%zu",
+        cxl_lib_errorf("connection_create_fixed(%s): invalid addrs doorbell=%#llx metadata=%#llx flag=%#llx node_id=%u metadata_size=%zu required=%zu",
                        bootstrap_owner ? "owner" : "attach",
                        (unsigned long long)addrs->doorbell_addr,
                        (unsigned long long)addrs->metadata_queue_addr,
                        (unsigned long long)addrs->flag_addr,
+                       (unsigned)addrs->node_id,
                        addrs->metadata_queue_size,
                        required_mq_size);
         return NULL;
@@ -1133,22 +990,20 @@ cxl_connection_create_fixed_internal(cxl_context_t *ctx,
         return NULL;
     cxl_connection_init_runtime_defaults(conn);
 
-    cxl_lib_debugf("connection_create_fixed(%s) mq_entries=%u doorbell=%#llx metadata=%#llx request=%#llx response=%#llx flag=%#llx",
+    cxl_lib_debugf("connection_create_fixed(%s) mq_entries=%u doorbell=%#llx metadata=%#llx request=%#llx response=%#llx flag=%#llx node_id=%u",
                    bootstrap_owner ? "owner" : "attach",
                    mq_entries,
                    (unsigned long long)addrs->doorbell_addr,
                    (unsigned long long)addrs->metadata_queue_addr,
                    (unsigned long long)addrs->request_data_addr,
                    (unsigned long long)addrs->response_data_addr,
-                   (unsigned long long)addrs->flag_addr);
+                   (unsigned long long)addrs->flag_addr,
+                   (unsigned)addrs->node_id);
 
     conn->ctx = ctx;
     conn->addrs = *addrs;
-    conn->owns_addrs = 0;
     conn->mq_entries = mq_entries;
     conn->mq_phase = 1;  /* Must match RPC engine's initial phase (true=1) */
-    conn->req_id_client_tag = 0;
-    conn->req_id_client_tag_bits = 0;
     if (cxl_req_id_allocator_init(conn) != 0) {
         cxl_connection_destroy(conn);
         return NULL;
@@ -1207,11 +1062,7 @@ void cxl_connection_destroy(cxl_connection_t *conn)
     if (conn->sync)
         cxl_sync_destroy(conn->sync);
 
-    /* Free regions if we own them */
-    if (conn->owns_addrs && conn->ctx && conn->ctx->allocator)
-        cxl_global_free_connection(conn->ctx->allocator, &conn->addrs);
-
-    free(conn->req_id_inflight_bitmap);
+    free(conn->rpc_id_inflight_bitmap);
     free(conn->req_entry_offsets);
     free(conn->req_entry_sizes);
     free(conn->req_entry_next);
@@ -1223,37 +1074,6 @@ const cxl_connection_addrs_t *cxl_connection_get_addrs(
     const cxl_connection_t *conn)
 {
     return conn ? &conn->addrs : NULL;
-}
-
-int cxl_connection_set_client_tag(cxl_connection_t *conn,
-                                  uint16_t client_tag,
-                                  uint8_t client_tag_bits)
-{
-    uint16_t old_client_tag = 0;
-    uint8_t old_client_tag_bits = 0;
-
-    if (!conn)
-        return -1;
-    if (client_tag_bits > 15)
-        return -1;
-    if (client_tag_bits == 0 && client_tag != 0)
-        return -1;
-    if (client_tag_bits > 0 && client_tag >= (1u << client_tag_bits))
-        return -1;
-    if (conn->req_id_inflight_count != 0)
-        return -1;
-
-    old_client_tag = conn->req_id_client_tag;
-    old_client_tag_bits = conn->req_id_client_tag_bits;
-    conn->req_id_client_tag = client_tag;
-    conn->req_id_client_tag_bits = client_tag_bits;
-    if (cxl_req_id_allocator_init(conn) == 0)
-        return 0;
-
-    conn->req_id_client_tag = old_client_tag;
-    conn->req_id_client_tag_bits = old_client_tag_bits;
-    (void)cxl_req_id_allocator_init(conn);
-    return -1;
 }
 
 int cxl_connection_bind_copyengine_lane(cxl_connection_t *conn,
@@ -1281,8 +1101,6 @@ int cxl_connection_bind_copyengine_lane(cxl_connection_t *conn,
  * ================================================================ */
 
 int cxl_send_request(cxl_connection_t *conn,
-                     uint16_t service_id,
-                     uint16_t method_id,
                      const void *data,
                      size_t len)
 {
@@ -1292,9 +1110,6 @@ int cxl_send_request(cxl_connection_t *conn,
 
     /* Check data pointer when length is non-zero */
     if (len > 0 && !data)
-        return -1;
-
-    if (service_id > 0x0FFFu || method_id > 0x0FFFu)
         return -1;
 
     if (len > CXL_REQ_PAYLOAD_SOFT_MAX)
@@ -1313,8 +1128,8 @@ int cxl_send_request(cxl_connection_t *conn,
             memcpy(&inline_data, data, len);
 
         cxl_build_doorbell(doorbell_buf, CXL_METHOD_REQUEST, 1,
-                            service_id, method_id, req_id,
-                            (uint32_t)len, inline_data);
+                           (uint32_t)len, conn->addrs.node_id,
+                           req_id, inline_data);
     } else {
         /* Non-inline: write request_data entry, then doorbell */
         if (!conn->request_data || conn->addrs.request_data_size == 0)
@@ -1322,7 +1137,7 @@ int cxl_send_request(cxl_connection_t *conn,
 
         /*
          * request_data publish uses 64B cacheline slots.
-         * Doorbell header carries full payload length (20 bits), while
+         * Doorbell header carries full payload length (32 bits), while
          * request_data stores payload bytes only (no in-band length header).
          */
         size_t entry_size = cxl_request_entry_size(len);
@@ -1358,26 +1173,12 @@ int cxl_send_request(cxl_connection_t *conn,
                               ((uint8_t *)entry_ptr - (uint8_t *)conn->request_data);
 
         cxl_build_doorbell(doorbell_buf, CXL_METHOD_REQUEST, 0,
-                            service_id, method_id, req_id,
-                            (uint32_t)len, entry_phys);
+                           (uint32_t)len, conn->addrs.node_id,
+                           req_id, entry_phys);
     }
 
     /* Publish doorbell via the same store+flush semantic path as payload. */
-    uintptr_t doorbell_line_start = ((uintptr_t)conn->doorbell) & ~((uintptr_t)63);
-    uintptr_t doorbell_line_end =
-        (((uintptr_t)conn->doorbell + CXL_DOORBELL_PUBLISH_LEN) + 63u) &
-        ~((uintptr_t)63);
-    /* Publish order: store payload, flush touched cacheline(s), then sfence. */
-    memcpy((void *)conn->doorbell, doorbell_buf, CXL_DOORBELL_PUBLISH_LEN);
-    for (uintptr_t line = doorbell_line_start; line < doorbell_line_end;
-         line += 64u) {
-        __asm__ __volatile__(
-            "clflushopt (%0)"
-            :
-            : "r"((void *)line)
-            : "memory");
-    }
-    __asm__ __volatile__("sfence" ::: "memory");
+    cxl_publish_doorbell_raw(conn->doorbell, doorbell_buf);
 
     return (int)req_id;
 
@@ -1387,70 +1188,46 @@ fail_release_req_id:
 }
 
 /* forward declarations for client response drain helpers */
-int cxl_peek_latest_completed_request_id(cxl_connection_t *conn,
-                                         uint16_t *out_request_id);
+int cxl_peek_latest_completed_rpc_id(cxl_connection_t *conn,
+                                     uint16_t *out_rpc_id);
 
 int cxl_consume_next_response(cxl_connection_t *conn,
                               void *out_data,
                               size_t *out_len,
-                              uint16_t *out_request_id);
-
-static int
-cxl_advance_response_scan_offset(cxl_connection_t *conn)
-{
-    if (!conn || conn->addrs.response_data_size == 0)
-        return 0;
-
-    if (conn->resp_read_offset == 0)
-        return 0;
-
-    /*
-     * Response entries are 64B-aligned and tightly packed. An empty slot can
-     * only mean we reached the producer's tail wrap and must restart at 0.
-     */
-    conn->resp_read_offset = 0;
-    return 1;
-}
+                              uint16_t *out_rpc_id);
 
 static int
 cxl_peek_next_response_entry(cxl_connection_t *conn,
                              const volatile uint8_t **out_payload,
                              size_t *out_len,
-                             uint16_t *out_request_id)
+                             uint16_t *out_rpc_id)
 {
     if (out_payload)
         *out_payload = NULL;
     if (out_len)
         *out_len = 0;
-    if (out_request_id)
-        *out_request_id = 0;
+    if (out_rpc_id)
+        *out_rpc_id = 0;
 
     if (!conn || !conn->response_data ||
-        !out_payload || !out_len || !out_request_id)
+        !out_payload || !out_len || !out_rpc_id)
         return -1;
     if (conn->addrs.response_data_size == 0)
         return -1;
 
-    int advanced_gap_once = 0;
-
-retry_after_gap:
     if (conn->resp_read_offset >= conn->addrs.response_data_size) {
         conn->resp_read_offset = 0;
     }
 
     volatile uint8_t *resp = conn->response_data + conn->resp_read_offset;
     __asm__ __volatile__("clflushopt (%0)" :: "r"((void *)resp) : "memory");
-    __asm__ __volatile__("sfence" ::: "memory");
+    cxl_invalidate_load_barrier();
     uint64_t header = *(volatile uint64_t *)resp;
     uint32_t payload_len_u32 = (uint32_t)(header & 0xFFFFFFFFu);
     uint16_t resp_req_id = (uint16_t)((header >> 32) & 0xFFFFu);
     uint16_t resp_rsp_id = (uint16_t)((header >> 48) & 0xFFFFu);
 
     if (resp_req_id == 0 || resp_rsp_id == 0) {
-        if (!advanced_gap_once && cxl_advance_response_scan_offset(conn)) {
-            advanced_gap_once = 1;
-            goto retry_after_gap;
-        }
         return 0;
     }
 
@@ -1462,10 +1239,6 @@ retry_after_gap:
         return -1;
 
     if (conn->resp_read_offset + entry_size > conn->addrs.response_data_size) {
-        if (!advanced_gap_once && cxl_advance_response_scan_offset(conn)) {
-            advanced_gap_once = 1;
-            goto retry_after_gap;
-        }
         return -1;
     }
     if (resp_rsp_id != resp_req_id)
@@ -1485,65 +1258,56 @@ retry_after_gap:
                 : "r"((void *)line)
                 : "memory");
         }
-        __asm__ __volatile__("sfence" ::: "memory");
+        cxl_invalidate_load_barrier();
     }
 
     *out_payload = resp + CXL_RESP_HEADER_LEN;
     *out_len = msg_len;
-    *out_request_id = resp_req_id;
+    *out_rpc_id = resp_req_id;
     return 1;
 }
 
 static inline void
 cxl_commit_response_head(cxl_connection_t *conn,
-                         uint16_t request_id,
+                         uint16_t rpc_id,
                          size_t msg_len)
 {
     size_t entry_size = cxl_response_entry_size(msg_len);
-    if (conn->response_data &&
-        conn->resp_read_offset < conn->addrs.response_data_size) {
-        /*
-         * Clear the consumed header so future wraps never reinterpret stale
-         * entries as a still-live response.
-         */
-        cxl_zero_and_flush_range(conn->response_data + conn->resp_read_offset,
-                                 CXL_RESP_HEADER_LEN);
-    }
     conn->resp_read_offset += entry_size;
     if (conn->addrs.response_data_size > 0 &&
         conn->resp_read_offset >= conn->addrs.response_data_size) {
         conn->resp_read_offset = 0;
     }
-    cxl_request_ring_mark_complete(conn, request_id);
-    cxl_req_id_allocator_release(conn, request_id);
+    cxl_request_ring_mark_complete(conn, rpc_id);
+    cxl_req_id_allocator_release(conn, rpc_id);
 }
 
-int cxl_peek_latest_completed_request_id(cxl_connection_t *conn,
-                                         uint16_t *out_request_id)
+int cxl_peek_latest_completed_rpc_id(cxl_connection_t *conn,
+                                     uint16_t *out_rpc_id)
 {
-    if (out_request_id)
-        *out_request_id = 0;
+    if (out_rpc_id)
+        *out_rpc_id = 0;
 
-    if (!conn || !conn->flag || !out_request_id)
+    if (!conn || !conn->flag || !out_rpc_id)
         return -1;
 
     volatile uint8_t *flag = conn->flag;
     __asm__ __volatile__("clflushopt (%0)" :: "r"((void *)flag) : "memory");
-    __asm__ __volatile__("sfence" ::: "memory");
-    *out_request_id = *(volatile uint16_t *)flag;
-    return (*out_request_id != 0u) ? 1 : 0;
+    cxl_invalidate_load_barrier();
+    *out_rpc_id = *(volatile uint16_t *)flag;
+    return (*out_rpc_id != 0u) ? 1 : 0;
 }
 
 int cxl_consume_next_response(cxl_connection_t *conn,
                               void *out_data,
                               size_t *out_len,
-                              uint16_t *out_request_id)
+                              uint16_t *out_rpc_id)
 {
-    if (out_request_id)
-        *out_request_id = 0;
+    if (out_rpc_id)
+        *out_rpc_id = 0;
 
     if (!conn || !conn->response_data || !out_data || !out_len ||
-        !out_request_id)
+        !out_rpc_id)
         return -1;
 
     size_t capacity = *out_len;
@@ -1551,7 +1315,7 @@ int cxl_consume_next_response(cxl_connection_t *conn,
     int peek_rc = cxl_peek_next_response_entry(conn,
                                                &payload,
                                                out_len,
-                                               out_request_id);
+                                               out_rpc_id);
     if (peek_rc != 1)
         return peek_rc;
 
@@ -1565,7 +1329,7 @@ int cxl_consume_next_response(cxl_connection_t *conn,
     if (*out_len > 0)
         memcpy(out_data, (const void *)payload, *out_len);
 
-    cxl_commit_response_head(conn, *out_request_id, *out_len);
+    cxl_commit_response_head(conn, *out_rpc_id, *out_len);
     return 1;
 }
 
@@ -1574,11 +1338,10 @@ int cxl_consume_next_response(cxl_connection_t *conn,
  * ================================================================ */
 
 int cxl_poll_request(cxl_connection_t *conn,
-                      uint16_t *service_id,
-                      uint16_t *method_id,
-                      uint16_t *request_id,
-                      const void **out_data_view,
-                      size_t *out_len)
+                     uint16_t *node_id,
+                     uint16_t *rpc_id,
+                     const void **out_data_view,
+                     size_t *out_len)
 {
     int ret = -1;
     const int mq_invalidate_consumed = CXL_MQ_INVALIDATE_CONSUMED;
@@ -1615,7 +1378,7 @@ int cxl_poll_request(cxl_connection_t *conn,
 
     uint64_t meta_lo = *(volatile uint64_t *)entry;
     uint64_t meta_hi = 0;
-    uint8_t entry_phase = (uint8_t)((meta_lo >> 3) & 0x01u);
+    uint8_t entry_phase = (uint8_t)((meta_lo >> 2) & 0x01u);
     uint8_t expected_phase = conn->mq_phase & 0x01;
 
     if (cxl_lib_trace_polls_enabled()) {
@@ -1661,70 +1424,75 @@ int cxl_poll_request(cxl_connection_t *conn,
     }
 
     /* Parse entry fields */
-    uint8_t mq_method  = (uint8_t)(meta_lo & 0x03u);
-    uint8_t mq_inline  = (uint8_t)((meta_lo >> 2) & 0x01u);
-    uint32_t mq_len = (uint32_t)((meta_lo >> 4) & CXL_REQ_META_LEN_MAX);
-    uint16_t svc = (uint16_t)((meta_lo >> 24) & 0x0FFFu);
-    uint16_t mid = (uint16_t)((meta_lo >> 36) & 0x0FFFu);
-    uint16_t rid = (uint16_t)((meta_lo >> 48) & 0xFFFFu);
+    uint8_t mq_method  = (uint8_t)(meta_lo & 0x01u);
+    uint8_t mq_inline  = (uint8_t)((meta_lo >> 1) & 0x01u);
+    uint32_t mq_len = (uint32_t)((meta_lo >> 3) & 0xFFFFFFFFu);
+    uint16_t nid = (uint16_t)((meta_lo >> 35) & CXL_NODE_ID_MASK);
+    uint16_t rid = (uint16_t)((meta_lo >> 49) & CXL_RPC_ID_MASK);
 
-    if (service_id) *service_id = svc;
-    if (method_id)  *method_id  = mid;
-    if (request_id) *request_id = rid;
+    if (node_id) *node_id = nid;
+    if (rpc_id)  *rpc_id = rid;
 
     /* Extract payload */
-    int is_request = (mq_method == CXL_METHOD_REQUEST);
-    int is_inline_req = (mq_inline != 0);
-    if (is_request) {
-        if (is_inline_req) {
-            /* Inline: payload view is in bytes 8-15. */
-            size_t msg_len = mq_len <= 8 ? (size_t)mq_len : 8;
-            *out_data_view = (const void *)(entry + 8);
+    if (mq_method != CXL_METHOD_REQUEST || rid == 0) {
+        cxl_lib_errorf("poll_request: unexpected metadata entry method=%u rpc_id=%u head=%u",
+                       (unsigned)mq_method, (unsigned)rid, head_idx);
+        cxl_advance_mq_head_with_policy(conn, head_idx, head_line_idx,
+                                        mq_entries_per_line,
+                                        mq_total_lines,
+                                        mq_invalidate_consumed);
+        ret = -1;
+        goto out;
+    }
+
+    if (mq_inline) {
+        /* Inline: payload view is in bytes 8-15. */
+        size_t msg_len = mq_len <= 8 ? (size_t)mq_len : 8;
+        *out_data_view = (const void *)(entry + 8);
+        *out_len = msg_len;
+    } else {
+        /* Non-inline: bytes 8-15 contain an absolute logical payload address. */
+        uint64_t data_addr = meta_hi;
+        size_t msg_len = (size_t)mq_len;
+        if (msg_len == 0 ||
+            msg_len > sizeof(conn->request_local_buf) ||
+            !cxl_rpc_phys_range_valid(conn->ctx, data_addr, msg_len)) {
+            cxl_advance_mq_head_with_policy(conn, head_idx, head_line_idx,
+                                            mq_entries_per_line,
+                                            mq_total_lines,
+                                            mq_invalidate_consumed);
+            ret = -1;
+            goto out;
+        }
+
+        volatile uint8_t *data_ptr = cxl_rpc_phys_to_virt(conn->ctx,
+                                                          data_addr);
+        if (data_ptr) {
+            const volatile uint8_t *payload_ptr = data_ptr;
+
+            /* Invalidate payload cacheline(s) before demand-load. */
+            uintptr_t line_start = ((uintptr_t)payload_ptr) & ~((uintptr_t)63);
+            uintptr_t line_end =
+                (((uintptr_t)payload_ptr + msg_len) + 63u) &
+                ~((uintptr_t)63);
+            for (uintptr_t line = line_start; line < line_end;
+                 line += 64u) {
+                __asm__ __volatile__(
+                    "clflushopt (%0)"
+                    :
+                    : "r"((void *)line)
+                    : "memory");
+            }
+            cxl_invalidate_load_barrier();
+            if (msg_len > 0)
+                memcpy(conn->request_local_buf,
+                       (const void *)payload_ptr,
+                       msg_len);
+            *out_data_view = (const void *)conn->request_local_buf;
             *out_len = msg_len;
         } else {
-            /* Non-inline: bytes 8-15 contain request_data logical address. */
-            uint64_t data_addr = meta_hi;
-            size_t msg_len = (size_t)mq_len;
-            if (msg_len == 0 ||
-                msg_len > sizeof(conn->request_local_buf) ||
-                !cxl_rpc_phys_range_valid(conn->ctx, data_addr, msg_len)) {
-                cxl_advance_mq_head_with_policy(conn, head_idx, head_line_idx,
-                                                mq_entries_per_line,
-                                                mq_total_lines,
-                                                mq_invalidate_consumed);
-                ret = -1;
-                goto out;
-            }
-
-            volatile uint8_t *data_ptr = cxl_rpc_phys_to_virt(conn->ctx,
-                                                              data_addr);
-            if (data_ptr) {
-                const volatile uint8_t *payload_ptr = data_ptr;
-
-                /* Invalidate payload cacheline(s) before demand-load. */
-                uintptr_t line_start = ((uintptr_t)payload_ptr) & ~((uintptr_t)63);
-                uintptr_t line_end =
-                    (((uintptr_t)payload_ptr + msg_len) + 63u) &
-                    ~((uintptr_t)63);
-                for (uintptr_t line = line_start; line < line_end;
-                     line += 64u) {
-                    __asm__ __volatile__(
-                        "clflushopt (%0)"
-                        :
-                        : "r"((void *)line)
-                        : "memory");
-                }
-                __asm__ __volatile__("sfence" ::: "memory");
-                if (msg_len > 0)
-                    memcpy(conn->request_local_buf,
-                           (const void *)payload_ptr,
-                           msg_len);
-                *out_data_view = (const void *)conn->request_local_buf;
-                *out_len = msg_len;
-            } else {
-                ret = -1;
-                goto out;
-            }
+            ret = -1;
+            goto out;
         }
     }
 
@@ -1762,6 +1530,8 @@ cxl_prepare_response_tx_path(cxl_connection_t *conn)
     if (cxl_copyengine_prepare(conn) != 0)
         return -1;
     if (cxl_copyengine_ensure_response_slots(conn) != 0)
+        return -1;
+    if (cxl_copyengine_validate_submit_invariants(conn) != 0)
         return -1;
 
     conn->resp_tx_ready = 1;
@@ -1863,7 +1633,7 @@ int cxl_connection_set_peer_response_flag_addr(cxl_connection_t *conn,
 }
 
 int cxl_send_response(cxl_connection_t *conn,
-                      uint16_t request_id,
+                      uint16_t rpc_id,
                       const void *data,
                       size_t len)
 {
@@ -1874,7 +1644,7 @@ int cxl_send_response(cxl_connection_t *conn,
         return -1;
     if (len > 0 && !data)
         return -1;
-    if (request_id == 0)
+    if (rpc_id == 0 || rpc_id > CXL_RPC_ID_MASK)
         return -1;
     if (len > CXL_RESP_PAYLOAD_SOFT_MAX)
         return -1;
@@ -1883,6 +1653,19 @@ int cxl_send_response(cxl_connection_t *conn,
     if (cxl_pick_peer_response_offset(conn, entry_size, &offset) != 0)
         return -1;
 
+    if (cxl_lib_debug_enabled()) {
+        size_t next_offset = offset + entry_size;
+        if (next_offset >= conn->peer_response_data_size)
+            next_offset = 0;
+        cxl_lib_debugf("send_response rpc_id=%u len=%zu entry_size=%zu offset=%zu next_offset=%zu flag_addr=%#llx",
+                       rpc_id,
+                       len,
+                       entry_size,
+                       offset,
+                       next_offset,
+                       (unsigned long long)conn->peer_flag_addr);
+    }
+
     /*
      * Preferred path: asynchronous CopyEngine offload.
      * Submit resp_data then flag in-order without waiting for completion.
@@ -1890,11 +1673,11 @@ int cxl_send_response(cxl_connection_t *conn,
      * translates the logical offset into one or two observed DMA segments,
      * builds descriptors, and rings the engine.
      */
-    if (!cxl_copyengine_submit_response_async(conn, request_id, data, len,
+    if (!cxl_copyengine_submit_response_async(conn, rpc_id, data, len,
                                               offset, entry_size)) {
         fprintf(stderr,
-                "cxl_rpc: ERROR: CopyEngine submit path failed (req_id=%u)\n",
-                request_id);
+                "cxl_rpc: ERROR: CopyEngine submit path failed (rpc_id=%u)\n",
+                rpc_id);
         return -1;
     }
 

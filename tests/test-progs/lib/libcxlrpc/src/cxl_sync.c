@@ -12,9 +12,9 @@
 #include <string.h>
 #include <stdint.h>
 
-/* ===== Doorbell method types (from pipeline.md) ===== */
+/* ===== Doorbell method types ===== */
 
-#define CXL_METHOD_HEAD_UPDATE  2
+#define CXL_METHOD_HEAD_UPDATE  1
 #define CXL_DOORBELL_PUBLISH_LEN 16
 
 /* ===== Internal state ===== */
@@ -28,13 +28,26 @@ struct cxl_adaptive_sync {
     volatile void *doorbell_addr;
 };
 
+static void
+build_head_update_doorbell(uint8_t *buf, uint32_t head)
+{
+    uint64_t header = 0;
+    uint64_t data = (uint64_t)head;
+
+    if (!buf)
+        return;
+
+    header |= (uint64_t)CXL_METHOD_HEAD_UPDATE;
+    header |= (uint64_t)1u << 1;  /* inline */
+    memcpy(buf, &header, sizeof(header));
+    memcpy(buf + sizeof(header), &data, sizeof(data));
+}
+
 /* Send HEAD_UPDATE with explicit store + clflushopt + sfence ordering. */
 static void do_head_sync(cxl_adaptive_sync_t *s, uint32_t head)
 {
     uint8_t buf[16] __attribute__((aligned(16)));
-    uint64_t *words = (uint64_t *)buf;
-    words[0] = (uint64_t)CXL_METHOD_HEAD_UPDATE;
-    words[1] = (uint64_t)head;
+    build_head_update_doorbell(buf, head);
     memcpy((void *)s->doorbell_addr, buf, CXL_DOORBELL_PUBLISH_LEN);
     uintptr_t line_start = ((uintptr_t)s->doorbell_addr) & ~((uintptr_t)63);
     uintptr_t line_end =

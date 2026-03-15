@@ -46,6 +46,7 @@
 #ifndef __DEV_PCI_COPY_ENGINE_HH__
 #define __DEV_PCI_COPY_ENGINE_HH__
 
+#include <deque>
 #include <vector>
 
 #include "base/statistics.hh"
@@ -69,6 +70,21 @@ class CopyEngine : public PciDevice
         int channelId;
         copy_engine_reg::DmaDesc *curDmaDesc;
         uint8_t *copyBuffer;
+        uint8_t *verifyBuffer;
+        uint8_t *delayedVerifyBuffer;
+        Addr verifyAddress;
+        uint32_t verifyLength;
+        struct DelayedVerifyReq
+        {
+            Addr src = 0;
+            Addr dst = 0;
+            uint32_t len = 0;
+            Tick dueTick = 0;
+            std::vector<uint8_t> expected;
+        };
+        std::deque<DelayedVerifyReq> delayedVerifyQueue;
+        DelayedVerifyReq activeDelayedVerify;
+        bool delayedVerifyActive;
 
         bool busy;
         bool underReset;
@@ -135,6 +151,16 @@ class CopyEngine : public PciDevice
         void writeCopyBytes();
         void writeCopyBytesComplete();
         EventFunctionWrapper writeCompleteEvent;
+
+        void verifyWriteTarget();
+        void verifyWriteTargetComplete();
+        EventFunctionWrapper verifyCompleteEvent;
+        void scheduleDelayedVerify(Addr src, Addr dst,
+                                   uint32_t len, const uint8_t *expected);
+        void startDelayedVerify();
+        void delayedVerifyComplete();
+        EventFunctionWrapper delayedVerifyKickEvent;
+        EventFunctionWrapper delayedVerifyCompleteEvent;
 
         void writeCompletionStatus();
         void writeStatusComplete();

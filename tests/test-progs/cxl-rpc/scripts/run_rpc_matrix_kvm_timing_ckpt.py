@@ -2,13 +2,19 @@
 """
 Run CXL RPC matrix experiments with:
   - KVM boot + TIMING CPU test phase
-  - rebuild checkpoint per experiment (exact CPU count)
+  - inject guest binaries once per batch
+  - reuse one checkpoint per client-count topology
   - automatic result extraction from board.pc.com_1.device
 
-Matrix (deduplicated):
-  A) req_size in [8B,64B,256B,1KB,4KB,16KB,64KB,256KB], clients=16, reqs=15
-  B) req_size=64B, clients in [1,2,4,8,16,32], reqs=15
-  response_size is fixed to 16B.
+Default experiment matrix (deduplicated):
+  A) client sweep:
+     req_size=64B, resp_size=64B, clients in [1,2,4,8,16,29], reqs=30
+  B) request-size sweep:
+     req_size in [8B,64B,256B,1KB,4KB,8KB], resp_size=64B,
+     clients=16, reqs=30
+  C) response-size sweep:
+     req_size=64B, resp_size in [8B,64B,256B,1KB],
+     clients=16, reqs=30
 """
 
 from __future__ import annotations
@@ -28,8 +34,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-REQ_SWEEP_SIZES = [8, 64, 256, 1024, 4096, 16384, 65536, 262144]
-CLIENT_SWEEP_COUNTS = [1, 2, 4, 8, 16, 32]
+BASE_REQUEST_SIZE = 64
+BASE_RESPONSE_SIZE = 64
+SIZE_SWEEP_CLIENTS = 16
+REQ_SWEEP_SIZES = [8, 64, 256, 1024, 4096, 8192]
+# Current public backend caps response payload at 4088B, so keep the
+# response-size sweep below that limit for now.
+RESP_SWEEP_SIZES = [8, 64, 256, 1024]
+CLIENT_SWEEP_COUNTS = [1, 2, 4, 8, 16, 29]
 
 
 @dataclass(frozen=True)
@@ -58,42 +70,68 @@ def resolve_repo_root(cli_repo_root: Optional[str]) -> Path:
     return Path(__file__).resolve().parents[4]
 
 
-def build_matrix(requests_per_client: int, response_size: int) -> List[Experiment]:
+def build_matrix(requests_per_client: int,
+                 baseline_response_size: int) -> List[Experiment]:
     dedup: Dict[ExperimentKey, Experiment] = {}
 
-    for size in REQ_SWEEP_SIZES:
-        key = ExperimentKey(
-            request_size=size,
-            response_size=response_size,
-            clients=16,
-            requests_per_client=requests_per_client,
-        )
-        dedup.setdefault(
-            key,
-            Experiment(
-                key=key,
-                exp_id=f"req{size}_resp{response_size}_c16_r{requests_per_client}",
-                source="size_sweep",
+    def add_experiment(key: ExperimentKey, source: str) -> None:
+        existing = dedup.get(key)
+        if existing is not None:
+            existing_sources = set(existing.source.split(","))
+            if source not in existing_sources:
+                existing.source = f"{existing.source},{source}"
+            return
+
+        dedup[key] = Experiment(
+            key=key,
+            exp_id=(
+                f"req{key.request_size}_resp{key.response_size}"
+                f"_c{key.clients}_r{key.requests_per_client}"
             ),
+            source=source,
         )
 
     for clients in CLIENT_SWEEP_COUNTS:
-        key = ExperimentKey(
-            request_size=64,
-            response_size=response_size,
-            clients=clients,
-            requests_per_client=requests_per_client,
-        )
-        dedup.setdefault(
-            key,
-            Experiment(
-                key=key,
-                exp_id=f"req64_resp{response_size}_c{clients}_r{requests_per_client}",
-                source="client_sweep",
+        add_experiment(
+            ExperimentKey(
+                request_size=BASE_REQUEST_SIZE,
+                response_size=baseline_response_size,
+                clients=clients,
+                requests_per_client=requests_per_client,
             ),
+            "client_sweep",
         )
 
-    return sorted(dedup.values(), key=lambda x: (x.key.clients, x.key.request_size))
+    for request_size in REQ_SWEEP_SIZES:
+        add_experiment(
+            ExperimentKey(
+                request_size=request_size,
+                response_size=baseline_response_size,
+                clients=SIZE_SWEEP_CLIENTS,
+                requests_per_client=requests_per_client,
+            ),
+            "request_size_sweep",
+        )
+
+    for response_size in RESP_SWEEP_SIZES:
+        add_experiment(
+            ExperimentKey(
+                request_size=BASE_REQUEST_SIZE,
+                response_size=response_size,
+                clients=SIZE_SWEEP_CLIENTS,
+                requests_per_client=requests_per_client,
+            ),
+            "response_size_sweep",
+        )
+
+    return sorted(
+        dedup.values(),
+        key=lambda x: (
+            x.key.clients,
+            x.key.request_size,
+            x.key.response_size,
+        ),
+    )
 
 
 def run_and_tee(cmd: List[str], log_path: Path) -> int:
@@ -178,36 +216,36 @@ def parse_board_ticks(board_path: Path) -> Tuple[Optional[int], List[Dict[str, i
 
         m = re_multi.match(line)
         if m:
-            cid = int(m.group(1))
+            node_id = int(m.group(1))
             ridx = int(m.group(2))
             kind = m.group(3)
             val = int(m.group(4))
-            fields.setdefault((cid, ridx), {})[kind] = val
+            fields.setdefault((node_id, ridx), {})[kind] = val
             continue
 
         m = re_single.match(line)
         if m:
-            cid = 0
+            node_id = 0
             ridx = int(m.group(1))
             kind = m.group(2)
             val = int(m.group(3))
-            fields.setdefault((cid, ridx), {})[kind] = val
+            fields.setdefault((node_id, ridx), {})[kind] = val
             continue
 
         m = re_bare.match(line)
         if m:
-            cid = 0
+            node_id = 0
             ridx = int(m.group(1))
             kind = m.group(2)
             val = int(m.group(3))
-            fields.setdefault((cid, ridx), {})[kind] = val
+            fields.setdefault((node_id, ridx), {})[kind] = val
 
     rows: List[Dict[str, int]] = []
-    for (cid, ridx), vals in sorted(fields.items()):
+    for (node_id, ridx), vals in sorted(fields.items()):
         if "start" in vals and "end" in vals and "delta" in vals:
             rows.append(
                 {
-                    "client_id": cid,
+                    "node_id": node_id,
                     "req_index": ridx,
                     "start_tick": vals["start"],
                     "end_tick": vals["end"],
@@ -342,9 +380,23 @@ def main() -> int:
     parser.add_argument("--repo-root", type=str, default=None)
     parser.add_argument("--output-base", type=str, default="output")
     parser.add_argument("--batch-name", type=str, default="")
-    parser.add_argument("--requests", type=int, default=15)
-    parser.add_argument("--response-size", type=int, default=16)
+    parser.add_argument("--requests", type=int, default=30)
+    parser.add_argument(
+        "--response-size",
+        type=int,
+        default=BASE_RESPONSE_SIZE,
+        help=(
+            "Baseline response size for client/request-size sweeps. "
+            "Response-size sweep still uses the built-in set."
+        ),
+    )
     parser.add_argument("--max-polls", type=int, default=2000000)
+    parser.add_argument(
+        "--only-exp-id",
+        type=str,
+        default="",
+        help="Run only the experiment whose exp_id exactly matches this value",
+    )
     parser.add_argument(
         "--start-index",
         type=int,
@@ -400,6 +452,11 @@ def main() -> int:
     disk_img = repo_root / "files/parsec.img"
 
     experiments = build_matrix(args.requests, args.response_size)
+    if args.only_exp_id:
+        experiments = [exp for exp in experiments if exp.exp_id == args.only_exp_id]
+        if not experiments:
+            print(f"[fatal] no experiment matched --only-exp-id={args.only_exp_id}")
+            return 2
     max_clients = max(exp.key.clients for exp in experiments)
     max_required_cpus = max_clients + 1  # server core + one core per client
 
@@ -448,12 +505,12 @@ def main() -> int:
     if args.checkpoint:
         print(
             "[matrix] note: --checkpoint is ignored; "
-            "this script rebuilds checkpoint per experiment with exact CPU count."
+            "this script manages per-client-count checkpoints automatically."
         )
     if args.checkpoint_cpus:
         print(
             "[matrix] note: --checkpoint-cpus is ignored; "
-            "CPU count is derived per experiment as clients+1."
+            "CPU count is derived from client count as clients+1."
         )
 
     experiments_csv = batch_dir / "experiments.csv"
@@ -487,7 +544,7 @@ def main() -> int:
         "response_size",
         "clients",
         "requests_per_client",
-        "client_id",
+        "node_id",
         "req_index",
         "start_tick",
         "end_tick",
@@ -499,6 +556,7 @@ def main() -> int:
     direct_kvm_access = os.access("/dev/kvm", os.R_OK | os.W_OK)
     sudo_n_available = sudo_nopass_available()
     kvm_cmd_prefix: List[str] = []
+    checkpoint_cache: Dict[int, Path] = {}
 
     if direct_kvm_access:
         print("[matrix] /dev/kvm is directly accessible by current user")
@@ -549,92 +607,109 @@ def main() -> int:
         run_outdir.mkdir(parents=True, exist_ok=True)
         run_log = run_outdir / "gem5_run.log"
         required_cpus = key.clients + 1
+        checkpoint_dir = checkpoint_cache.get(key.clients)
+        checkpoint_label = f"clients_{key.clients}"
         ckpt_outdir = (
-            batch_dir / f"ckpt_{idx:02d}_{exp.exp_id}" / "cxl_rpc_checkpoint"
+            batch_dir / "checkpoints" / checkpoint_label / "cxl_rpc_checkpoint"
         )
-        checkpoint_dir: Path = ckpt_outdir
 
-        ckpt_cmd = kvm_cmd_prefix + [
-            str(gem5_bin),
-            "-d",
-            str(ckpt_outdir),
-            str(save_ckpt_cfg),
-            "--num_cpus",
-            str(required_cpus),
-            "--rpc_client_count",
-            str(key.clients),
-        ]
-        if args.dry_run:
-            print(
-                "[dry-run] would build checkpoint:",
-                " ".join(shlex.quote(c) for c in ckpt_cmd),
-            )
-        else:
-            ckpt_outdir.mkdir(parents=True, exist_ok=True)
-            ckpt_log = run_outdir / "checkpoint_build.log"
-            ckpt_rc = run_and_tee(ckpt_cmd, ckpt_log)
-            if ckpt_rc != 0:
-                append_row(
-                    experiments_csv,
-                    {
-                        "exp_id": exp.exp_id,
-                        "source": exp.source,
-                        "request_size": key.request_size,
-                        "response_size": key.response_size,
-                        "clients": key.clients,
-                        "requests_per_client": key.requests_per_client,
-                        "checkpoint_dir": str(ckpt_outdir),
-                        "num_cpus": required_cpus,
-                        "output_dir": str(run_outdir),
-                        "start_time": "",
-                        "end_time": "",
-                        "elapsed_sec": "0.000",
-                        "gem5_rc": ckpt_rc,
-                        "test_cmd_exit": "",
-                        "tick_rows": 0,
-                        "expected_rows": key.clients * key.requests_per_client,
-                        "status": "checkpoint_failed",
-                    },
-                    exp_fields,
-                )
+        if checkpoint_dir is None:
+            resolved = None if args.dry_run else resolve_checkpoint_dir(ckpt_outdir)
+            if resolved is not None:
+                checkpoint_dir = resolved
+                checkpoint_cache[key.clients] = checkpoint_dir
                 print(
-                    f"[done] {exp.exp_id} status=checkpoint_failed "
-                    f"gem5_rc={ckpt_rc} test_rc=None ticks=0/"
-                    f"{key.clients * key.requests_per_client} elapsed=0.0s"
+                    f"[matrix] reuse checkpoint for {key.clients} client(s): "
+                    f"{checkpoint_dir}"
                 )
-                continue
-            resolved = resolve_checkpoint_dir(ckpt_outdir)
-            if resolved is None:
-                append_row(
-                    experiments_csv,
-                    {
-                        "exp_id": exp.exp_id,
-                        "source": exp.source,
-                        "request_size": key.request_size,
-                        "response_size": key.response_size,
-                        "clients": key.clients,
-                        "requests_per_client": key.requests_per_client,
-                        "checkpoint_dir": str(ckpt_outdir),
-                        "num_cpus": required_cpus,
-                        "output_dir": str(run_outdir),
-                        "start_time": "",
-                        "end_time": "",
-                        "elapsed_sec": "0.000",
-                        "gem5_rc": 2,
-                        "test_cmd_exit": "",
-                        "tick_rows": 0,
-                        "expected_rows": key.clients * key.requests_per_client,
-                        "status": "checkpoint_missing",
-                    },
-                    exp_fields,
-                )
-                print(
-                    f"[done] {exp.exp_id} status=checkpoint_missing "
-                    f"gem5_rc=2 test_rc=None ticks=0/"
-                    f"{key.clients * key.requests_per_client} elapsed=0.0s"
-                )
-                continue
-            checkpoint_dir = resolved
+            else:
+                ckpt_cmd = kvm_cmd_prefix + [
+                    str(gem5_bin),
+                    "-d",
+                    str(ckpt_outdir),
+                    str(save_ckpt_cfg),
+                    "--num_cpus",
+                    str(required_cpus),
+                    "--rpc_client_count",
+                    str(key.clients),
+                ]
+                if args.dry_run:
+                    checkpoint_dir = ckpt_outdir
+                    print(
+                        "[dry-run] would build checkpoint:",
+                        " ".join(shlex.quote(c) for c in ckpt_cmd),
+                    )
+                else:
+                    ckpt_outdir.mkdir(parents=True, exist_ok=True)
+                    ckpt_log = (
+                        batch_dir / "checkpoints" / checkpoint_label /
+                        "checkpoint_build.log"
+                    )
+                    ckpt_rc = run_and_tee(ckpt_cmd, ckpt_log)
+                    if ckpt_rc != 0:
+                        append_row(
+                            experiments_csv,
+                            {
+                                "exp_id": exp.exp_id,
+                                "source": exp.source,
+                                "request_size": key.request_size,
+                                "response_size": key.response_size,
+                                "clients": key.clients,
+                                "requests_per_client": key.requests_per_client,
+                                "checkpoint_dir": str(ckpt_outdir),
+                                "num_cpus": required_cpus,
+                                "output_dir": str(run_outdir),
+                                "start_time": "",
+                                "end_time": "",
+                                "elapsed_sec": "0.000",
+                                "gem5_rc": ckpt_rc,
+                                "test_cmd_exit": "",
+                                "tick_rows": 0,
+                                "expected_rows": key.clients * key.requests_per_client,
+                                "status": "checkpoint_failed",
+                            },
+                            exp_fields,
+                        )
+                        print(
+                            f"[done] {exp.exp_id} status=checkpoint_failed "
+                            f"gem5_rc={ckpt_rc} test_rc=None ticks=0/"
+                            f"{key.clients * key.requests_per_client} elapsed=0.0s"
+                        )
+                        continue
+                    resolved = resolve_checkpoint_dir(ckpt_outdir)
+                    if resolved is None:
+                        append_row(
+                            experiments_csv,
+                            {
+                                "exp_id": exp.exp_id,
+                                "source": exp.source,
+                                "request_size": key.request_size,
+                                "response_size": key.response_size,
+                                "clients": key.clients,
+                                "requests_per_client": key.requests_per_client,
+                                "checkpoint_dir": str(ckpt_outdir),
+                                "num_cpus": required_cpus,
+                                "output_dir": str(run_outdir),
+                                "start_time": "",
+                                "end_time": "",
+                                "elapsed_sec": "0.000",
+                                "gem5_rc": 2,
+                                "test_cmd_exit": "",
+                                "tick_rows": 0,
+                                "expected_rows": key.clients * key.requests_per_client,
+                                "status": "checkpoint_missing",
+                            },
+                            exp_fields,
+                        )
+                        print(
+                            f"[done] {exp.exp_id} status=checkpoint_missing "
+                            f"gem5_rc=2 test_rc=None ticks=0/"
+                            f"{key.clients * key.requests_per_client} elapsed=0.0s"
+                        )
+                        continue
+                    checkpoint_dir = resolved
+
+                checkpoint_cache[key.clients] = checkpoint_dir
 
         server_args = f"--silent --response-size {key.response_size}"
         test_cmd = (
@@ -736,7 +811,7 @@ def main() -> int:
                     "response_size": key.response_size,
                     "clients": key.clients,
                     "requests_per_client": key.requests_per_client,
-                    "client_id": row["client_id"],
+                    "node_id": row["node_id"],
                     "req_index": row["req_index"],
                     "start_tick": row["start_tick"],
                     "end_tick": row["end_tick"],

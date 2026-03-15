@@ -1,9 +1,8 @@
 /*
- * CXL RPC Global Memory Allocator
+ * CXL RPC fixed shared-memory layout definitions.
  *
- * Manages the CXL memory space and allocates per-connection regions
- * (doorbell, metadata queue, request data, response data, flag).
- * Thread-safe: protected by internal pthread mutex.
+ * The current public RPC flow uses caller-provided fixed address ranges for
+ * doorbell, metadata queue, request data, response data, and flag regions.
  */
 
 #ifndef CXL_ALLOC_H
@@ -26,8 +25,9 @@ extern "C" {
 #define CXL_DEFAULT_REQUEST_DATA_SIZE   (10 * 1024 * 1024)/* 10MB */
 #define CXL_DEFAULT_RESPONSE_DATA_SIZE  (10 * 1024 * 1024)/* 10MB */
 /*
- * Flag publishes a 16-bit request_id, but the storage region is still a full
- * 64B cacheline because the CopyEngine writes the whole line atomically.
+ * Flag publishes a 15-bit logical rpc_id carried in a uint16_t slot, but the
+ * storage region is still a full 64B cacheline because the CopyEngine writes
+ * the whole line atomically.
  */
 #define CXL_DEFAULT_FLAG_SIZE           64
 
@@ -43,29 +43,6 @@ extern "C" {
 #define CXL_CONN_OFF_FLAG \
     (CXL_CONN_OFF_RESPONSE_DATA + CXL_DEFAULT_RESPONSE_DATA_SIZE)
 
-/* ================================================================
- * Tier 1: Global Allocator
- * ================================================================ */
-
-typedef struct cxl_global_allocator cxl_global_alloc_t;
-
-/**
- * Initialize global allocator for CXL memory space.
- *
- * @param base_addr  Logical/protocol base address of CXL memory
- *                   (current board default: 0x100000000)
- * @param total_size Total size of CXL memory region
- * @return           Allocator handle, or NULL on failure
- */
-cxl_global_alloc_t *cxl_global_alloc_init(uint64_t base_addr,
-                                           size_t total_size);
-
-/**
- * Destroy global allocator and free all internal state.
- */
-void cxl_global_alloc_destroy(cxl_global_alloc_t *alloc);
-
-/* Convenience: allocate all regions for one connection */
 typedef struct {
     uint64_t doorbell_addr;
     uint64_t metadata_queue_addr;
@@ -75,32 +52,13 @@ typedef struct {
     size_t   metadata_queue_size;
     size_t   request_data_size;
     size_t   response_data_size;
-    /* Underlying allocation block for dynamic layout. */
-    uint64_t alloc_base_addr;
-    size_t   alloc_size;
+    /*
+     * Source node identity published into request doorbells.
+     * Server-owner connections that only poll the shared metadata queue can
+     * leave this as 0.
+     */
+    uint16_t node_id;
 } cxl_connection_addrs_t;
-
-/**
- * Allocate all regions for a connection in one call.
- *
- * @param alloc     Global allocator
- * @param mq_size   Metadata queue size (0 for default 16KB)
- * @param req_size  Request data size (0 for default 10MB)
- * @param resp_size Response data size (0 for default 10MB)
- * @param out       Output: allocated addresses
- * @return          0 on success, -1 on failure (all freed on error)
- */
-int cxl_global_alloc_connection(cxl_global_alloc_t *alloc,
-                                 size_t mq_size,
-                                 size_t req_size,
-                                 size_t resp_size,
-                                 cxl_connection_addrs_t *out);
-
-/**
- * Free all regions for a connection.
- */
-void cxl_global_free_connection(cxl_global_alloc_t *alloc,
-                                 const cxl_connection_addrs_t *addrs);
 
 #ifdef __cplusplus
 }

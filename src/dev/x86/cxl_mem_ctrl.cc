@@ -13,15 +13,15 @@ namespace
 {
 
 bool
-isConsumedControlDoorbellCandidate(PacketPtr pkt)
+isConsumedHeadUpdateCandidate(PacketPtr pkt, const DoorbellWriteProbe& probe)
 {
-    if (!pkt || !pkt->isWrite() || !pkt->hasData() || pkt->getSize() < 16) {
+    if (!pkt || !pkt->isWrite() || !pkt->hasData() ||
+        !probe.matched_connection || !probe.covers_doorbell ||
+        !probe.parsed_entry) {
         return false;
     }
 
-    DoorbellEntry entry;
-    entry.parseFromBuffer(pkt->getConstPtr<uint8_t>());
-    return entry.method == METHOD_HEAD_UPDATE;
+    return probe.entry.method == METHOD_HEAD_UPDATE;
 }
 
 } // anonymous namespace
@@ -239,27 +239,32 @@ CXLMemCtrl::CXLResponsePort::recvTimingReq(PacketPtr pkt)
     DPRINTF(CXLMemCtrl, "Response queue size: %d outresp: %d\n",
             transmitList.size(), outstandingResponses);
 
-    const bool probeDoorbell =
-        pkt->isWrite() && ctrl.rpcEngine && ctrl.rpcEngine->mustProbeWrite(pkt);
-    const bool controlBypassCandidate =
-        probeDoorbell && isConsumedControlDoorbellCandidate(pkt);
+    DoorbellWriteProbe doorbellProbe;
+    const bool probeDoorbell = pkt->isWrite() && ctrl.rpcEngine;
+    if (probeDoorbell) {
+        doorbellProbe = ctrl.rpcEngine->probeDoorbellWrite(pkt);
+    }
+    const bool headUpdateBypassCandidate =
+        doorbellProbe.should_probe &&
+        isConsumedHeadUpdateCandidate(pkt, doorbellProbe);
 
-    auto consumeControlDoorbell = [&](const char *reason) -> std::optional<bool> {
-        if (!controlBypassCandidate) {
+    auto consumeHeadUpdateDoorbell =
+        [&](const char *reason) -> std::optional<bool> {
+        if (!headUpdateBypassCandidate) {
             return std::nullopt;
         }
 
-        auto dbResult = ctrl.rpcEngine->handleDoorbellWrite(pkt);
+        auto dbResult = ctrl.rpcEngine->handleDoorbellWrite(pkt, &doorbellProbe);
         if (dbResult != DoorbellHandleResult::Consumed) {
             DPRINTF(CXLMemCtrl,
-                    "Stalled %s path saw non-consumed control candidate at %#x "
+                    "Stalled %s path saw non-consumed HEAD_UPDATE candidate at %#x "
                     "(result=%d)\n",
                     reason, pkt->getAddr(), static_cast<int>(dbResult));
             return false;
         }
 
         DPRINTF(CXLMemCtrl,
-                "Processing control doorbell while stalled (%s) at %#x\n",
+                "Processing HEAD_UPDATE doorbell while stalled (%s) at %#x\n",
                 reason, pkt->getAddr());
 
         Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
@@ -278,7 +283,7 @@ CXLMemCtrl::CXLResponsePort::recvTimingReq(PacketPtr pkt)
     };
 
     if (retryReq) {
-        if (auto handled = consumeControlDoorbell("retry-pending")) {
+        if (auto handled = consumeHeadUpdateDoorbell("retry-pending")) {
             return *handled;
         }
         return false;
@@ -286,7 +291,7 @@ CXLMemCtrl::CXLResponsePort::recvTimingReq(PacketPtr pkt)
 
     // Admission first: only admitted packets pay doorbell handling costs.
     if (memReqPort.reqQueueFull()) {
-        if (auto handled = consumeControlDoorbell("request-queue-full")) {
+        if (auto handled = consumeHeadUpdateDoorbell("request-queue-full")) {
             return *handled;
         }
         DPRINTF(CXLMemCtrl, "Request queue full\n");
@@ -297,7 +302,7 @@ CXLMemCtrl::CXLResponsePort::recvTimingReq(PacketPtr pkt)
     bool expects_response = pkt->needsResponse();
     if (expects_response) {
         if (respQueueFull()) {
-            if (auto handled = consumeControlDoorbell("response-queue-full")) {
+            if (auto handled = consumeHeadUpdateDoorbell("response-queue-full")) {
                 return *handled;
             }
             DPRINTF(CXLMemCtrl, "Response queue full\n");
@@ -314,8 +319,8 @@ CXLMemCtrl::CXLResponsePort::recvTimingReq(PacketPtr pkt)
     // Only pay doorbell handling costs after admission succeeds.
     DoorbellHandleResult doorbellResult = DoorbellHandleResult::NotHandled;
     bool remappedDoorbell = false;
-    if (probeDoorbell) {
-        auto dbResult = ctrl.rpcEngine->handleDoorbellWrite(pkt);
+    if (doorbellProbe.should_probe) {
+        auto dbResult = ctrl.rpcEngine->handleDoorbellWrite(pkt, &doorbellProbe);
         doorbellResult = dbResult;
         if (dbResult != DoorbellHandleResult::NotHandled) {
             DPRINTF(CXLRPCEngine, "Intercepting doorbell write at %#x\n",
@@ -353,7 +358,7 @@ CXLMemCtrl::CXLResponsePort::recvTimingReq(PacketPtr pkt)
 
     memReqPort.schedTimingReq(pkt, ctrl.clockEdge(protoProcLat) + receive_delay);
     if (remappedDoorbell && ctrl.rpcEngine) {
-        ctrl.rpcEngine->commitRemappedDoorbell(pkt);
+        ctrl.rpcEngine->accountRemappedDoorbellForward();
     }
 
     return !retryReq;
@@ -520,11 +525,14 @@ CXLMemCtrl::CXLResponsePort::recvAtomic(PacketPtr pkt)
 
     // Check if this is a doorbell write for RPC (same as timing path).
     DoorbellHandleResult atomicDoorbellResult = DoorbellHandleResult::NotHandled;
+    DoorbellWriteProbe doorbellProbe;
     const bool probeDoorbell =
-        pkt->isWrite() && ctrl.rpcEngine &&
-        ctrl.rpcEngine->mustProbeWrite(pkt);
+        pkt->isWrite() && ctrl.rpcEngine;
     if (probeDoorbell) {
-        auto dbResult = ctrl.rpcEngine->handleDoorbellWrite(pkt);
+        doorbellProbe = ctrl.rpcEngine->probeDoorbellWrite(pkt);
+    }
+    if (doorbellProbe.should_probe) {
+        auto dbResult = ctrl.rpcEngine->handleDoorbellWrite(pkt, &doorbellProbe);
         atomicDoorbellResult = dbResult;
         if (dbResult != DoorbellHandleResult::NotHandled) {
             DPRINTF(CXLRPCEngine, "Intercepting doorbell write (atomic) at %#x\n",
@@ -549,7 +557,7 @@ CXLMemCtrl::CXLResponsePort::recvAtomic(PacketPtr pkt)
     Tick access_delay = memReqPort.sendAtomic(pkt);
 
     if (atomicDoorbellResult == DoorbellHandleResult::Remapped && ctrl.rpcEngine) {
-        ctrl.rpcEngine->commitRemappedDoorbell(pkt);
+        ctrl.rpcEngine->accountRemappedDoorbellForward();
     }
 
     DPRINTF(CXLMemCtrl, "access_delay=%ld, proto_proc_lat=%ld, total=%ld\n",
@@ -563,11 +571,14 @@ CXLMemCtrl::CXLResponsePort::recvAtomicBackdoor(
 {
     // Check if this is a doorbell write for RPC (same as recvAtomic path).
     DoorbellHandleResult backdoorDoorbellResult = DoorbellHandleResult::NotHandled;
+    DoorbellWriteProbe doorbellProbe;
     const bool probeDoorbell =
-        pkt->isWrite() && ctrl.rpcEngine &&
-        ctrl.rpcEngine->mustProbeWrite(pkt);
+        pkt->isWrite() && ctrl.rpcEngine;
     if (probeDoorbell) {
-        auto dbResult = ctrl.rpcEngine->handleDoorbellWrite(pkt);
+        doorbellProbe = ctrl.rpcEngine->probeDoorbellWrite(pkt);
+    }
+    if (doorbellProbe.should_probe) {
+        auto dbResult = ctrl.rpcEngine->handleDoorbellWrite(pkt, &doorbellProbe);
         backdoorDoorbellResult = dbResult;
         if (dbResult != DoorbellHandleResult::NotHandled) {
             DPRINTF(CXLRPCEngine,
@@ -595,7 +606,7 @@ CXLMemCtrl::CXLResponsePort::recvAtomicBackdoor(
 
     if (backdoorDoorbellResult == DoorbellHandleResult::Remapped &&
         ctrl.rpcEngine) {
-        ctrl.rpcEngine->commitRemappedDoorbell(pkt);
+        ctrl.rpcEngine->accountRemappedDoorbellForward();
     }
 
     return delay * ctrl.clockPeriod() + access_delay;

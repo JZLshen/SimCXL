@@ -35,6 +35,7 @@ requires(isa_required=ISA.X86)
 repo_root = Path(__file__).resolve().parents[3]
 default_kernel = repo_root / "files" / "vmlinux"
 default_disk = repo_root / "files" / "parsec.img"
+MAX_COPY_ENGINES = 29
 
 parser = argparse.ArgumentParser(description="CXL RPC test parameters.")
 parser.add_argument(
@@ -238,6 +239,11 @@ requested_rpc_clients = (
     if args.rpc_client_count > 0
     else _infer_rpc_num_clients(args.test_cmd)
 )
+if requested_rpc_clients > MAX_COPY_ENGINES:
+    parser.error(
+        f"current X86Board supports at most {MAX_COPY_ENGINES} CopyEngines "
+        f"on PCI bus 0; requested {requested_rpc_clients} client(s)"
+    )
 
 if checkpoint_topology is not None:
     num_copy_engines, copy_engine_channels = checkpoint_topology

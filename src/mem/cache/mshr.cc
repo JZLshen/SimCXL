@@ -476,6 +476,7 @@ MSHR::handleSnoop(PacketPtr pkt, Counter _order)
     // matching the conditions checked in Cache::handleSnoop
     const bool will_respond = isPendingModified() && pkt->needsResponse() &&
         !pkt->isClean();
+    const bool defer_clean = isPendingModified() && pkt->isClean();
     if (isPendingModified() || pkt->isInvalidate()) {
         // We need to save and replay the packet in two cases:
         // 1. We're awaiting a writable copy (Modified or Exclusive),
@@ -514,7 +515,7 @@ MSHR::handleSnoop(PacketPtr pkt, Counter _order)
             // in the case of an uncacheable request there is no need
             // to set the responderHadWritable flag, but since the
             // recipient does not care there is no harm in doing so
-        } else if (isPendingModified() && pkt->isClean()) {
+        } else if (defer_clean) {
             // this cache doesn't respond to the clean request, a
             // destination xbar will respond to this request, but to
             // do so it needs to know if it should wait for the
@@ -541,7 +542,12 @@ MSHR::handleSnoop(PacketPtr pkt, Counter _order)
         pkt->setHasSharers();
     }
 
-    return will_respond;
+    // A clean request that overlaps an in-service modified transaction is
+    // already captured in the deferred snoop target list above. Let the
+    // replayed FromSnoop packet handle the regular cache snoop work; otherwise
+    // the original clean packet may fall through to Cache::handleSnoop() and
+    // attempt to set SATISFIED a second time.
+    return will_respond || defer_clean;
 }
 
 MSHR::TargetList

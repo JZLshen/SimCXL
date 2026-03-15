@@ -17,41 +17,78 @@ library interface.
 
 The client response path uses exactly one model:
 
-1. The client keeps a local pending `req_id` set or list.
+1. The client keeps a local pending `rpc_id` set or list.
 2. The client polls only the completion flag.
-3. If the flag `req_id` is still pending, the client drains `resp_data` in
+3. If the flag `rpc_id` is still pending, the client drains `resp_data` in
    producer order.
-4. Draining stops when the consumed response `req_id` matches the flag snapshot.
+4. Draining stops when the consumed response `rpc_id` matches the flag snapshot.
 
 A response is not considered complete until its payload has been copied into
 client-owned local memory.
 
 ## Public API Summary
 
-### Request ID layout
+### Connection setup API
 
-`request_id` is always 16 bits:
+The public `libcxlrpc` flow uses caller-provided fixed shared-memory ranges.
+There is no public dynamic allocator path anymore.
 
-```text
-request_id = (client_tag << (16 - client_tag_bits)) | seq_low_bits
+Use one of these constructors:
+
+```c
+cxl_connection_t *cxl_connection_create_fixed_owner(
+    cxl_context_t *ctx,
+    const cxl_connection_addrs_t *addrs,
+    uint32_t mq_entries);
+
+cxl_connection_t *cxl_connection_create_fixed_attach(
+    cxl_context_t *ctx,
+    const cxl_connection_addrs_t *addrs,
+    uint32_t mq_entries);
+
+cxl_connection_t *cxl_connection_create_fixed(
+    cxl_context_t *ctx,
+    const cxl_connection_addrs_t *addrs,
+    uint32_t mq_entries);
 ```
 
-- `client_tag` occupies the high bits
-- `seq_low_bits` is allocated per connection
-- a `request_id` stays reserved until the response payload has been consumed
-  into local memory
+Notes:
 
-For a single-client deployment, use `client_tag = 0` and
-`client_tag_bits = 0`.
+- `fixed_owner` is the destructive bootstrap path for the owner of a fixed
+  region. It may clear shared metadata / flag state and reset controller-side
+  queue state.
+- `fixed_attach` is the non-destructive attach path for peers joining an
+  already-defined fixed layout.
+- `fixed` is a convenience alias of `fixed_owner`.
+
+### Doorbell / RPC ID layout
+
+The metadata/doorbell entry is always 16 bytes:
+
+```text
+bytes 0..7:
+  bit[0]      method   (0=request, 1=head_update)
+  bit[1]      inline
+  bit[2]      phase
+  bits[34:3]  length   (32 bits)
+  bits[48:35] node_id  (14 bits)
+  bits[63:49] rpc_id   (15 bits, 0 reserved as invalid)
+
+bytes 8..15:
+  inline      request payload bytes
+  non-inline  request_data logical address
+```
+
+- `rpc_id` is a connection-local logical request ID in `[1, 32767]`
+- `rpc_id` stays reserved until the response payload has been consumed into
+  local memory
+- `node_id` identifies which client/node the server should route the response to
+- `service_id`, `method_id`, and `client_tag` are no longer part of the public
+  protocol
 
 ### Client-side API
 
 ```c
-int cxl_connection_set_client_tag(
-    cxl_connection_t *conn,
-    uint16_t client_tag,
-    uint8_t client_tag_bits);
-
 int cxl_connection_bind_copyengine_lane(
     cxl_connection_t *conn,
     size_t engine_index,
@@ -59,28 +96,27 @@ int cxl_connection_bind_copyengine_lane(
 
 int cxl_send_request(
     cxl_connection_t *conn,
-    uint16_t service_id,
-    uint16_t method_id,
     const void *data,
     size_t len);
 
-int cxl_peek_latest_completed_request_id(
+int cxl_peek_latest_completed_rpc_id(
     cxl_connection_t *conn,
-    uint16_t *out_request_id);
+    uint16_t *out_rpc_id);
 
 int cxl_consume_next_response(
     cxl_connection_t *conn,
     void *out_data,
     size_t *out_len,
-    uint16_t *out_request_id);
+    uint16_t *out_rpc_id);
 ```
 
 Notes:
 
-- `cxl_peek_latest_completed_request_id()` reads only the flag.
+- `cxl_send_request()` returns the allocated `rpc_id` on success.
+- `cxl_peek_latest_completed_rpc_id()` reads only the flag.
 - `cxl_consume_next_response()` consumes exactly one response in producer order.
 - `cxl_consume_next_response()` copies the payload into caller-owned local
-  memory before reclaiming the `request_id`.
+  memory before reclaiming the `rpc_id`.
 - If `*out_len` is too small, `cxl_consume_next_response()` returns `-1`,
   writes back the exact required size, and does not consume the entry.
 - Server-side response connections must bind one dedicated CopyEngine lane
@@ -91,15 +127,14 @@ Notes:
 ```c
 int cxl_poll_request(
     cxl_connection_t *conn,
-    uint16_t *service_id,
-    uint16_t *method_id,
-    uint16_t *request_id,
+    uint16_t *node_id,
+    uint16_t *rpc_id,
     const void **out_data_view,
     size_t *out_len);
 
 int cxl_send_response(
     cxl_connection_t *conn,
-    uint16_t request_id,
+    uint16_t rpc_id,
     const void *data,
     size_t len);
 
@@ -116,6 +151,7 @@ int cxl_connection_set_peer_response_flag_addr(
 Notes:
 
 - `cxl_poll_request()` is non-blocking.
+- `cxl_poll_request()` returns the source `node_id` and request `rpc_id`.
 - With the current backend, `cxl_send_response()` supports payloads up to
   `4088` bytes.
 - Server responses are sent through `CopyEngine` after one fixed lane is
@@ -132,13 +168,16 @@ Implications:
   clients
 - total available lanes must be at least the number of active response
   connections
-- the public path uses `1 client : 1 engine : 1 channel`
+- the public path uses `1 node : 1 engine : 1 channel`
 - the default runtime topology keeps `channel_index = 0` and derives the
   engine count automatically from the client count
+- the current public X86 board keeps all CopyEngines on PCI bus 0, function 0,
+  and therefore supports at most `29` dedicated engines / active clients in
+  this default topology
 
 If you want the strictest isolation model, run with one channel per engine and
 one engine per active client. In that default public setup, bind
-`(engine_index = client_id, channel_index = 0)`.
+`(engine_index = node_id, channel_index = 0)`.
 
 ## Local Build
 
@@ -234,6 +273,8 @@ The test config derives the CopyEngine topology from `rpc_client_count`.
 If `--rpc_client_count` is not passed explicitly, it infers the client count
 from `CXL_RPC_CLIENT_COUNT=...`, `--num-clients`, or the standard multi-client
 launcher name inside `--test_cmd`.
+The current public X86 board rejects requests above `29` clients because that
+topology maps to one dedicated single-function CopyEngine per active client.
 
 ### 5. Read results
 

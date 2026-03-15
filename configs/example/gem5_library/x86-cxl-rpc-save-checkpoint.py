@@ -47,6 +47,7 @@ requires(isa_required=ISA.X86)
 repo_root = Path(__file__).resolve().parents[3]
 default_kernel = repo_root / "files" / "vmlinux"
 default_disk = repo_root / "files" / "parsec.img"
+MAX_COPY_ENGINES = 29
 
 parser = argparse.ArgumentParser(description='Save CXL RPC boot checkpoint.')
 parser.add_argument('--num_cpus', type=int, default=1, help='Number of CPUs')
@@ -98,6 +99,11 @@ if not os.access('/dev/kvm', os.R_OK | os.W_OK):
 num_copy_engines = (
     args.rpc_client_count if args.rpc_client_count > 0 else max(1, args.num_cpus - 1)
 )
+if num_copy_engines > MAX_COPY_ENGINES:
+    parser.error(
+        f'current X86Board supports at most {MAX_COPY_ENGINES} CopyEngines '
+        f'on PCI bus 0; requested {num_copy_engines}'
+    )
 copy_engine_channels = 1
 
 # --- Board/memory/cache config MUST match x86-cxl-rpc-test.py exactly ---
