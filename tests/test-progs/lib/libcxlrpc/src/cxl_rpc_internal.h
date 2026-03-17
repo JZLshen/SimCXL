@@ -45,6 +45,9 @@ struct cxl_connection {
     uint32_t mq_entries;
     uint32_t mq_head;
     uint32_t mq_phase;
+    uint32_t mq_prefetch_start_line;
+    uint32_t mq_prefetch_nr_lines;
+    uint8_t mq_prefetch_window_valid;
 
     uint16_t rpc_id_seq_mask;
     uint16_t rpc_id_next;

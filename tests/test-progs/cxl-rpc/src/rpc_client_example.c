@@ -69,7 +69,7 @@
 #define MIN_RESPONSE_SIZE 8
 #define MAX_REQUEST_SIZE (256u * 1024u)
 #define MAX_RESPONSE_SIZE (4096u - 8u)
-#define FIXED_SLIDING_WINDOW 4
+#define FIXED_SLIDING_WINDOW 16
 
 typedef struct __attribute__((packed)) {
     uint32_t lhs;

@@ -117,9 +117,10 @@ cxl_invalidate_load_barrier(void)
 {
     /*
      * Read-side invalidate paths must not let the subsequent load observe a
-     * stale cacheline before the invalidate has completed.
+     * stale cacheline before the invalidate has completed. These call sites
+     * only need a load barrier after clflushopt, not a full read/write fence.
      */
-    __asm__ __volatile__("mfence" ::: "memory");
+    __asm__ __volatile__("lfence" ::: "memory");
 }
 
 static void
@@ -1393,34 +1394,75 @@ int cxl_poll_request(cxl_connection_t *conn,
     /* Check phase bit: new entry has phase matching our expected phase */
     if (entry_phase != expected_phase) {
         /*
-         * Naive prefetch mode: invalidate current metadata cacheline after
-         * an empty poll. Optional "invalidate prefetched" additionally
-         * invalidates the previously prefetched lookahead window.
+         * Always invalidate the probed head line after an empty poll because
+         * this poll just demand-loaded it into CPU caches. For the prefetched
+         * lookahead window, only invalidate once per prefetch arm; repeated
+         * empty polls on the same head should not keep re-flushing the same
+         * stale tail window unless a later successful poll has prefetched it
+         * again.
          */
+        uint32_t invalidate_start_line = head_line_idx;
+        uint32_t invalidate_nr_lines = 1;
+
         if (mq_invalidate_prefetched &&
-            mq_prefetch_lines > 0 &&
-            mq_total_lines > 0) {
-            cxl_mq_invalidate_lines(conn->metadata_queue,
-                                    head_line_idx,
-                                    mq_prefetch_lines + 1,
-                                    mq_total_lines);
-        } else {
-            cxl_invalidate_cacheline(entry_line);
-            __asm__ __volatile__("sfence" ::: "memory");
+            conn->mq_prefetch_window_valid &&
+            conn->mq_prefetch_nr_lines > 0 &&
+            mq_total_lines > 1) {
+            uint32_t prefetched_start = conn->mq_prefetch_start_line;
+            uint32_t prefetched_nr = conn->mq_prefetch_nr_lines;
+
+            if (prefetched_nr >= mq_total_lines)
+                prefetched_nr = mq_total_lines - 1;
+
+            if (prefetched_start == head_line_idx) {
+                invalidate_nr_lines += prefetched_nr - 1u;
+            } else if (prefetched_start ==
+                       ((head_line_idx + 1u) % mq_total_lines)) {
+                invalidate_nr_lines += prefetched_nr;
+            } else {
+                cxl_invalidate_cacheline(entry_line);
+                __asm__ __volatile__("sfence" ::: "memory");
+                cxl_mq_invalidate_lines(conn->metadata_queue,
+                                        prefetched_start,
+                                        prefetched_nr,
+                                        mq_total_lines);
+                conn->mq_prefetch_window_valid = 0;
+                conn->mq_prefetch_nr_lines = 0;
+                ret = 0;
+                goto out;
+            }
+
+            conn->mq_prefetch_window_valid = 0;
+            conn->mq_prefetch_nr_lines = 0;
         }
+
+        cxl_mq_invalidate_lines(conn->metadata_queue,
+                                invalidate_start_line,
+                                invalidate_nr_lines,
+                                mq_total_lines);
         ret = 0;
         goto out;
     }
 
     meta_hi = *(volatile uint64_t *)(entry + 8);
 
-    if (mq_prefetch_lines > 0 && mq_total_lines > 0) {
-        for (uint32_t i = 1; i <= mq_prefetch_lines; i++) {
+    if (mq_prefetch_lines > 0 && mq_total_lines > 1) {
+        uint32_t prefetched_nr_lines = mq_prefetch_lines;
+        if (prefetched_nr_lines >= mq_total_lines)
+            prefetched_nr_lines = mq_total_lines - 1u;
+
+        for (uint32_t i = 1; i <= prefetched_nr_lines; i++) {
             uint32_t next_line = (head_line_idx + i) % mq_total_lines;
             __builtin_prefetch((const void *)(conn->metadata_queue +
                                               ((size_t)next_line * 64u)),
                                0, 3);
         }
+        conn->mq_prefetch_start_line = (head_line_idx + 1u) % mq_total_lines;
+        conn->mq_prefetch_nr_lines = prefetched_nr_lines;
+        conn->mq_prefetch_window_valid = (prefetched_nr_lines > 0) ? 1u : 0u;
+    } else {
+        conn->mq_prefetch_nr_lines = 0;
+        conn->mq_prefetch_window_valid = 0;
     }
 
     /* Parse entry fields */

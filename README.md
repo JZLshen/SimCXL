@@ -121,6 +121,14 @@ CXL Device is recognized as a CPU-less NUMA node in the system. We provide two w
 
    The CXL device driver provides an mmap system call to allocate CXL memory.
 
+## CXL RPC (CPU-to-CPU)
+
+The CXL RPC documentation is maintained separately so the top-level SimCXL
+README stays focused on the simulator itself.
+
+- RPC workflow, public API, protocol model, guest image injection, checkpoint
+  flow, and test commands: `tests/test-progs/cxl-rpc/README.md`
+
 ## CXL Type 1/2 Accelerator
 
 CXL accelerators require customization of device functionality based on specific user requirements. We provide a simple Load Store Unit (LSU) as an example. The LSU includes a device cache; it accesses host memory at cacheline granularity via the CXL.cache protocol and caches the data locally. For a concrete example, please refer to `configs/example/gem5_library/x86-cxl-type1-with-ruby.py`.

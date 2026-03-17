@@ -325,6 +325,37 @@ cxl_copyengine_channel_release_buffers(cxl_ce_channel_state_t *chan)
 }
 
 static void
+cxl_copyengine_channel_prime_slot_templates(cxl_ce_channel_state_t *chan)
+{
+    if (!chan || !chan->resp_src_slot_phys || !chan->flag_src_slot_phys ||
+        !chan->desc_phys || !chan->desc_pool) {
+        return;
+    }
+
+    for (size_t slot = 0; slot < chan->slots; slot++) {
+        const size_t desc_base_idx = slot * CXL_CE_DESC_PER_REQ;
+        cxl_ce_desc_t *resp_desc0 = chan->desc_pool + desc_base_idx;
+        cxl_ce_desc_t *resp_desc1 = resp_desc0 + 1;
+        cxl_ce_desc_t *flag_desc = resp_desc0 + 2;
+        const uint64_t src_resp_phys = chan->resp_src_slot_phys[slot];
+        const uint64_t src_flag_phys = chan->flag_src_slot_phys[slot];
+        const uint64_t flag_desc_phys = chan->desc_phys[desc_base_idx + 2];
+
+        resp_desc0->command = 0;
+        resp_desc0->src = src_resp_phys;
+        resp_desc0->next = flag_desc_phys;
+
+        resp_desc1->command = 0;
+        resp_desc1->next = flag_desc_phys;
+
+        flag_desc->len = (uint32_t)CXL_CE_FLAG_SLOT_BYTES;
+        flag_desc->command = 0;
+        flag_desc->src = src_flag_phys;
+        flag_desc->next = 0;
+    }
+}
+
+static void
 cxl_copyengine_sync_conn_state(cxl_connection_t *conn)
 {
     cxl_ce_channel_state_t *chan = NULL;
@@ -834,62 +865,6 @@ cxl_copyengine_translate_peer_response_logical(cxl_connection_t *conn,
     return 0;
 }
 
-static int
-cxl_copyengine_build_response_segments(cxl_connection_t *conn,
-                                       size_t dst_resp_offset,
-                                       size_t resp_transfer_size,
-                                       cxl_ce_dma_segment_t *segments,
-                                       size_t *segment_count_out)
-{
-    if (!conn || !segments || !segment_count_out || resp_transfer_size == 0)
-        return -1;
-    if (!conn->ce_peer_resp_page_phys || conn->ce_peer_resp_page_count == 0 ||
-        conn->ce_peer_resp_page_size == 0) {
-        return -1;
-    }
-    if (dst_resp_offset > conn->peer_response_data_size ||
-        resp_transfer_size > conn->peer_response_data_size - dst_resp_offset) {
-        return -1;
-    }
-
-    const uint64_t logical_base = conn->peer_response_data_addr + dst_resp_offset;
-    const uint64_t page_size = (uint64_t)conn->ce_peer_resp_page_size;
-    uint64_t logical_addr = logical_base;
-    size_t remaining = resp_transfer_size;
-    size_t segment_count = 0;
-    size_t src_offset = 0;
-
-    while (remaining > 0) {
-        if (segment_count >= CXL_CE_MAX_RESP_SEGMENTS)
-            return -1;
-
-        const uint64_t page_off =
-            (logical_addr - conn->ce_peer_resp_logical_page_base) % page_size;
-        const size_t page_remaining = (size_t)(page_size - page_off);
-        const size_t segment_len =
-            (remaining < page_remaining) ? remaining : page_remaining;
-        uint64_t dst_phys = 0;
-
-        if (cxl_copyengine_translate_peer_response_logical(conn,
-                                                           logical_addr,
-                                                           &dst_phys) != 0) {
-            return -1;
-        }
-
-        segments[segment_count].dst_phys = dst_phys;
-        segments[segment_count].len = (uint32_t)segment_len;
-        segments[segment_count].src_offset = (uint32_t)src_offset;
-        segment_count++;
-
-        logical_addr += (uint64_t)segment_len;
-        src_offset += segment_len;
-        remaining -= segment_len;
-    }
-
-    *segment_count_out = segment_count;
-    return 0;
-}
-
 int
 cxl_copyengine_update_peer_response_mapping(cxl_connection_t *conn)
 {
@@ -1036,6 +1011,7 @@ cxl_copyengine_channel_configure_slots(cxl_ce_channel_state_t *chan,
     }
 
     chan->slots = slots;
+    cxl_copyengine_channel_prime_slot_templates(chan);
     chan->next_slot = 0;
     chan->chain_started = 0;
     chan->last_desc = NULL;
@@ -1073,6 +1049,9 @@ cxl_connection_init_runtime_defaults(cxl_connection_t *conn)
     conn->rpc_id_inflight_count = 0;
     conn->rpc_id_capacity = (uint32_t)CXL_RPC_ID_MASK;
     conn->rpc_id_inflight_bitmap = NULL;
+    conn->mq_prefetch_start_line = 0;
+    conn->mq_prefetch_nr_lines = 0;
+    conn->mq_prefetch_window_valid = 0;
     conn->req_entry_offsets = NULL;
     conn->req_entry_sizes = NULL;
     conn->req_entry_next = NULL;
@@ -1544,28 +1523,35 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
 {
     cxl_ce_channel_state_t *chan = NULL;
     volatile uint8_t *bar0 = NULL;
+    const char *submit_mode = "start";
     uint64_t dst_flag_phys = 0;
+    uint64_t dst_resp_phys0 = 0;
+    uint64_t dst_resp_phys1 = 0;
+    uint64_t logical_resp_addr = 0;
     size_t slot = 0;
     size_t desc_base_idx = 0;
     uint8_t *src_resp = NULL;
     uint8_t *src_flag = NULL;
-    cxl_ce_desc_t *descs[CXL_CE_DESC_PER_REQ] = {0};
-    uint64_t desc_phys[CXL_CE_DESC_PER_REQ] = {0};
-    cxl_ce_dma_segment_t resp_segments[CXL_CE_MAX_RESP_SEGMENTS] = {0};
-    size_t resp_segment_count = 0;
-    size_t flag_desc_index = 0;
+    cxl_ce_desc_t *resp_desc0 = NULL;
+    cxl_ce_desc_t *resp_desc1 = NULL;
+    cxl_ce_desc_t *flag_desc = NULL;
+    uint64_t desc_phys0 = 0;
+    uint64_t desc_phys1 = 0;
+    uint64_t flag_desc_phys = 0;
     uint64_t src_resp_phys = 0;
     uint64_t src_flag_phys = 0;
+    size_t first_len = 0;
+    size_t second_len = 0;
+    size_t page_delta = 0;
+    size_t page_index = 0;
+    size_t page_off = 0;
+    size_t page_size = 0;
+    size_t resp_segment_count = 0;
 
     chan = cxl_copyengine_get_assigned_channel(conn);
     if (chan->poisoned)
         return 0;
     bar0 = conn->ce_bar0;
-
-    if (chan->chain_started &&
-        cxl_copyengine_channel_wait_idle(conn, chan) != 0) {
-        return 0;
-    }
 
     if (chan->next_slot >= chan->slots) {
         if (cxl_copyengine_channel_wait_idle(conn, chan) != 0)
@@ -1582,18 +1568,72 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
         return 0;
     }
 
-    if (cxl_copyengine_build_response_segments(
-            conn, dst_resp_offset, resp_transfer_size,
-            resp_segments, &resp_segment_count) != 0) {
+    if (!conn->ce_peer_resp_page_phys || conn->ce_peer_resp_page_count == 0 ||
+        conn->ce_peer_resp_page_size == 0 ||
+        dst_resp_offset > conn->peer_response_data_size ||
+        resp_transfer_size > conn->peer_response_data_size - dst_resp_offset) {
         if (!g_cxl_ce.warned) {
             fprintf(stderr,
-                    "cxl_rpc: ERROR: CopyEngine response segment build failed\n");
+                    "cxl_rpc: ERROR: CopyEngine response segment state invalid\n");
             g_cxl_ce.warned = 1;
         }
         return 0;
     }
 
     dst_flag_phys = conn->ce_peer_flag_phys;
+    page_size = conn->ce_peer_resp_page_size;
+    logical_resp_addr = conn->peer_response_data_addr + dst_resp_offset;
+    if (logical_resp_addr < conn->ce_peer_resp_logical_page_base) {
+        if (!g_cxl_ce.warned) {
+            fprintf(stderr,
+                    "cxl_rpc: ERROR: CopyEngine logical response address below page base\n");
+            g_cxl_ce.warned = 1;
+        }
+        return 0;
+    }
+    page_delta = (size_t)(logical_resp_addr -
+                          conn->ce_peer_resp_logical_page_base);
+    page_index = page_delta / page_size;
+    page_off = page_delta % page_size;
+    if (page_index >= conn->ce_peer_resp_page_count) {
+        if (!g_cxl_ce.warned) {
+            fprintf(stderr,
+                    "cxl_rpc: ERROR: CopyEngine response page index out of range offset=%zu page_index=%zu page_count=%zu\n",
+                    dst_resp_offset, page_index, conn->ce_peer_resp_page_count);
+            g_cxl_ce.warned = 1;
+        }
+        return 0;
+    }
+    first_len = resp_transfer_size;
+    if (page_off + first_len > page_size)
+        first_len = page_size - page_off;
+    second_len = resp_transfer_size - first_len;
+    resp_segment_count = (second_len > 0) ? 2u : 1u;
+    if (cxl_copyengine_translate_peer_response_logical(
+            conn,
+            logical_resp_addr,
+            &dst_resp_phys0) != 0) {
+        if (!g_cxl_ce.warned) {
+            fprintf(stderr,
+                    "cxl_rpc: ERROR: CopyEngine first response translation failed\n");
+            g_cxl_ce.warned = 1;
+        }
+        return 0;
+    }
+    if (second_len > 0) {
+        if (page_index + 1 >= conn->ce_peer_resp_page_count ||
+            cxl_copyengine_translate_peer_response_logical(
+                conn,
+                logical_resp_addr + first_len,
+                &dst_resp_phys1) != 0) {
+            if (!g_cxl_ce.warned) {
+                fprintf(stderr,
+                        "cxl_rpc: ERROR: CopyEngine second response translation failed\n");
+                g_cxl_ce.warned = 1;
+            }
+            return 0;
+        }
+    }
 
     slot = chan->next_slot++;
     src_resp = chan->resp_src_pool + slot * (size_t)CXL_CE_RESP_SLOT_BYTES;
@@ -1601,10 +1641,12 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
     desc_base_idx = slot * CXL_CE_DESC_PER_REQ;
     src_resp_phys = chan->resp_src_slot_phys[slot];
     src_flag_phys = chan->flag_src_slot_phys[slot];
-    for (size_t i = 0; i < CXL_CE_DESC_PER_REQ; i++) {
-        descs[i] = chan->desc_pool + desc_base_idx + i;
-        desc_phys[i] = chan->desc_phys[desc_base_idx + i];
-    }
+    resp_desc0 = chan->desc_pool + desc_base_idx;
+    resp_desc1 = resp_desc0 + 1;
+    flag_desc = resp_desc0 + 2;
+    desc_phys0 = chan->desc_phys[desc_base_idx];
+    desc_phys1 = chan->desc_phys[desc_base_idx + 1];
+    flag_desc_phys = chan->desc_phys[desc_base_idx + 2];
 
     struct __attribute__((packed)) {
         uint32_t payload_len;
@@ -1612,31 +1654,24 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
         uint16_t response_id;
     } hdr = {(uint32_t)len, rpc_id, rpc_id};
 
-    memset(src_resp, 0, resp_transfer_size);
     memcpy(src_resp, &hdr, sizeof(hdr));
     if (len > 0)
         memcpy(src_resp + sizeof(hdr), data, len);
-    memset(src_flag, 0, (size_t)CXL_CE_FLAG_SLOT_BYTES);
     memcpy(src_flag, &rpc_id, CXL_FLAG_PUBLISH_LEN);
 
-    for (size_t i = 0; i < CXL_CE_DESC_PER_REQ; i++)
-        memset(descs[i], 0, sizeof(*descs[i]));
-
-    for (size_t i = 0; i < resp_segment_count; i++) {
-        descs[i]->len = resp_segments[i].len;
-        descs[i]->command = 0;
-        descs[i]->src = src_resp_phys + resp_segments[i].src_offset;
-        descs[i]->dest = resp_segments[i].dst_phys;
-        descs[i]->next = (i + 1 < resp_segment_count) ?
-            desc_phys[i + 1] : desc_phys[resp_segment_count];
+    resp_desc0->len = (uint32_t)first_len;
+    resp_desc0->dest = dst_resp_phys0;
+    resp_desc0->next = (second_len > 0) ? desc_phys1 : flag_desc_phys;
+    if (second_len > 0) {
+        resp_desc1->len = (uint32_t)second_len;
+        resp_desc1->src = src_resp_phys + first_len;
+        resp_desc1->dest = dst_resp_phys1;
+        resp_desc1->next = flag_desc_phys;
     }
 
-    flag_desc_index = resp_segment_count;
-    descs[flag_desc_index]->len = (uint32_t)CXL_CE_FLAG_SLOT_BYTES;
-    descs[flag_desc_index]->command = 0;
-    descs[flag_desc_index]->src = src_flag_phys;
-    descs[flag_desc_index]->dest = dst_flag_phys;
-    descs[flag_desc_index]->next = 0;
+    (void)src_flag_phys;
+    flag_desc->dest = dst_flag_phys;
+    flag_desc->next = 0;
 
     /*
      * Keep the response payload, publish flag, and descriptor cachelines
@@ -1654,31 +1689,55 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
                       resp_segment_count,
                       (unsigned long long)dst_flag_phys,
                       chan->chain_started);
-        for (size_t i = 0; i < resp_segment_count; i++) {
-            cxl_ce_debugf("submit_response seg[%zu] src_phys=%#llx src_off=%u dst_phys=%#llx len=%u next=%#llx",
-                          i,
-                          (unsigned long long)descs[i]->src,
-                          resp_segments[i].src_offset,
-                          (unsigned long long)descs[i]->dest,
-                          descs[i]->len,
-                          (unsigned long long)descs[i]->next);
+        cxl_ce_debugf("submit_response seg[0] src_phys=%#llx src_off=0 dst_phys=%#llx len=%u next=%#llx",
+                      (unsigned long long)resp_desc0->src,
+                      (unsigned long long)resp_desc0->dest,
+                      resp_desc0->len,
+                      (unsigned long long)resp_desc0->next);
+        if (second_len > 0) {
+            cxl_ce_debugf("submit_response seg[1] src_phys=%#llx src_off=%zu dst_phys=%#llx len=%u next=%#llx",
+                          (unsigned long long)resp_desc1->src,
+                          first_len,
+                          (unsigned long long)resp_desc1->dest,
+                          resp_desc1->len,
+                          (unsigned long long)resp_desc1->next);
         }
         cxl_ce_debugf("submit_response flag_desc src_phys=%#llx dst_phys=%#llx len=%u desc_phys=%#llx",
-                      (unsigned long long)descs[flag_desc_index]->src,
-                      (unsigned long long)descs[flag_desc_index]->dest,
-                      descs[flag_desc_index]->len,
-                      (unsigned long long)desc_phys[flag_desc_index]);
+                      (unsigned long long)flag_desc->src,
+                      (unsigned long long)flag_desc->dest,
+                      flag_desc->len,
+                      (unsigned long long)flag_desc_phys);
     }
 
-    cxl_ce_mmio_write64(bar0,
-                        chan->chan_mmio_base + CXL_CE_CHAN_CHAINADDR,
-                        desc_phys[0]);
-    cxl_ce_mmio_write8(bar0,
-                       chan->chan_mmio_base + CXL_CE_CHAN_COMMAND,
-                       CXL_CE_CMD_START_DMA);
+    if (chan->chain_started) {
+        if (!chan->last_desc) {
+            if (!g_cxl_ce.warned) {
+                fprintf(stderr,
+                        "cxl_rpc: ERROR: CopyEngine append path missing tail"
+                        " engine=%s channel=%u\n",
+                        chan->engine->resource0_path, chan->chan_id);
+                g_cxl_ce.warned = 1;
+            }
+            chan->poisoned = 1;
+            cxl_copyengine_sync_conn_state(conn);
+            return 0;
+        }
+        chan->last_desc->next = desc_phys0;
+        submit_mode = "append";
+        cxl_ce_mmio_write8(bar0,
+                           chan->chan_mmio_base + CXL_CE_CHAN_COMMAND,
+                           CXL_CE_CMD_APPEND_DMA);
+    } else {
+        cxl_ce_mmio_write64(bar0,
+                            chan->chan_mmio_base + CXL_CE_CHAN_CHAINADDR,
+                            desc_phys0);
+        cxl_ce_mmio_write8(bar0,
+                           chan->chan_mmio_base + CXL_CE_CHAN_COMMAND,
+                           CXL_CE_CMD_START_DMA);
+    }
     chan->chain_started = 1;
 
-    chan->last_desc = descs[flag_desc_index];
+    chan->last_desc = flag_desc;
     conn->ce_chain_started = chan->chain_started;
     conn->ce_next_slot = chan->next_slot;
     conn->ce_last_desc = chan->last_desc;
@@ -1686,10 +1745,10 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
         cxl_ce_debugf("submit_response queued rpc_id=%u slot=%zu first_desc=%#llx last_desc=%#llx next_slot=%zu mode=%s",
                       rpc_id,
                       slot,
-                      (unsigned long long)desc_phys[0],
-                      (unsigned long long)desc_phys[flag_desc_index],
+                      (unsigned long long)desc_phys0,
+                      (unsigned long long)flag_desc_phys,
                       chan->next_slot,
-                      "start");
+                      submit_mode);
     }
     return 1;
 }
