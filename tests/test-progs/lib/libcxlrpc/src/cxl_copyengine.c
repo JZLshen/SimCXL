@@ -1057,7 +1057,9 @@ cxl_connection_init_runtime_defaults(cxl_connection_t *conn)
     conn->req_entry_next = NULL;
     conn->req_entry_complete = NULL;
     conn->ce_lane_bind_valid = 0;
+    conn->ce_bind_lane_index_valid = 0;
     conn->ce_bind_engine_index = 0;
+    conn->ce_bind_lane_index = 0;
     conn->ce_bind_channel_id = 0;
 
     cxl_copyengine_clear_conn_state(conn);
@@ -1330,6 +1332,61 @@ cxl_copyengine_prepare(cxl_connection_t *conn)
         }
         cxl_copyengine_sync_conn_state(conn);
         return -1;
+    }
+
+    if (conn->ce_bind_lane_index_valid) {
+        if (conn->ce_bind_lane_index >= g_cxl_ce.channel_count) {
+            if (!g_cxl_ce.warned) {
+                fprintf(stderr,
+                        "cxl_rpc: ERROR: requested CopyEngine lane index does not exist"
+                        " lane=%zu available_channels=%zu\n",
+                        conn->ce_bind_lane_index,
+                        g_cxl_ce.channel_count);
+                g_cxl_ce.warned = 1;
+            }
+            cxl_copyengine_sync_conn_state(conn);
+            return -1;
+        }
+
+        chan = &g_cxl_ce.channels[conn->ce_bind_lane_index];
+        if (chan->poisoned) {
+            if (!g_cxl_ce.warned) {
+                fprintf(stderr,
+                        "cxl_rpc: ERROR: requested CopyEngine lane index is poisoned"
+                        " lane=%zu engine=%zu channel=%u\n",
+                        conn->ce_bind_lane_index,
+                        chan->engine_index,
+                        chan->chan_id);
+                g_cxl_ce.warned = 1;
+            }
+            cxl_copyengine_sync_conn_state(conn);
+            return -1;
+        }
+
+        if (chan->owner_conn && chan->owner_conn != conn) {
+            if (!g_cxl_ce.warned) {
+                fprintf(stderr,
+                        "cxl_rpc: ERROR: requested CopyEngine lane index already in use"
+                        " lane=%zu engine=%zu channel=%u\n",
+                        conn->ce_bind_lane_index,
+                        chan->engine_index,
+                        chan->chan_id);
+                g_cxl_ce.warned = 1;
+            }
+            cxl_copyengine_sync_conn_state(conn);
+            return -1;
+        }
+
+        if (!chan->owner_conn) {
+            chan->owner_conn = conn;
+            g_cxl_ce.attached_conns++;
+        }
+        conn->ce_lane_assigned = 1;
+        conn->ce_engine_index = chan->engine_index;
+        conn->ce_channel_index = chan->channel_index;
+        conn->ce_hw_channel_id = chan->chan_id;
+        cxl_copyengine_sync_conn_state(conn);
+        return 0;
     }
 
     for (size_t i = 0; i < g_cxl_ce.channel_count; i++) {

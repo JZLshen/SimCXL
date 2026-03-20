@@ -154,6 +154,22 @@ int cxl_connection_bind_copyengine_lane(cxl_connection_t *conn,
                                         size_t engine_index,
                                         uint32_t channel_index);
 
+/**
+ * Bind one dedicated CopyEngine lane by global lane index.
+ *
+ * Lane indices follow the library's discovered global lane order:
+ * engines are sorted by PCI resource path, and channels are enumerated in
+ * ascending channel ID inside each engine. This keeps server-side client to
+ * lane binding stable even when public configs use multiple channels per
+ * engine.
+ *
+ * @param conn        Connection handle
+ * @param lane_index  Zero-based global lane index
+ * @return            0 on success, -1 on error
+ */
+int cxl_connection_bind_copyengine_lane_index(cxl_connection_t *conn,
+                                              size_t lane_index);
+
 /* ================================================================
  * Client API
  * ================================================================ */

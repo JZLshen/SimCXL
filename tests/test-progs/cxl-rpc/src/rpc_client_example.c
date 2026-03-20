@@ -39,7 +39,7 @@
 
 /* Global CXL shared-memory aperture. */
 #define CXL_BASE 0x100000000ULL
-#define CXL_SIZE 0x42000000ULL
+#define CXL_SIZE 0x200000000ULL
 
 /* N-client : 1-server layout. */
 #define CLIENT_REGION_SIZE 0x02000000ULL
@@ -78,12 +78,14 @@ typedef struct __attribute__((packed)) {
 
 #define RPC_ID_SPACE (1u << 15)
 #define FIRST_REQ_BARRIER_MAGIC 0x46524231u
+#define FIRST_REQ_BARRIER_WORDS (((MAX_CLIENTS) + 63) / 64)
 
-typedef struct __attribute__((packed)) {
+typedef struct {
     uint32_t magic;
     uint32_t num_clients;
-    uint32_t arrived_mask;
-    uint32_t reserved;
+    uint32_t bitmap_words;
+    uint32_t reserved0;
+    uint64_t arrived_bitmap[FIRST_REQ_BARRIER_WORDS];
 } first_req_barrier_state_t;
 
 static volatile int keep_running = 1;
@@ -92,6 +94,78 @@ static inline uint64_t
 current_tick(void)
 {
     return m5_rpns();
+}
+
+static inline size_t
+first_req_barrier_active_words(int num_clients)
+{
+    return (size_t)((num_clients + 63) / 64);
+}
+
+static inline uint64_t
+first_req_barrier_full_mask_for_word(int num_clients, size_t word_index)
+{
+    int remaining = num_clients - (int)(word_index * 64u);
+    if (remaining >= 64)
+        return UINT64_MAX;
+    if (remaining <= 0)
+        return 0;
+    return (1ULL << remaining) - 1ULL;
+}
+
+static void
+first_req_barrier_reset(first_req_barrier_state_t *state, int num_clients)
+{
+    if (!state)
+        return;
+
+    state->magic = FIRST_REQ_BARRIER_MAGIC;
+    state->num_clients = (uint32_t)num_clients;
+    state->bitmap_words = (uint32_t)FIRST_REQ_BARRIER_WORDS;
+    state->reserved0 = 0;
+    memset(state->arrived_bitmap, 0, sizeof(state->arrived_bitmap));
+}
+
+static int
+first_req_barrier_is_complete(const first_req_barrier_state_t *state,
+                              int num_clients)
+{
+    size_t words = first_req_barrier_active_words(num_clients);
+
+    if (!state)
+        return 0;
+
+    for (size_t i = 0; i < words; i++) {
+        uint64_t full_mask = first_req_barrier_full_mask_for_word(num_clients,
+                                                                  i);
+        uint64_t arrived =
+            __atomic_load_n(&state->arrived_bitmap[i], __ATOMIC_ACQUIRE);
+        if ((arrived & full_mask) != full_mask)
+            return 0;
+    }
+
+    return 1;
+}
+
+static size_t
+first_req_barrier_count_arrived(const first_req_barrier_state_t *state,
+                                int num_clients)
+{
+    size_t words = first_req_barrier_active_words(num_clients);
+    size_t arrived_count = 0;
+
+    if (!state)
+        return 0;
+
+    for (size_t i = 0; i < words; i++) {
+        uint64_t full_mask = first_req_barrier_full_mask_for_word(num_clients,
+                                                                  i);
+        uint64_t arrived =
+            __atomic_load_n(&state->arrived_bitmap[i], __ATOMIC_ACQUIRE);
+        arrived_count += (size_t)__builtin_popcountll(arrived & full_mask);
+    }
+
+    return arrived_count;
 }
 
 static inline uint32_t
@@ -274,7 +348,7 @@ wait_all_clients_first_request(int num_clients, int node_id)
 {
     if (num_clients <= 1)
         return 0;
-    if (num_clients > 32 || node_id < 0 || node_id >= num_clients) {
+    if (num_clients > MAX_CLIENTS || node_id < 0 || node_id >= num_clients) {
         fprintf(stderr, "client: invalid first-request barrier arguments\n");
         return -1;
     }
@@ -311,9 +385,8 @@ wait_all_clients_first_request(int num_clients, int node_id)
         return -1;
     }
 
-    uint32_t full_mask =
-        (num_clients == 32) ? 0xFFFFFFFFu : ((1u << num_clients) - 1u);
-    uint32_t my_bit = (1u << node_id);
+    size_t my_word_index = (size_t)node_id / 64u;
+    uint64_t my_bit = 1ULL << (node_id % 64);
 
     if (flock(fd, LOCK_EX) != 0) {
         fprintf(stderr, "client: flock first-request barrier failed\n");
@@ -324,14 +397,12 @@ wait_all_clients_first_request(int num_clients, int node_id)
 
     if (state->magic != FIRST_REQ_BARRIER_MAGIC ||
         state->num_clients != (uint32_t)num_clients ||
-        state->arrived_mask == full_mask) {
-        state->magic = FIRST_REQ_BARRIER_MAGIC;
-        state->num_clients = (uint32_t)num_clients;
-        state->arrived_mask = 0;
-        state->reserved = 0;
+        state->bitmap_words != (uint32_t)FIRST_REQ_BARRIER_WORDS ||
+        first_req_barrier_is_complete(state, num_clients)) {
+        first_req_barrier_reset(state, num_clients);
     }
 
-    state->arrived_mask |= my_bit;
+    state->arrived_bitmap[my_word_index] |= my_bit;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
     if (flock(fd, LOCK_UN) != 0) {
@@ -347,18 +418,18 @@ wait_all_clients_first_request(int num_clients, int node_id)
     uint64_t start_ms = monotonic_time_ms();
 
     while (keep_running) {
-        uint32_t arrived = __atomic_load_n(&state->arrived_mask,
-                                           __ATOMIC_ACQUIRE);
-        if ((arrived & full_mask) == full_mask)
+        if (first_req_barrier_is_complete(state, num_clients))
             break;
 
         if (timeout_ms > 0) {
             uint64_t now_ms = monotonic_time_ms();
             if (now_ms >= start_ms && (now_ms - start_ms) >= timeout_ms) {
+                size_t arrived_clients =
+                    first_req_barrier_count_arrived(state, num_clients);
                 fprintf(stderr,
                         "client: first-request barrier timeout path=%s "
-                        "arrived_mask=0x%08x full_mask=0x%08x\n",
-                        barrier_path, arrived, full_mask);
+                        "arrived=%zu/%d\n",
+                        barrier_path, arrived_clients, num_clients);
                 munmap(state, sizeof(first_req_barrier_state_t));
                 close(fd);
                 return -1;

@@ -31,7 +31,7 @@
 
 /* Global CXL shared-memory aperture. */
 #define CXL_BASE 0x100000000ULL
-#define CXL_SIZE 0x42000000ULL
+#define CXL_SIZE 0x200000000ULL
 
 /* N-client : 1-server layout (must match rpc_client_example.c). */
 #define CLIENT_REGION_SIZE 0x02000000ULL
@@ -240,8 +240,11 @@ main(int argc, char **argv)
             }
         }
 
-        if (cxl_connection_bind_copyengine_lane(resp_conns[i], (size_t)i, 0) < 0) {
-            fprintf(stderr, "server: bind CopyEngine lane failed for client %d\n", i);
+        if (cxl_connection_bind_copyengine_lane_index(resp_conns[i],
+                                                      (size_t)i) < 0) {
+            fprintf(stderr,
+                    "server: bind CopyEngine lane index failed for client %d\n",
+                    i);
             rc = 1;
             goto cleanup;
         }

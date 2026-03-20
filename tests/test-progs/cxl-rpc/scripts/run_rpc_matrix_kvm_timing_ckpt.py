@@ -8,7 +8,7 @@ Run CXL RPC matrix experiments with:
 
 Default experiment matrix (deduplicated):
   A) client sweep:
-     req_size=64B, resp_size=64B, clients in [1,2,4,8,16,29], reqs=30
+     req_size=64B, resp_size=64B, clients in [1,2,4,8,16,32,64,128], reqs=30
   B) request-size sweep:
      req_size in [8B,64B,256B,1KB,4KB,8KB], resp_size=64B,
      clients=16, reqs=30
@@ -41,7 +41,7 @@ REQ_SWEEP_SIZES = [8, 64, 256, 1024, 4096, 8192]
 # Current public backend caps response payload at 4088B, so keep the
 # response-size sweep below that limit for now.
 RESP_SWEEP_SIZES = [8, 64, 256, 1024]
-CLIENT_SWEEP_COUNTS = [1, 2, 4, 8, 16, 29]
+CLIENT_SWEEP_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128]
 
 
 @dataclass(frozen=True)
@@ -405,9 +405,26 @@ def main() -> int:
     )
     parser.add_argument("--checkpoint", type=str, default="")
     parser.add_argument("--checkpoint-cpus", type=int, default=0)
+    parser.add_argument(
+        "--copy-engine-channels",
+        type=int,
+        default=0,
+        help=(
+            "Pass --copy_engine_channels through to both checkpoint and timing "
+            "configs. 0 keeps their auto-derived topology."
+        ),
+    )
     parser.add_argument("--skip-inject", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force-rerun", action="store_true")
+    parser.add_argument(
+        "--allow-concurrent-runs",
+        action="store_true",
+        help=(
+            "Skip the built-in lingering-process cleanup so multiple matrix "
+            "batches can run in parallel."
+        ),
+    )
     parser.add_argument(
         "--inter-experiment-sleep-sec",
         type=int,
@@ -441,6 +458,9 @@ def main() -> int:
     batch_dir.mkdir(parents=True, exist_ok=True)
     if args.start_index < 1:
         print("[fatal] --start-index must be >= 1")
+        return 2
+    if args.copy_engine_channels < 0:
+        print("[fatal] --copy-engine-channels must be >= 0")
         return 2
 
     gem5_bin = repo_root / "build/X86/gem5.opt"
@@ -592,15 +612,16 @@ def main() -> int:
                     f"starting next experiment: {exp.exp_id}"
                 )
                 time.sleep(args.inter_experiment_sleep_sec)
-        if not wait_for_no_matrix_processes(
-            gem5_bin,
-            rpc_cfg_paths,
-            settle_sec=float(args.process_settle_sec),
-            term_grace_sec=float(args.process_term_grace_sec),
-            kill_grace_sec=float(args.process_kill_grace_sec),
-            dry_run=args.dry_run,
-        ):
-            return 2
+        if not args.allow_concurrent_runs:
+            if not wait_for_no_matrix_processes(
+                gem5_bin,
+                rpc_cfg_paths,
+                settle_sec=float(args.process_settle_sec),
+                term_grace_sec=float(args.process_term_grace_sec),
+                kill_grace_sec=float(args.process_kill_grace_sec),
+                dry_run=args.dry_run,
+            ):
+                return 2
         started_experiments += 1
 
         run_outdir = batch_dir / f"run_{idx:02d}_{exp.exp_id}"
@@ -633,6 +654,13 @@ def main() -> int:
                     "--rpc_client_count",
                     str(key.clients),
                 ]
+                if args.copy_engine_channels > 0:
+                    ckpt_cmd.extend(
+                        [
+                            "--copy_engine_channels",
+                            str(args.copy_engine_channels),
+                        ]
+                    )
                 if args.dry_run:
                     checkpoint_dir = ckpt_outdir
                     print(
@@ -743,6 +771,13 @@ def main() -> int:
             "--test_cmd",
             test_cmd,
         ]
+        if args.copy_engine_channels > 0:
+            gem5_cmd.extend(
+                [
+                    "--copy_engine_channels",
+                    str(args.copy_engine_channels),
+                ]
+            )
 
         start_ts = dt.datetime.now().isoformat(timespec="seconds")
         start_time = time.time()

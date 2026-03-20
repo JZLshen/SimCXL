@@ -48,6 +48,7 @@ repo_root = Path(__file__).resolve().parents[3]
 default_kernel = repo_root / "files" / "vmlinux"
 default_disk = repo_root / "files" / "parsec.img"
 MAX_COPY_ENGINES = 29
+MAX_COPY_ENGINE_CHANNELS = 64
 
 parser = argparse.ArgumentParser(description='Save CXL RPC boot checkpoint.')
 parser.add_argument('--num_cpus', type=int, default=1, help='Number of CPUs')
@@ -57,6 +58,13 @@ parser.add_argument(
     default=0,
     help=('RPC client count encoded into the checkpoint hardware topology. '
           '0 means auto: max(1, num_cpus - 1).'),
+)
+parser.add_argument(
+    '--copy_engine_channels',
+    type=int,
+    default=0,
+    help=('Channels per CopyEngine. 0 auto-derives the minimum channel count '
+          'needed to provide at least one response lane per client.'),
 )
 parser.add_argument(
     '--copy_engine_xfercap',
@@ -96,15 +104,50 @@ if not os.access('/dev/kvm', os.R_OK | os.W_OK):
         '/dev/kvm on the host'
     )
 
-num_copy_engines = (
+
+def ceil_div(numer: int, denom: int) -> int:
+    return (numer + denom - 1) // denom
+
+
+def derive_copyengine_topology(
+    requested_clients: int,
+    requested_channels: int,
+) -> tuple[int, int]:
+    if requested_clients < 1:
+        requested_clients = 1
+    if requested_channels < 0:
+        parser.error('--copy_engine_channels must be >= 0')
+
+    channels = requested_channels
+    if channels == 0:
+        channels = max(1, ceil_div(requested_clients, MAX_COPY_ENGINES))
+
+    if channels > MAX_COPY_ENGINE_CHANNELS:
+        parser.error(
+            '--copy_engine_channels exceeds board limit: '
+            f'{channels} > {MAX_COPY_ENGINE_CHANNELS}'
+        )
+
+    num_engines = ceil_div(requested_clients, channels)
+    if num_engines > MAX_COPY_ENGINES:
+        max_clients = MAX_COPY_ENGINES * channels
+        parser.error(
+            'requested rpc_client_count exceeds current X86Board lane '
+            f'capacity: clients={requested_clients}, '
+            f'channels/engine={channels}, '
+            f'max_supported_clients={max_clients}'
+        )
+
+    return num_engines, channels
+
+
+requested_rpc_clients = (
     args.rpc_client_count if args.rpc_client_count > 0 else max(1, args.num_cpus - 1)
 )
-if num_copy_engines > MAX_COPY_ENGINES:
-    parser.error(
-        f'current X86Board supports at most {MAX_COPY_ENGINES} CopyEngines '
-        f'on PCI bus 0; requested {num_copy_engines}'
-    )
-copy_engine_channels = 1
+num_copy_engines, copy_engine_channels = derive_copyengine_topology(
+    requested_rpc_clients,
+    args.copy_engine_channels,
+)
 
 # --- Board/memory/cache config MUST match x86-cxl-rpc-test.py exactly ---
 

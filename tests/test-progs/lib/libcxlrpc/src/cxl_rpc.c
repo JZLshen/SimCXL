@@ -1092,8 +1092,29 @@ int cxl_connection_bind_copyengine_lane(cxl_connection_t *conn,
     }
 
     conn->ce_lane_bind_valid = 1;
+    conn->ce_bind_lane_index_valid = 0;
     conn->ce_bind_engine_index = engine_index;
+    conn->ce_bind_lane_index = 0;
     conn->ce_bind_channel_id = channel_index;
+    return 0;
+}
+
+int cxl_connection_bind_copyengine_lane_index(cxl_connection_t *conn,
+                                              size_t lane_index)
+{
+    if (!conn)
+        return -1;
+    if (conn->ce_lane_assigned) {
+        if (conn->ce_channel_index != lane_index)
+            return -1;
+        return 0;
+    }
+
+    conn->ce_lane_bind_valid = 1;
+    conn->ce_bind_lane_index_valid = 1;
+    conn->ce_bind_engine_index = 0;
+    conn->ce_bind_lane_index = lane_index;
+    conn->ce_bind_channel_id = 0;
     return 0;
 }
 

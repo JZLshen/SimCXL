@@ -36,6 +36,7 @@ repo_root = Path(__file__).resolve().parents[3]
 default_kernel = repo_root / "files" / "vmlinux"
 default_disk = repo_root / "files" / "parsec.img"
 MAX_COPY_ENGINES = 29
+MAX_COPY_ENGINE_CHANNELS = 64
 
 parser = argparse.ArgumentParser(description="CXL RPC test parameters.")
 parser.add_argument(
@@ -69,6 +70,15 @@ parser.add_argument(
     help=(
         "RPC client count. "
         "0 means infer from test_cmd and bind one engine per client."
+    ),
+)
+parser.add_argument(
+    "--copy_engine_channels",
+    type=int,
+    default=0,
+    help=(
+        "Channels per CopyEngine. 0 auto-derives the minimum channel count "
+        "needed to provide at least one response lane per client."
     ),
 )
 parser.add_argument(
@@ -207,6 +217,41 @@ def _load_checkpoint_copyengine_topology(
         channel_count = 1
     return engine_sections, channel_count
 
+
+def _ceil_div(numer: int, denom: int) -> int:
+    return (numer + denom - 1) // denom
+
+
+def _derive_copyengine_topology(
+    requested_clients: int,
+    requested_channels: int,
+) -> tuple[int, int]:
+    if requested_clients < 1:
+        requested_clients = 1
+    if requested_channels < 0:
+        parser.error("--copy_engine_channels must be >= 0")
+
+    channels = requested_channels
+    if channels == 0:
+        channels = max(1, _ceil_div(requested_clients, MAX_COPY_ENGINES))
+
+    if channels > MAX_COPY_ENGINE_CHANNELS:
+        parser.error(
+            "--copy_engine_channels exceeds board limit: "
+            f"{channels} > {MAX_COPY_ENGINE_CHANNELS}"
+        )
+
+    num_engines = _ceil_div(requested_clients, channels)
+    if num_engines > MAX_COPY_ENGINES:
+        max_clients = MAX_COPY_ENGINES * channels
+        parser.error(
+            "requested rpc_client_count exceeds current X86Board lane "
+            f"capacity: clients={requested_clients}, channels/engine={channels}, "
+            f"max_supported_clients={max_clients}"
+        )
+
+    return num_engines, channels
+
 cache_hierarchy = PrivateL1PrivateL2SharedL3CacheHierarchy(
     l1d_size="48kB",
     l1d_assoc=6,
@@ -239,24 +284,31 @@ requested_rpc_clients = (
     if args.rpc_client_count > 0
     else _infer_rpc_num_clients(args.test_cmd)
 )
-if requested_rpc_clients > MAX_COPY_ENGINES:
-    parser.error(
-        f"current X86Board supports at most {MAX_COPY_ENGINES} CopyEngines "
-        f"on PCI bus 0; requested {requested_rpc_clients} client(s)"
-    )
 
 if checkpoint_topology is not None:
     num_copy_engines, copy_engine_channels = checkpoint_topology
-    if requested_rpc_clients > num_copy_engines:
+    available_lanes = num_copy_engines * copy_engine_channels
+    if (args.copy_engine_channels > 0 and
+            args.copy_engine_channels != copy_engine_channels):
+        parser.error(
+            "--copy_engine_channels conflicts with restored checkpoint "
+            f"topology: requested {args.copy_engine_channels}, "
+            f"checkpoint has {copy_engine_channels}"
+        )
+    if requested_rpc_clients > available_lanes:
         parser.error(
             "checkpoint CopyEngine topology is smaller than rpc_client_count: "
             f"{requested_rpc_clients} client(s) need at least "
-            f"{requested_rpc_clients} engine(s), checkpoint has "
-            f"{num_copy_engines}"
+            f"{requested_rpc_clients} lane(s), checkpoint has "
+            f"{available_lanes} lane(s) "
+            f"({num_copy_engines} engine(s) x {copy_engine_channels} "
+            "channel(s))"
         )
 else:
-    num_copy_engines = max(1, requested_rpc_clients)
-    copy_engine_channels = 1
+    num_copy_engines, copy_engine_channels = _derive_copyengine_topology(
+        requested_rpc_clients,
+        args.copy_engine_channels,
+    )
 
 processor = SimpleSwitchableProcessor(
     starting_core_type=CPUTypes.KVM,
