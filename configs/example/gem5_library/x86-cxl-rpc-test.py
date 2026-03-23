@@ -124,6 +124,12 @@ args = parser.parse_args()
 if args.rpc_client_count < 0:
     parser.error("--rpc_client_count must be >= 0")
 
+KVM_UNSUPPORTED_M5_RPNS_BINS = {
+    "rpc_client_example",
+    "cxl_mem_copy_cmp",
+    "cpu_memmove_bw",
+}
+
 
 def _validate_test_mode(test_cmd: str) -> None:
     if ("run_rpc_server_client.sh" in test_cmd or
@@ -143,6 +149,36 @@ def _validate_test_mode(test_cmd: str) -> None:
 
 
 _validate_test_mode(args.test_cmd)
+
+
+def _validate_kvm_guest_compat(test_cmd: str, cpu_type: str) -> None:
+    if cpu_type != "KVM":
+        return
+
+    try:
+        tokens = shlex.split(test_cmd, posix=True)
+    except ValueError:
+        tokens = test_cmd.split()
+
+    unsupported = []
+    for token in tokens:
+        base = os.path.basename(token)
+        if base in KVM_UNSUPPORTED_M5_RPNS_BINS:
+            unsupported.append(base)
+
+    if not unsupported:
+        return
+
+    bins = ", ".join(sorted(set(unsupported)))
+    parser.error(
+        "KVM post-boot execution is unsupported for the selected test command "
+        "because these guest binaries execute m5_rpns(), which traps as an "
+        f"invalid opcode under KVM: {bins}. Use a non-KVM post-boot CPU "
+        "type (TIMING/O3/ATOMIC) for this RPC path."
+    )
+
+
+_validate_kvm_guest_compat(args.test_cmd, args.cpu_type)
 
 
 def _parse_positive_int(text: str) -> int | None:
@@ -185,7 +221,10 @@ def _load_checkpoint_copyengine_topology(
 
     cfg = Path(checkpoint_dir) / "config.ini"
     if not cfg.is_file():
-        return None
+        parser.error(
+            "restored checkpoint is missing config.ini for CopyEngine topology: "
+            f"{cfg}"
+        )
 
     engine_sections = 0
     channel_count = 0
@@ -212,9 +251,15 @@ def _load_checkpoint_copyengine_topology(
                     channel_count = parsed
 
     if engine_sections == 0:
-        return None
+        parser.error(
+            "restored checkpoint does not describe any CopyEngine sections: "
+            f"{cfg}"
+        )
     if channel_count == 0:
-        channel_count = 1
+        parser.error(
+            "restored checkpoint is missing ChanCnt for CopyEngine topology: "
+            f"{cfg}"
+        )
     return engine_sections, channel_count
 
 
@@ -364,7 +409,11 @@ script_lines.extend(
         f"export CXL_RPC_TEST_TIMEOUT_SEC=\"${{CXL_RPC_TEST_TIMEOUT_SEC:-{test_timeout_sec}}}\"",
         "exec >/dev/ttyS0 2>&1",
         f"TEST_CMD={shlex.quote(effective_test_cmd)}",
-        "if [ \"${CXL_RPC_TEST_TIMEOUT_SEC}\" -gt 0 ] && command -v timeout >/dev/null 2>&1; then",
+        "if [ \"${CXL_RPC_TEST_TIMEOUT_SEC}\" -gt 0 ]; then",
+        "  command -v timeout >/dev/null 2>&1 || {",
+        "    echo \"[gem5-test] timeout command is required when CXL_RPC_TEST_TIMEOUT_SEC > 0\"",
+        "    exit 127",
+        "  }",
         "  timeout --signal=TERM --kill-after=5 \"${CXL_RPC_TEST_TIMEOUT_SEC}s\" bash -c \"$TEST_CMD\"",
         "  TEST_CMD_RC=$?",
         "else",

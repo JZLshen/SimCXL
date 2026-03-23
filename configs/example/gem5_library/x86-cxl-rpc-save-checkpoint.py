@@ -75,7 +75,7 @@ parser.add_argument(
 parser.add_argument('--is_asic', type=str, choices=['True', 'False'],
                     default='True', help='ASIC or FPGA device.')
 parser.add_argument(
-    '--fallback_sim_seconds',
+    '--handoff_deadline_sim_seconds',
     type=int,
     default=90,
     help=('Fail checkpoint build after this many simulated seconds if the '
@@ -312,7 +312,7 @@ print(f"  Kernel: {args.kernel}")
 print(f"  Disk: {args.disk}")
 print(f"  Checkpoint will be saved in KVM state (before CPU switch)")
 print("  This allows restore with TIMING, O3, or KVM")
-print(f"  Fallback sim-seconds: {args.fallback_sim_seconds}")
+print(f"  Handoff deadline sim-seconds: {args.handoff_deadline_sim_seconds}")
 print("  Save policy: immediate at guest handoff EXIT")
 print(f"  Run step ticks: {run_step_ticks}")
 print(
@@ -320,7 +320,9 @@ print(
     f"{num_copy_engines} engine(s) x {copy_engine_channels} channel(s)"
 )
 
-fallback_ticks = max(0, args.fallback_sim_seconds) * 1_000_000_000_000
+handoff_deadline_ticks = (
+    max(0, args.handoff_deadline_sim_seconds) * 1_000_000_000_000
+)
 
 while True:
     now_wall = time.monotonic()
@@ -328,18 +330,18 @@ while True:
     if checkpoint_trigger["saved"]:
         break
 
-    if fallback_ticks != 0:
-        remaining = fallback_ticks - m5.curTick()
+    if handoff_deadline_ticks != 0:
+        remaining = handoff_deadline_ticks - m5.curTick()
         if remaining <= 0:
             print("ERROR: checkpoint handoff EXIT was not observed before "
-                  f"fallback deadline at tick {m5.curTick()}.")
-            print("ERROR: refusing to save a fallback checkpoint because it "
-                  "would not represent the intended handoff state.")
+                  f"handoff deadline at tick {m5.curTick()}.")
+            print("ERROR: refusing to save a checkpoint because it would not "
+                  "represent the intended handoff state.")
             raise SystemExit(2)
         if now_wall - last_status_wall["pre_exit"] >= status_wall_interval_sec:
             print(
                 "[ckpt-host] waiting for guest EXIT "
-                f"curTick={m5.curTick()} fallback_remaining_ticks={remaining} "
+                f"curTick={m5.curTick()} handoff_remaining_ticks={remaining} "
                 f"next_step_ticks={min(run_step_ticks, remaining)}"
             )
             last_status_wall["pre_exit"] = now_wall
