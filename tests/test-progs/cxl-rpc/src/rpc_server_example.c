@@ -201,23 +201,23 @@ main(int argc, char **argv)
         .node_id = 0,
     };
 
-    poll_conn = cxl_connection_create_fixed_owner(ctx, &addrs, 1024);
+    poll_conn = cxl_connection_create_server_poll_owner(ctx, &addrs, 1024);
     if (!poll_conn) {
-        fprintf(stderr, "server: connection_create_fixed_owner failed\n");
+        fprintf(stderr, "server: connection_create_server_poll_owner failed\n");
         rc = 1;
         goto cleanup;
     }
 
     for (int i = 0; i < num_clients; i++) {
         if (num_clients == 1) {
-            resp_conns[i] = poll_conn;
+            resp_conns[i] = cxl_connection_create_response_tx(ctx);
         } else {
-            resp_conns[i] = cxl_connection_create_fixed_attach(ctx, &addrs, 1024);
-            if (!resp_conns[i]) {
-                fprintf(stderr, "server: create response connection failed\n");
-                rc = 1;
-                goto cleanup;
-            }
+            resp_conns[i] = cxl_connection_create_response_tx(ctx);
+        }
+        if (!resp_conns[i]) {
+            fprintf(stderr, "server: create response-tx connection failed\n");
+            rc = 1;
+            goto cleanup;
         }
 
         if (cxl_connection_bind_copyengine_lane_index(resp_conns[i],

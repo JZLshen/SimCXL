@@ -1001,6 +1001,7 @@ cxl_connection_init_runtime_defaults(cxl_connection_t *conn)
     if (!conn)
         return;
 
+    conn->caps = 0;
     conn->rpc_id_seq_mask = (uint16_t)CXL_RPC_ID_MASK;
     conn->rpc_id_next = 1;
     conn->rpc_id_inflight_count = 0;

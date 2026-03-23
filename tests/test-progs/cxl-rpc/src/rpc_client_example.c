@@ -609,9 +609,9 @@ main(int argc, char **argv)
         .node_id = (uint16_t)node_id,
     };
 
-    conn = cxl_connection_create_fixed_attach(ctx, &addrs, 1024);
+    conn = cxl_connection_create_client_attach(ctx, &addrs);
     if (!conn) {
-        fprintf(stderr, "client: connection_create_fixed_attach failed\n");
+        fprintf(stderr, "client: connection_create_client_attach failed\n");
         rc = 1;
         goto cleanup;
     }

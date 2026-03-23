@@ -681,6 +681,26 @@ cxl_prepare_future_payloads_same_line(cxl_connection_t *conn,
  * ================================================================ */
 
 static inline int
+cxl_connection_has_cap(const cxl_connection_t *conn, uint32_t cap)
+{
+    return (conn && ((conn->caps & cap) != 0u)) ? 1 : 0;
+}
+
+static int
+cxl_connection_require_cap(const cxl_connection_t *conn,
+                           uint32_t cap,
+                           const char *api)
+{
+    if (cxl_connection_has_cap(conn, cap))
+        return 1;
+
+    cxl_lib_errorf("%s: unsupported connection role caps=%#x required=%#x",
+                   api ? api : "connection_api",
+                   conn ? conn->caps : 0u, cap);
+    return 0;
+}
+
+static inline int
 cxl_req_id_inflight_test(const cxl_connection_t *conn, uint16_t req_id)
 {
     return ((conn->rpc_id_inflight_bitmap[req_id >> 6] >>
@@ -707,6 +727,8 @@ cxl_connection_state_arrays_init(cxl_connection_t *conn)
 {
     if (!conn)
         return -1;
+    if ((conn->caps & (CXL_CONN_CAP_REQUEST_TX | CXL_CONN_CAP_RESPONSE_RX)) == 0)
+        return 0;
 
     if (!conn->rpc_id_inflight_bitmap) {
         conn->rpc_id_inflight_bitmap =
@@ -776,6 +798,10 @@ cxl_req_id_allocator_init(cxl_connection_t *conn)
 
     if (!conn)
         return -1;
+    if ((conn->caps & (CXL_CONN_CAP_REQUEST_TX | CXL_CONN_CAP_RESPONSE_RX)) == 0) {
+        conn->rpc_id_capacity = (uint32_t)CXL_RPC_ID_MASK;
+        return 0;
+    }
 
     if (cxl_connection_state_arrays_init(conn) != 0)
         return -1;
@@ -938,14 +964,29 @@ cxl_req_id_allocator_release(cxl_connection_t *conn, uint16_t req_id)
 
 static void connection_init_virt_ptrs(cxl_connection_t *conn)
 {
-    conn->doorbell = cxl_rpc_phys_to_virt(conn->ctx, conn->addrs.doorbell_addr);
-    conn->metadata_queue = cxl_rpc_phys_to_virt(conn->ctx,
-                                                  conn->addrs.metadata_queue_addr);
-    conn->request_data = cxl_rpc_phys_to_virt(conn->ctx,
-                                                conn->addrs.request_data_addr);
-    conn->response_data = cxl_rpc_phys_to_virt(conn->ctx,
-                                                 conn->addrs.response_data_addr);
-    conn->flag = cxl_rpc_phys_to_virt(conn->ctx, conn->addrs.flag_addr);
+    if (!conn || !conn->ctx)
+        return;
+
+    if (conn->caps & (CXL_CONN_CAP_REQUEST_RX |
+                      CXL_CONN_CAP_REQUEST_TX |
+                      CXL_CONN_CAP_HEAD_SYNC |
+                      CXL_CONN_CAP_BOOTSTRAP)) {
+        conn->doorbell = cxl_rpc_phys_to_virt(conn->ctx,
+                                              conn->addrs.doorbell_addr);
+    }
+    if (conn->caps & CXL_CONN_CAP_REQUEST_RX) {
+        conn->metadata_queue = cxl_rpc_phys_to_virt(
+            conn->ctx, conn->addrs.metadata_queue_addr);
+    }
+    if (conn->caps & CXL_CONN_CAP_REQUEST_TX) {
+        conn->request_data = cxl_rpc_phys_to_virt(conn->ctx,
+                                                  conn->addrs.request_data_addr);
+    }
+    if (conn->caps & CXL_CONN_CAP_RESPONSE_RX) {
+        conn->response_data = cxl_rpc_phys_to_virt(
+            conn->ctx, conn->addrs.response_data_addr);
+        conn->flag = cxl_rpc_phys_to_virt(conn->ctx, conn->addrs.flag_addr);
+    }
 }
 
 static void
@@ -1035,53 +1076,154 @@ cxl_advance_mq_head_with_policy(cxl_connection_t *conn,
 }
 
 static int
+connection_validate_fixed_addrs(cxl_context_t *ctx,
+                                const cxl_connection_addrs_t *addrs,
+                                uint32_t mq_entries,
+                                uint32_t caps,
+                                const char *label,
+                                size_t *metadata_clear_size_out)
+{
+    size_t metadata_clear_size = 0;
+
+    if (metadata_clear_size_out)
+        *metadata_clear_size_out = 0;
+    if (!ctx || !addrs)
+        return -1;
+
+    if ((caps & (CXL_CONN_CAP_REQUEST_TX |
+                 CXL_CONN_CAP_REQUEST_RX |
+                 CXL_CONN_CAP_RESPONSE_RX)) == 0) {
+        return 0;
+    }
+
+    if (addrs->node_id > CXL_NODE_ID_MASK) {
+        cxl_lib_errorf("%s: invalid node_id=%u",
+                       label ? label : "connection_create",
+                       (unsigned)addrs->node_id);
+        return -1;
+    }
+
+    if (caps & (CXL_CONN_CAP_REQUEST_RX |
+                CXL_CONN_CAP_REQUEST_TX |
+                CXL_CONN_CAP_HEAD_SYNC |
+                CXL_CONN_CAP_BOOTSTRAP)) {
+        if (addrs->doorbell_addr == 0 ||
+            !cxl_rpc_phys_range_valid(ctx, addrs->doorbell_addr,
+                                      CXL_DEFAULT_DOORBELL_SIZE)) {
+            cxl_lib_errorf("%s: invalid doorbell addr=%#llx",
+                           label ? label : "connection_create",
+                           (unsigned long long)addrs->doorbell_addr);
+            return -1;
+        }
+    }
+
+    if (caps & CXL_CONN_CAP_REQUEST_RX) {
+        if (mq_entries == 0)
+            mq_entries = 1024u;
+        metadata_clear_size = (size_t)mq_entries * CXL_METADATA_ENTRY_SIZE;
+        if (addrs->metadata_queue_addr == 0 ||
+            addrs->metadata_queue_size < metadata_clear_size ||
+            !cxl_rpc_phys_range_valid(ctx, addrs->metadata_queue_addr,
+                                      addrs->metadata_queue_size)) {
+            cxl_lib_errorf("%s: invalid metadata addr=%#llx size=%zu required=%zu",
+                           label ? label : "connection_create",
+                           (unsigned long long)addrs->metadata_queue_addr,
+                           addrs->metadata_queue_size, metadata_clear_size);
+            return -1;
+        }
+    }
+
+    if (caps & CXL_CONN_CAP_REQUEST_TX) {
+        if (addrs->request_data_addr == 0 || addrs->request_data_size == 0 ||
+            !cxl_rpc_phys_range_valid(ctx, addrs->request_data_addr,
+                                      addrs->request_data_size)) {
+            cxl_lib_errorf("%s: invalid request range addr=%#llx size=%zu",
+                           label ? label : "connection_create",
+                           (unsigned long long)addrs->request_data_addr,
+                           addrs->request_data_size);
+            return -1;
+        }
+    }
+
+    if (caps & CXL_CONN_CAP_RESPONSE_RX) {
+        if (addrs->response_data_addr == 0 || addrs->response_data_size == 0 ||
+            addrs->flag_addr == 0 ||
+            !cxl_rpc_phys_range_valid(ctx, addrs->response_data_addr,
+                                      addrs->response_data_size) ||
+            !cxl_rpc_phys_range_valid(ctx, addrs->flag_addr,
+                                      CXL_DEFAULT_FLAG_SIZE)) {
+            cxl_lib_errorf("%s: invalid response-rx ranges response=%#llx size=%zu flag=%#llx",
+                           label ? label : "connection_create",
+                           (unsigned long long)addrs->response_data_addr,
+                           addrs->response_data_size,
+                           (unsigned long long)addrs->flag_addr);
+            return -1;
+        }
+    }
+
+    if (metadata_clear_size_out)
+        *metadata_clear_size_out = metadata_clear_size;
+    return 0;
+}
+
+static int
 connection_finalize_setup(cxl_connection_t *conn,
-                          size_t metadata_clear_size,
-                          int bootstrap_owner)
+                          size_t metadata_clear_size)
 {
     size_t doorbell_span = 0;
+    const int has_req_rx = cxl_connection_has_cap(conn, CXL_CONN_CAP_REQUEST_RX);
+    const int has_req_tx = cxl_connection_has_cap(conn, CXL_CONN_CAP_REQUEST_TX);
+    const int has_resp_rx = cxl_connection_has_cap(conn, CXL_CONN_CAP_RESPONSE_RX);
+    const int has_bootstrap = cxl_connection_has_cap(conn, CXL_CONN_CAP_BOOTSTRAP);
+    const int has_head_sync = cxl_connection_has_cap(conn, CXL_CONN_CAP_HEAD_SYNC);
 
     if (!conn)
         return -1;
 
     connection_init_virt_ptrs(conn);
-    if (conn->addrs.metadata_queue_addr > conn->addrs.doorbell_addr) {
+    if (has_req_rx &&
+        conn->addrs.metadata_queue_addr > conn->addrs.doorbell_addr) {
         doorbell_span = (size_t)(conn->addrs.metadata_queue_addr -
                                  conn->addrs.doorbell_addr);
     }
     if (doorbell_span > 0 && conn->doorbell) {
         cxl_prefault_each_page_ro_and_flush_touched(conn->doorbell,
                                                     doorbell_span);
+    } else if (has_req_tx && conn->doorbell) {
+        cxl_prefault_each_page_ro_and_flush_touched(conn->doorbell,
+                                                    CXL_DEFAULT_DOORBELL_SIZE);
     }
-    cxl_prefault_each_page_ro_and_flush_touched(conn->metadata_queue,
-                                                metadata_clear_size);
-    cxl_prefault_each_page_ro_and_flush_touched(conn->response_data,
-                                                conn->addrs.response_data_size);
-    cxl_prefault_each_page_ro_and_flush_touched(conn->flag,
-                                                CXL_DEFAULT_FLAG_SIZE);
-
-    const int do_destructive_bootstrap = bootstrap_owner;
+    if (has_req_rx) {
+        cxl_prefault_each_page_ro_and_flush_touched(conn->metadata_queue,
+                                                    metadata_clear_size);
+    }
+    if (has_resp_rx) {
+        cxl_prefault_each_page_ro_and_flush_touched(conn->response_data,
+                                                    conn->addrs.response_data_size);
+        cxl_prefault_each_page_ro_and_flush_touched(conn->flag,
+                                                    CXL_DEFAULT_FLAG_SIZE);
+    }
 
     /*
      * Owner/bootstrap paths reset the completion flag. Attach paths must not
      * destroy already-published completions on a live shared connection.
      */
-    if (do_destructive_bootstrap)
+    if (has_bootstrap && has_resp_rx)
         cxl_zero_and_flush_range(conn->flag, CXL_DEFAULT_FLAG_SIZE);
 
-    if (do_destructive_bootstrap && conn->metadata_queue && metadata_clear_size > 0) {
+    if (has_bootstrap && has_req_rx &&
+        conn->metadata_queue && metadata_clear_size > 0) {
         cxl_zero_and_flush_range(conn->metadata_queue, metadata_clear_size);
     }
 
-
-    if (conn->doorbell) {
+    if (has_head_sync && conn->doorbell && conn->mq_entries > 0) {
         cxl_sync_config_t sync_cfg = {
             .queue_size_n = conn->mq_entries,
-	    };
+        };
         conn->sync = cxl_sync_init(&sync_cfg, (volatile void *)conn->doorbell);
     }
 
-    if (do_destructive_bootstrap &&
+    if (has_bootstrap &&
         cxl_bootstrap_controller_translation(conn, metadata_clear_size) != 0) {
         cxl_lib_errorf("connection bootstrap controller translation failed "
                        "doorbell=%#llx metadata=%#llx",
@@ -1094,100 +1236,61 @@ connection_finalize_setup(cxl_connection_t *conn,
 }
 
 static cxl_connection_t *
-cxl_connection_create_fixed_internal(cxl_context_t *ctx,
-                                     const cxl_connection_addrs_t *addrs,
-                                     uint32_t mq_entries,
-                                     int bootstrap_owner)
+cxl_connection_create_internal(cxl_context_t *ctx,
+                               const cxl_connection_addrs_t *addrs,
+                               uint32_t mq_entries,
+                               uint32_t caps,
+                               const char *label)
 {
-    if (!ctx || !addrs)
+    cxl_connection_t *conn = NULL;
+    size_t metadata_clear_size = 0;
+
+    if (!ctx)
         return NULL;
-
-    if (mq_entries == 0) mq_entries = 1024;
-    size_t required_mq_size = (size_t)mq_entries * CXL_METADATA_ENTRY_SIZE;
-
-    if (addrs->doorbell_addr == 0 ||
-        addrs->metadata_queue_addr == 0 ||
-        addrs->flag_addr == 0 ||
-        addrs->node_id > CXL_NODE_ID_MASK ||
-        addrs->metadata_queue_size < required_mq_size) {
-        cxl_lib_errorf("connection_create_fixed(%s): invalid addrs doorbell=%#llx metadata=%#llx flag=%#llx node_id=%u metadata_size=%zu required=%zu",
-                       bootstrap_owner ? "owner" : "attach",
-                       (unsigned long long)addrs->doorbell_addr,
-                       (unsigned long long)addrs->metadata_queue_addr,
-                       (unsigned long long)addrs->flag_addr,
-                       (unsigned)addrs->node_id,
-                       addrs->metadata_queue_size,
-                       required_mq_size);
+    if ((caps & (CXL_CONN_CAP_REQUEST_RX |
+                 CXL_CONN_CAP_REQUEST_TX |
+                 CXL_CONN_CAP_RESPONSE_RX)) != 0 &&
+        connection_validate_fixed_addrs(ctx, addrs, mq_entries, caps, label,
+                                        &metadata_clear_size) != 0) {
         return NULL;
     }
+    if ((caps & CXL_CONN_CAP_REQUEST_RX) && mq_entries == 0)
+        mq_entries = 1024u;
 
-    if (!cxl_rpc_phys_range_valid(ctx, addrs->doorbell_addr,
-                                  CXL_DEFAULT_DOORBELL_SIZE) ||
-        !cxl_rpc_phys_range_valid(ctx, addrs->metadata_queue_addr,
-                                  addrs->metadata_queue_size) ||
-        !cxl_rpc_phys_range_valid(ctx, addrs->flag_addr,
-                                  CXL_DEFAULT_FLAG_SIZE)) {
-        cxl_lib_errorf("connection_create_fixed(%s): invalid phys range doorbell=%#llx metadata=%#llx size=%zu flag=%#llx phys_base=%#llx map_size=%zu",
-                       bootstrap_owner ? "owner" : "attach",
-                       (unsigned long long)addrs->doorbell_addr,
-                       (unsigned long long)addrs->metadata_queue_addr,
-                       addrs->metadata_queue_size,
-                       (unsigned long long)addrs->flag_addr,
-                       ctx ? (unsigned long long)ctx->phys_base : 0ULL,
-                       ctx ? ctx->map_size : 0u);
-        return NULL;
-    }
-
-    if (addrs->request_data_size > 0 &&
-        (addrs->request_data_addr == 0 ||
-         !cxl_rpc_phys_range_valid(ctx, addrs->request_data_addr,
-                                   addrs->request_data_size))) {
-        cxl_lib_errorf("connection_create_fixed(%s): invalid request range addr=%#llx size=%zu",
-                       bootstrap_owner ? "owner" : "attach",
-                       (unsigned long long)addrs->request_data_addr,
-                       addrs->request_data_size);
-        return NULL;
-    }
-
-    if (addrs->response_data_size > 0 &&
-        (addrs->response_data_addr == 0 ||
-         !cxl_rpc_phys_range_valid(ctx, addrs->response_data_addr,
-                                   addrs->response_data_size))) {
-        cxl_lib_errorf("connection_create_fixed(%s): invalid response range addr=%#llx size=%zu",
-                       bootstrap_owner ? "owner" : "attach",
-                       (unsigned long long)addrs->response_data_addr,
-                       addrs->response_data_size);
-        return NULL;
-    }
-
-    cxl_connection_t *conn = calloc(1, sizeof(*conn));
+    conn = calloc(1, sizeof(*conn));
     if (!conn)
         return NULL;
     cxl_connection_init_runtime_defaults(conn);
 
-    cxl_lib_debugf("connection_create_fixed(%s) mq_entries=%u doorbell=%#llx metadata=%#llx request=%#llx response=%#llx flag=%#llx node_id=%u",
-                   bootstrap_owner ? "owner" : "attach",
-                   mq_entries,
-                   (unsigned long long)addrs->doorbell_addr,
-                   (unsigned long long)addrs->metadata_queue_addr,
-                   (unsigned long long)addrs->request_data_addr,
-                   (unsigned long long)addrs->response_data_addr,
-                   (unsigned long long)addrs->flag_addr,
-                   (unsigned)addrs->node_id);
-
     conn->ctx = ctx;
-    conn->addrs = *addrs;
-    conn->mq_entries = mq_entries;
-    conn->mq_phase = 1;  /* Must match RPC engine's initial phase (true=1) */
-    cxl_mq_payload_prepare_reset_for_head(conn, 64u / CXL_METADATA_ENTRY_SIZE);
+    conn->caps = caps;
+    if (addrs)
+        conn->addrs = *addrs;
+    if (caps & CXL_CONN_CAP_REQUEST_RX) {
+        conn->mq_entries = mq_entries;
+        conn->mq_phase = 1;  /* Must match RPC engine's initial phase (true=1) */
+        cxl_mq_payload_prepare_reset_for_head(conn,
+                                              64u / CXL_METADATA_ENTRY_SIZE);
+    }
+
+    cxl_lib_debugf("%s caps=%#x mq_entries=%u doorbell=%#llx metadata=%#llx request=%#llx response=%#llx flag=%#llx node_id=%u",
+                   label ? label : "connection_create",
+                   caps, conn->mq_entries,
+                   (unsigned long long)conn->addrs.doorbell_addr,
+                   (unsigned long long)conn->addrs.metadata_queue_addr,
+                   (unsigned long long)conn->addrs.request_data_addr,
+                   (unsigned long long)conn->addrs.response_data_addr,
+                   (unsigned long long)conn->addrs.flag_addr,
+                   (unsigned)conn->addrs.node_id);
+
     if (cxl_req_id_allocator_init(conn) != 0) {
         cxl_connection_destroy(conn);
         return NULL;
     }
 
-    if (connection_finalize_setup(conn, required_mq_size, bootstrap_owner) != 0) {
-        cxl_lib_errorf("connection_create_fixed(%s): finalize_setup failed doorbell=%#llx metadata=%#llx request=%#llx response=%#llx flag=%#llx",
-                       bootstrap_owner ? "owner" : "attach",
+    if (connection_finalize_setup(conn, metadata_clear_size) != 0) {
+        cxl_lib_errorf("%s: finalize_setup failed doorbell=%#llx metadata=%#llx request=%#llx response=%#llx flag=%#llx",
+                       label ? label : "connection_create",
                        (unsigned long long)conn->addrs.doorbell_addr,
                        (unsigned long long)conn->addrs.metadata_queue_addr,
                        (unsigned long long)conn->addrs.request_data_addr,
@@ -1197,8 +1300,8 @@ cxl_connection_create_fixed_internal(cxl_context_t *ctx,
         return NULL;
     }
 
-    cxl_lib_debugf("connection_create_fixed(%s) done metadata_ptr=%p request_ptr=%p response_ptr=%p flag_ptr=%p",
-                   bootstrap_owner ? "owner" : "attach",
+    cxl_lib_debugf("%s done metadata_ptr=%p request_ptr=%p response_ptr=%p flag_ptr=%p",
+                   label ? label : "connection_create",
                    (void *)conn->metadata_queue,
                    (void *)conn->request_data,
                    (void *)conn->response_data,
@@ -1207,18 +1310,65 @@ cxl_connection_create_fixed_internal(cxl_context_t *ctx,
     return conn;
 }
 
+cxl_connection_t *cxl_connection_create_server_poll_owner(
+    cxl_context_t *ctx,
+    const cxl_connection_addrs_t *addrs,
+    uint32_t mq_entries)
+{
+    return cxl_connection_create_internal(
+        ctx, addrs, mq_entries,
+        CXL_CONN_CAP_REQUEST_RX |
+            CXL_CONN_CAP_BOOTSTRAP |
+            CXL_CONN_CAP_HEAD_SYNC,
+        "connection_create_server_poll_owner");
+}
+
+cxl_connection_t *cxl_connection_create_client_attach(
+    cxl_context_t *ctx,
+    const cxl_connection_addrs_t *addrs)
+{
+    return cxl_connection_create_internal(
+        ctx, addrs, 0,
+        CXL_CONN_CAP_REQUEST_TX |
+            CXL_CONN_CAP_RESPONSE_RX,
+        "connection_create_client_attach");
+}
+
+cxl_connection_t *cxl_connection_create_response_tx(cxl_context_t *ctx)
+{
+    return cxl_connection_create_internal(
+        ctx, NULL, 0,
+        CXL_CONN_CAP_RESPONSE_TX,
+        "connection_create_response_tx");
+}
+
 cxl_connection_t *cxl_connection_create_fixed_owner(cxl_context_t *ctx,
                                                      const cxl_connection_addrs_t *addrs,
                                                      uint32_t mq_entries)
 {
-    return cxl_connection_create_fixed_internal(ctx, addrs, mq_entries, 1);
+    return cxl_connection_create_internal(
+        ctx, addrs, mq_entries,
+        CXL_CONN_CAP_REQUEST_RX |
+            CXL_CONN_CAP_REQUEST_TX |
+            CXL_CONN_CAP_RESPONSE_RX |
+            CXL_CONN_CAP_RESPONSE_TX |
+            CXL_CONN_CAP_BOOTSTRAP |
+            CXL_CONN_CAP_HEAD_SYNC,
+        "connection_create_fixed_owner");
 }
 
 cxl_connection_t *cxl_connection_create_fixed_attach(cxl_context_t *ctx,
                                                       const cxl_connection_addrs_t *addrs,
                                                       uint32_t mq_entries)
 {
-    return cxl_connection_create_fixed_internal(ctx, addrs, mq_entries, 0);
+    return cxl_connection_create_internal(
+        ctx, addrs, mq_entries,
+        CXL_CONN_CAP_REQUEST_RX |
+            CXL_CONN_CAP_REQUEST_TX |
+            CXL_CONN_CAP_RESPONSE_RX |
+            CXL_CONN_CAP_RESPONSE_TX |
+            CXL_CONN_CAP_HEAD_SYNC,
+        "connection_create_fixed_attach");
 }
 
 cxl_connection_t *cxl_connection_create_fixed(cxl_context_t *ctx,
@@ -1256,7 +1406,8 @@ int cxl_connection_bind_copyengine_lane(cxl_connection_t *conn,
                                         size_t engine_index,
                                         uint32_t channel_index)
 {
-    if (!conn)
+    if (!cxl_connection_require_cap(conn, CXL_CONN_CAP_RESPONSE_TX,
+                                    "cxl_connection_bind_copyengine_lane"))
         return -1;
     if (conn->ce_lane_assigned) {
         if (conn->ce_engine_index != engine_index ||
@@ -1277,7 +1428,8 @@ int cxl_connection_bind_copyengine_lane(cxl_connection_t *conn,
 int cxl_connection_bind_copyengine_lane_index(cxl_connection_t *conn,
                                               size_t lane_index)
 {
-    if (!conn)
+    if (!cxl_connection_require_cap(conn, CXL_CONN_CAP_RESPONSE_TX,
+                                    "cxl_connection_bind_copyengine_lane_index"))
         return -1;
     if (conn->ce_lane_assigned) {
         if (conn->ce_channel_index != lane_index)
@@ -1301,8 +1453,12 @@ int cxl_send_request(cxl_connection_t *conn,
                      const void *data,
                      size_t len)
 {
+    if (!cxl_connection_require_cap(conn, CXL_CONN_CAP_REQUEST_TX,
+                                    "cxl_send_request"))
+        return -1;
+
     /* Parameter validation */
-    if (!conn || !conn->doorbell)
+    if (!conn->doorbell)
         return -1;
 
     /* Check data pointer when length is non-zero */
@@ -1485,7 +1641,10 @@ int cxl_peek_latest_completed_rpc_id(cxl_connection_t *conn,
     if (out_rpc_id)
         *out_rpc_id = 0;
 
-    if (!conn || !conn->flag || !out_rpc_id)
+    if (!cxl_connection_require_cap(conn, CXL_CONN_CAP_RESPONSE_RX,
+                                    "cxl_peek_latest_completed_rpc_id"))
+        return -1;
+    if (!conn->flag || !out_rpc_id)
         return -1;
 
     volatile uint8_t *flag = conn->flag;
@@ -1503,7 +1662,10 @@ int cxl_consume_next_response(cxl_connection_t *conn,
     if (out_rpc_id)
         *out_rpc_id = 0;
 
-    if (!conn || !conn->response_data || !out_data || !out_len ||
+    if (!cxl_connection_require_cap(conn, CXL_CONN_CAP_RESPONSE_RX,
+                                    "cxl_consume_next_response"))
+        return -1;
+    if (!conn->response_data || !out_data || !out_len ||
         !out_rpc_id)
         return -1;
 
@@ -1550,7 +1712,9 @@ int cxl_poll_request(cxl_connection_t *conn,
         *out_data_view = NULL;
     if (out_len)
         *out_len = 0;
-    if (!conn || !conn->metadata_queue || !out_data_view || !out_len) {
+    if (!cxl_connection_require_cap(conn, CXL_CONN_CAP_REQUEST_RX,
+                                    "cxl_poll_request") ||
+        !conn->metadata_queue || !out_data_view || !out_len) {
         goto out;
     }
 
@@ -1732,7 +1896,8 @@ out:
 static int
 cxl_prepare_response_tx_path(cxl_connection_t *conn)
 {
-    if (!conn)
+    if (!cxl_connection_require_cap(conn, CXL_CONN_CAP_RESPONSE_TX,
+                                    "cxl_prepare_response_tx_path"))
         return -1;
 
     conn->resp_tx_ready = 0;
@@ -1782,7 +1947,10 @@ int cxl_connection_set_peer_response_data(cxl_connection_t *conn,
                                           uint64_t peer_response_data_addr,
                                           size_t peer_response_data_size)
 {
-    if (!conn || !conn->ctx)
+    if (!cxl_connection_require_cap(conn, CXL_CONN_CAP_RESPONSE_TX,
+                                    "cxl_connection_set_peer_response_data"))
+        return -1;
+    if (!conn->ctx)
         return -1;
 
     if (peer_response_data_addr == 0 || peer_response_data_size == 0)
@@ -1822,7 +1990,10 @@ int cxl_connection_set_peer_response_data(cxl_connection_t *conn,
 int cxl_connection_set_peer_response_flag_addr(cxl_connection_t *conn,
                                                uint64_t peer_flag_addr)
 {
-    if (!conn || !conn->ctx)
+    if (!cxl_connection_require_cap(conn, CXL_CONN_CAP_RESPONSE_TX,
+                                    "cxl_connection_set_peer_response_flag_addr"))
+        return -1;
+    if (!conn->ctx)
         return -1;
 
     if (peer_flag_addr == 0)
@@ -1858,7 +2029,10 @@ int cxl_send_response(cxl_connection_t *conn,
     size_t entry_size = 0;
     size_t offset = 0;
 
-    if (!conn || !conn->resp_tx_ready)
+    if (!cxl_connection_require_cap(conn, CXL_CONN_CAP_RESPONSE_TX,
+                                    "cxl_send_response"))
+        return -1;
+    if (!conn->resp_tx_ready)
         return -1;
     if (len > 0 && !data)
         return -1;

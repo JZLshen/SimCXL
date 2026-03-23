@@ -102,10 +102,47 @@ volatile void *cxl_rpc_phys_to_virt(const cxl_context_t *ctx,
 typedef struct cxl_connection cxl_connection_t;
 
 /**
+ * Create a server-side metadata-queue polling connection for a fixed layout.
+ *
+ * This role owns the destructive bootstrap path for the shared request queue.
+ * It initializes only the local state required to poll requests and publish
+ * periodic HEAD_UPDATE notifications.
+ */
+cxl_connection_t *cxl_connection_create_server_poll_owner(
+    cxl_context_t *ctx,
+    const cxl_connection_addrs_t *addrs,
+    uint32_t mq_entries);
+
+/**
+ * Create a client-side fixed-layout endpoint.
+ *
+ * This role initializes only the local state required to send requests and
+ * drain responses from the caller's own response-data / flag region.
+ */
+cxl_connection_t *cxl_connection_create_client_attach(
+    cxl_context_t *ctx,
+    const cxl_connection_addrs_t *addrs);
+
+/**
+ * Create a server-side response transmit endpoint.
+ *
+ * This role carries only CopyEngine response-transmit state. It does not map
+ * or initialize any local fixed-layout doorbell / metadata / response / flag
+ * regions. Peer response-data / flag addresses are configured later via
+ * cxl_connection_set_peer_response_data() and
+ * cxl_connection_set_peer_response_flag_addr().
+ */
+cxl_connection_t *cxl_connection_create_response_tx(cxl_context_t *ctx);
+
+/**
  * Create a connection with pre-assigned addresses. This is the owner path
  * for a fixed layout. It initializes local runtime state only; controller-side
  * registration is assumed to be configured out-of-band with final observed
  * addresses.
+ *
+ * Legacy compatibility constructor: initializes the full local state used by
+ * earlier revisions. New code should prefer the role-specific constructors
+ * above.
  */
 cxl_connection_t *cxl_connection_create_fixed_owner(cxl_context_t *ctx,
                                                      const cxl_connection_addrs_t *addrs,
@@ -114,6 +151,10 @@ cxl_connection_t *cxl_connection_create_fixed_owner(cxl_context_t *ctx,
 /**
  * Create a connection with pre-assigned addresses without modifying shared
  * request-side state.
+ *
+ * Legacy compatibility constructor: initializes the full local state used by
+ * earlier revisions. New code should prefer the role-specific constructors
+ * above.
  */
 cxl_connection_t *cxl_connection_create_fixed_attach(cxl_context_t *ctx,
                                                       const cxl_connection_addrs_t *addrs,
