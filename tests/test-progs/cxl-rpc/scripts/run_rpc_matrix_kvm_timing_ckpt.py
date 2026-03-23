@@ -414,6 +414,15 @@ def main() -> int:
             "configs. 0 keeps their auto-derived topology."
         ),
     )
+    parser.add_argument(
+        "--checkpoint-handoff-deadline-sim-seconds",
+        type=int,
+        default=0,
+        help=(
+            "Pass --handoff_deadline_sim_seconds to checkpoint generation. "
+            "0 keeps the checkpoint script default."
+        ),
+    )
     parser.add_argument("--skip-inject", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force-rerun", action="store_true")
@@ -461,6 +470,9 @@ def main() -> int:
         return 2
     if args.copy_engine_channels < 0:
         print("[fatal] --copy-engine-channels must be >= 0")
+        return 2
+    if args.checkpoint_handoff_deadline_sim_seconds < 0:
+        print("[fatal] --checkpoint-handoff-deadline-sim-seconds must be >= 0")
         return 2
 
     gem5_bin = repo_root / "build/X86/gem5.opt"
@@ -659,6 +671,13 @@ def main() -> int:
                         [
                             "--copy_engine_channels",
                             str(args.copy_engine_channels),
+                        ]
+                    )
+                if args.checkpoint_handoff_deadline_sim_seconds > 0:
+                    ckpt_cmd.extend(
+                        [
+                            "--handoff_deadline_sim_seconds",
+                            str(args.checkpoint_handoff_deadline_sim_seconds),
                         ]
                     )
                 if args.dry_run:

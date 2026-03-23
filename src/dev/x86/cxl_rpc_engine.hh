@@ -131,6 +131,7 @@ struct ClientConnection {
 
     // Server-side resources for this client
     Addr doorbell_addr;
+    std::unordered_map<Addr, Addr> doorbell_page_addr_map;  // logical page -> observed page
     MetadataQueue metadata_queue;
     Addr metadata_queue_logical_base;  // Untranslated logical MQ base addr
     std::unordered_map<Addr, Addr> metadata_line_addr_map;  // logical line -> observed line
@@ -153,7 +154,9 @@ struct DoorbellWriteProbe {
     bool covers_doorbell = false;
     bool parsed_entry = false;
     Addr doorbell_addr = 0;
+    Addr logical_doorbell_addr = 0;
     size_t doorbell_offset = 0;
+    uint32_t slot_index = 0;
     const ClientConnection* connection = nullptr;
     DoorbellEntry entry;
 };
@@ -167,15 +170,11 @@ struct DoorbellWriteProbe {
 class CXLRPCEngine : public SimObject
 {
   private:
-    // Doorbell address range fallback (used before connections are ready).
+    // Logical public doorbell span configured by the board layout.
     AddrRange doorbellRange;
 
     // Registered client connections (doorbell_addr -> connection)
     std::unordered_map<Addr, ClientConnection> connections;
-    bool singleDoorbellSegmentValid = false;
-    Addr singleDoorbellCanonicalAddr = 0;
-    Addr singleDoorbellSegmentStart = 0;
-    Addr singleDoorbellSegmentEnd = 0;
 
     // Auto-register parameters
     bool autoRegister;
@@ -189,24 +188,15 @@ class CXLRPCEngine : public SimObject
     uint32_t defaultResponseDataCapacity;
     Addr defaultFlagAddr;
 
-    /**
-     * Check if an address targets a registered doorbell segment.
-     *
-     * When connections are registered, this checks each connection's
-     * contiguous doorbell segment (base + slot-stride range). Before startup
-     * registration, it falls back to the configured doorbell range.
-     */
-    bool isDoorbell(Addr addr) const;
-
     // Find connection whose doorbell slot overlaps [addr, addr + size).
-    // base_addr is set to the matched slot start address.
+    // base_addr is set to the matched observed slot start address.
+    // logical_addr is set to the matched logical slot start address.
     ClientConnection* findConnectionForAddr(
         Addr addr, uint32_t size, Addr& base_addr,
-        Addr* canonical_addr = nullptr);
+        Addr* logical_addr = nullptr, uint32_t* slot_index = nullptr);
     const ClientConnection* findConnectionForAddr(
         Addr addr, uint32_t size, Addr& base_addr,
-        Addr* canonical_addr = nullptr) const;
-    void rebuildDoorbellSlotIndex();
+        Addr* logical_addr = nullptr, uint32_t* slot_index = nullptr) const;
     Addr resolveMetadataSlotAddr(const ClientConnection& conn,
                                  uint32_t slot) const;
     std::array<std::vector<bool>, 4> remapByteEnableMasks;
@@ -277,14 +267,16 @@ class CXLRPCEngine : public SimObject
     bool isBootstrapRequest(const DoorbellEntry& entry) const;
     DoorbellHandleResult processBootstrapRequest(
         ClientConnection& conn, Addr doorbell_addr,
+        Addr logical_doorbell_addr, uint32_t slot_index,
         const DoorbellEntry& entry, PacketPtr pkt);
-    bool tryLearnDoorbellTranslation(PacketPtr pkt);
+    bool consumeBootstrapDoorbellBinding(PacketPtr pkt);
 
     /**
      * Process a complete doorbell entry (dispatch by method type)
      */
     DoorbellHandleResult processDoorbellEntry(
         ClientConnection& conn, Addr doorbell_addr,
+        Addr logical_doorbell_addr, uint32_t slot_index,
         const DoorbellEntry& entry, PacketPtr pkt);
 
     /**
@@ -293,6 +285,7 @@ class CXLRPCEngine : public SimObject
      */
     DoorbellHandleResult processRequest(
         ClientConnection& conn, Addr doorbell_addr,
+        Addr logical_doorbell_addr, uint32_t slot_index,
         const DoorbellEntry& entry, PacketPtr pkt);
 
     /**
@@ -300,6 +293,7 @@ class CXLRPCEngine : public SimObject
      */
     DoorbellHandleResult processHeadUpdate(
         ClientConnection& conn, Addr doorbell_addr,
+        Addr logical_doorbell_addr, uint32_t slot_index,
         const DoorbellEntry& entry, PacketPtr pkt);
 };
 

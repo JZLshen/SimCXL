@@ -168,12 +168,14 @@ Implications:
   clients
 - total available lanes must be at least the number of active response
   connections
-- the public path uses `1 node : 1 engine : 1 channel`
-- the default runtime topology keeps `channel_index = 0` and derives the
-  engine count automatically from the client count
+- the public path binds client `i` to the global lane with index `i`
+- the default runtime topology auto-derives the minimum
+  `(engine_count, channels_per_engine)` pair whose total lane count is large
+  enough for the requested client count
 - the current public X86 board keeps all CopyEngines on PCI bus 0, function 0,
-  and therefore supports at most `29` dedicated engines / active clients in
-  this default topology
+  and therefore supports at most `29` single-function engines or
+  `29 * channels_per_engine` active clients in the default multi-channel
+  topology
 
 If you want the strictest isolation model, run with one channel per engine and
 one engine per active client. In that default public setup, bind
@@ -237,7 +239,7 @@ The checkpoint directory is typically:
 `output/rebuild_ckpt_4c_example/cxl_rpc_checkpoint`
 
 If the guest never reaches the intended readfile handoff `m5 exit`, checkpoint
-save now fails instead of emitting a fallback checkpoint from the wrong state.
+save now fails instead of writing a checkpoint from the wrong state.
 
 ### 4. Run experiments from the checkpoint
 
@@ -273,8 +275,16 @@ The test config derives the CopyEngine topology from `rpc_client_count`.
 If `--rpc_client_count` is not passed explicitly, it infers the client count
 from `CXL_RPC_CLIENT_COUNT=...`, `--num-clients`, or the standard multi-client
 launcher name inside `--test_cmd`.
-The current public X86 board rejects requests above `29` clients because that
-topology maps to one dedicated single-function CopyEngine per active client.
+For client counts above `29`, the public configs automatically increase the
+channel count per engine so the total number of response lanes still covers all
+clients, while keeping the board on the existing bus-0 single-function engine
+topology.
+
+`rpc_client_example`, `cxl_mem_copy_cmp`, and `cpu_memmove_bw` use
+`m5_rpns()` for tick capture. Because that pseudo-instruction traps as an
+invalid opcode under guest `KVM`, `x86-cxl-rpc-test.py` rejects
+`--cpu_type KVM` when the guest command launches any of those binaries. This
+is intentional fail-fast behavior for the current RPC path.
 
 ### 5. Read results
 

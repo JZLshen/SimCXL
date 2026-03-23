@@ -6,22 +6,9 @@
 #include <string.h>
 
 #include "cxl_rpc.h"
+#include "cxl_rpc_layout.h"
 
-#define CXL_BASE 0x100000000ULL
-#define CXL_SIZE 0x200000000ULL
-
-#define CLIENT_REGION_SIZE 0x02000000ULL
-#define SERVER_REGION_INDEX 0
 #define NODE_REGION_INDEX(node_id) ((uint64_t)(node_id) + 1ULL)
-
-#define DOORBELL_OFFSET 0x00000000ULL
-#define METADATA_Q_OFFSET 0x00001000ULL
-#define REQUEST_DATA_OFFSET 0x00005000ULL
-#define RESPONSE_DATA_OFFSET 0x00A05000ULL
-#define FLAG_OFFSET 0x01405000ULL
-
-#define REQUEST_DATA_BYTES (10ULL * 1024ULL * 1024ULL)
-#define RESPONSE_DATA_BYTES (10ULL * 1024ULL * 1024ULL)
 
 #define DEFAULT_MAX_POLLS 2000000
 #define DEFAULT_POLL_PAUSE 0
@@ -77,7 +64,7 @@ int main(int argc, char **argv)
     cxl_connection_addrs_t tx_addrs = {
         .doorbell_addr = server_base + DOORBELL_OFFSET,
         .metadata_queue_addr = server_base + METADATA_Q_OFFSET,
-        .metadata_queue_size = 16 * 1024,
+        .metadata_queue_size = METADATA_Q_SIZE_BYTES,
         .request_data_addr = server_base + REQUEST_DATA_OFFSET,
         .request_data_size = REQUEST_DATA_BYTES,
         .response_data_addr = server_base + RESPONSE_DATA_OFFSET,
@@ -88,7 +75,7 @@ int main(int argc, char **argv)
     cxl_connection_addrs_t rx_addrs = {
         .doorbell_addr = client_base + DOORBELL_OFFSET,
         .metadata_queue_addr = client_base + METADATA_Q_OFFSET,
-        .metadata_queue_size = 16 * 1024,
+        .metadata_queue_size = METADATA_Q_SIZE_BYTES,
         .request_data_addr = client_base + REQUEST_DATA_OFFSET,
         .request_data_size = REQUEST_DATA_BYTES,
         .response_data_addr = client_base + RESPONSE_DATA_OFFSET,

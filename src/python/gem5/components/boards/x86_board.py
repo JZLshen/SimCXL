@@ -70,6 +70,21 @@ from .kernel_disk_workload import KernelDiskWorkload
 _COPY_ENGINE_GENERAL_REG_SIZE = 0x80
 _COPY_ENGINE_CHANNEL_REG_SIZE = 0x80
 _COPY_ENGINE_LEGACY_BAR0_SIZE = 1024
+_CXL_RPC_BASE_ADDR = 0x100000000
+_CXL_RPC_PUBLIC_CXL_SIZE = 0x200000000
+_CXL_RPC_CLIENT_REGION_SIZE = 0x02000000
+_CXL_RPC_TOTAL_REGIONS = _CXL_RPC_PUBLIC_CXL_SIZE // _CXL_RPC_CLIENT_REGION_SIZE
+_CXL_RPC_MAX_CLIENTS = _CXL_RPC_TOTAL_REGIONS - 1
+_CXL_RPC_DOORBELL_SLOT_BYTES = 0x40
+_CXL_RPC_RESERVED_DOORBELL_SLOTS = 1
+_CXL_RPC_METADATA_Q_ENTRIES = 1024
+_CXL_RPC_METADATA_ENTRY_BYTES = 16
+_CXL_RPC_METADATA_Q_BYTES = (
+    _CXL_RPC_METADATA_Q_ENTRIES * _CXL_RPC_METADATA_ENTRY_BYTES
+)
+_CXL_RPC_REQUEST_DATA_BYTES = 10 * 1024 * 1024
+_CXL_RPC_RESPONSE_DATA_BYTES = 10 * 1024 * 1024
+_CXL_RPC_FLAG_BYTES = 64
 #
 # Keep CopyEngines on bus 0 / function 0 only.
 # Skip:
@@ -85,6 +100,10 @@ def _next_power_of_two(size: int) -> int:
     return 1 << (size - 1).bit_length()
 
 
+def _align_up(value: int, align: int) -> int:
+    return (value + align - 1) & ~(align - 1)
+
+
 def _get_copy_engine_bar0_size(channel_count: int) -> int:
     required_size = _COPY_ENGINE_GENERAL_REG_SIZE + (
         channel_count * _COPY_ENGINE_CHANNEL_REG_SIZE
@@ -93,6 +112,43 @@ def _get_copy_engine_bar0_size(channel_count: int) -> int:
         _COPY_ENGINE_LEGACY_BAR0_SIZE,
         _next_power_of_two(required_size),
     )
+
+
+def _get_public_cxl_rpc_layout() -> dict[str, int]:
+    doorbell_region_bytes = _align_up(
+        (_CXL_RPC_MAX_CLIENTS + _CXL_RPC_RESERVED_DOORBELL_SLOTS)
+        * _CXL_RPC_DOORBELL_SLOT_BYTES,
+        0x1000,
+    )
+    metadata_offset = doorbell_region_bytes
+    request_data_offset = _align_up(
+        metadata_offset + _CXL_RPC_METADATA_Q_BYTES, 0x1000
+    )
+    response_data_offset = _align_up(
+        request_data_offset + _CXL_RPC_REQUEST_DATA_BYTES, 0x1000
+    )
+    flag_offset = _align_up(
+        response_data_offset + _CXL_RPC_RESPONSE_DATA_BYTES, 0x1000
+    )
+
+    if flag_offset + _CXL_RPC_FLAG_BYTES > _CXL_RPC_CLIENT_REGION_SIZE:
+        raise ValueError("Public CXL RPC layout no longer fits in one client region")
+
+    return {
+        "doorbell_offset": 0,
+        "doorbell_region_bytes": doorbell_region_bytes,
+        "metadata_offset": metadata_offset,
+        "metadata_entries": _CXL_RPC_METADATA_Q_ENTRIES,
+        "metadata_bytes": _CXL_RPC_METADATA_Q_BYTES,
+        "request_data_offset": request_data_offset,
+        "request_data_bytes": _CXL_RPC_REQUEST_DATA_BYTES,
+        "response_data_offset": response_data_offset,
+        "response_data_bytes": _CXL_RPC_RESPONSE_DATA_BYTES,
+        "flag_offset": flag_offset,
+    }
+
+
+_CXL_RPC_PUBLIC_LAYOUT = _get_public_cxl_rpc_layout()
 
 
 class X86Board(AbstractSystemBoard, KernelDiskWorkload):
@@ -224,7 +280,7 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         # Place CXL memory starting at 4GB and keep software-visible addresses
         # aligned to this direct range (NUMA/system-memory path).
         cxl_mem_size = cxl_dram.get_size()
-        cxl_mem_range = AddrRange(Addr(0x100000000), size=cxl_mem_size)
+        cxl_mem_range = AddrRange(Addr(_CXL_RPC_BASE_ADDR), size=cxl_mem_size)
         cxl_dram.set_memory_range([cxl_mem_range])
         cxl_mem_ctrl = self.pc.south_bridge.cxl_device
         cxl_mem_ctrl.connectMemory(cxl_mem_range, cxl_dram)
@@ -238,16 +294,42 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         else:
             cxl_mem_ctrl.configCXL(Latency("60ns"), 36)
 
-        # CPU-to-CPU mode uses the server-facing doorbell at region 0 base.
-        # Keep a narrow window so client metadata/response traffic
-        # (also in CXL memory) is not treated as doorbell writes.
-        doorbell_range = AddrRange(0x100000000, size='4kB')
+        rpc_layout = _CXL_RPC_PUBLIC_LAYOUT
+        rpc_base = _CXL_RPC_BASE_ADDR
+        metadata_addr = rpc_base + rpc_layout["metadata_offset"]
+        doorbell_range = AddrRange(
+            rpc_base + rpc_layout["doorbell_offset"],
+            size=rpc_layout["doorbell_region_bytes"],
+        )
+        if rpc_base + rpc_layout["doorbell_region_bytes"] > metadata_addr:
+            raise ValueError(
+                "RPC doorbell region overlaps metadata queue in board layout"
+            )
 
         self.rpc_engine = CXLRPCEngine()
         self.rpc_engine.doorbell_range = doorbell_range
         self.rpc_engine.auto_register = True
-
-        # Use a single server doorbell segment at region 0.
+        self.rpc_engine.default_node_id = 0
+        self.rpc_engine.default_doorbell_addr = (
+            rpc_base + rpc_layout["doorbell_offset"]
+        )
+        self.rpc_engine.default_metadata_queue_addr = metadata_addr
+        self.rpc_engine.default_metadata_queue_entries = rpc_layout[
+            "metadata_entries"
+        ]
+        self.rpc_engine.default_request_data_addr = (
+            rpc_base + rpc_layout["request_data_offset"]
+        )
+        self.rpc_engine.default_request_data_capacity = rpc_layout[
+            "request_data_bytes"
+        ]
+        self.rpc_engine.default_response_data_addr = (
+            rpc_base + rpc_layout["response_data_offset"]
+        )
+        self.rpc_engine.default_response_data_capacity = rpc_layout[
+            "response_data_bytes"
+        ]
+        self.rpc_engine.default_flag_addr = rpc_base + rpc_layout["flag_offset"]
 
         # Attach to CXLMemCtrl
         cxl_mem_ctrl.rpc_engine = self.rpc_engine

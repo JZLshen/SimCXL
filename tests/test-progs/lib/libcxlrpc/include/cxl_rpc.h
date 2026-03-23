@@ -252,10 +252,11 @@ int cxl_consume_next_response(cxl_connection_t *conn,
  * Payload view semantics:
  *   - Inline request: out_data_view points to metadata entry bytes [8..15].
  *   - Non-inline request: bytes [8..15] carry an absolute logical payload
- *     address inside the shared CXL aperture. The payload is first copied
- *     into a connection-local staging buffer, then out_data_view points to
- *     that local buffer.
- *   Lifetime is valid until this connection performs the next request poll.
+ *     address inside the shared CXL aperture. out_data_view points directly
+ *     to that shared payload region after the library has invalidated and
+ *     prefetched it for read-side consumption.
+ *   Callers should consume the returned view before performing the next
+ *   request poll on the same connection.
  *
  * @param out_data_view Out: payload view pointer (inline or request_data)
  * @param out_len       Out: exact payload size from metadata

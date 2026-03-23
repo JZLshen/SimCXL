@@ -6,7 +6,6 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdarg.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -117,48 +116,6 @@ typedef struct {
 
 static cxl_ce_shared_state_t g_cxl_ce = {
 };
-
-static inline int
-cxl_ce_env_flag_enabled(const char *name)
-{
-    const char *env = getenv(name);
-    return (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
-}
-
-static int
-cxl_ce_debug_enabled(void)
-{
-    static int initialized = 0;
-    static int enabled = 0;
-
-    if (!initialized) {
-        const char *lib_debug = getenv("CXL_RPC_LIB_DEBUG");
-
-        if (lib_debug) {
-            enabled = cxl_ce_env_flag_enabled("CXL_RPC_LIB_DEBUG");
-        } else {
-            enabled = cxl_ce_env_flag_enabled("CXL_RPC_PROGRESS_DEBUG");
-        }
-        initialized = 1;
-    }
-
-    return enabled;
-}
-
-static void
-cxl_ce_debugf(const char *fmt, ...)
-{
-    va_list ap;
-
-    if (!cxl_ce_debug_enabled())
-        return;
-
-    va_start(ap, fmt);
-    fprintf(stderr, "[libcxlrpc][CE] ");
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
-    va_end(ap);
-}
 
 static int
 cmp_str_ptrs(const void *a, const void *b)
@@ -1052,6 +1009,8 @@ cxl_connection_init_runtime_defaults(cxl_connection_t *conn)
     conn->mq_prefetch_start_line = 0;
     conn->mq_prefetch_nr_lines = 0;
     conn->mq_prefetch_window_valid = 0;
+    conn->mq_payload_prepared_mask = 0;
+    conn->mq_payload_next_probe_slot = 1;
     conn->req_entry_offsets = NULL;
     conn->req_entry_sizes = NULL;
     conn->req_entry_next = NULL;
@@ -1580,7 +1539,6 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
 {
     cxl_ce_channel_state_t *chan = NULL;
     volatile uint8_t *bar0 = NULL;
-    const char *submit_mode = "start";
     uint64_t dst_flag_phys = 0;
     uint64_t dst_resp_phys0 = 0;
     uint64_t dst_resp_phys1 = 0;
@@ -1603,7 +1561,6 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
     size_t page_index = 0;
     size_t page_off = 0;
     size_t page_size = 0;
-    size_t resp_segment_count = 0;
 
     chan = cxl_copyengine_get_assigned_channel(conn);
     if (chan->poisoned)
@@ -1665,7 +1622,6 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
     if (page_off + first_len > page_size)
         first_len = page_size - page_off;
     second_len = resp_transfer_size - first_len;
-    resp_segment_count = (second_len > 0) ? 2u : 1u;
     if (cxl_copyengine_translate_peer_response_logical(
             conn,
             logical_resp_addr,
@@ -1737,35 +1693,6 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
      */
     __asm__ __volatile__("sfence" ::: "memory");
 
-    if (cxl_ce_debug_enabled()) {
-        cxl_ce_debugf("submit_response rpc_id=%u slot=%zu dst_resp_offset=%zu resp_transfer_size=%zu resp_segments=%zu dst_flag_phys=%#llx chain_started=%d",
-                      rpc_id,
-                      slot,
-                      dst_resp_offset,
-                      resp_transfer_size,
-                      resp_segment_count,
-                      (unsigned long long)dst_flag_phys,
-                      chan->chain_started);
-        cxl_ce_debugf("submit_response seg[0] src_phys=%#llx src_off=0 dst_phys=%#llx len=%u next=%#llx",
-                      (unsigned long long)resp_desc0->src,
-                      (unsigned long long)resp_desc0->dest,
-                      resp_desc0->len,
-                      (unsigned long long)resp_desc0->next);
-        if (second_len > 0) {
-            cxl_ce_debugf("submit_response seg[1] src_phys=%#llx src_off=%zu dst_phys=%#llx len=%u next=%#llx",
-                          (unsigned long long)resp_desc1->src,
-                          first_len,
-                          (unsigned long long)resp_desc1->dest,
-                          resp_desc1->len,
-                          (unsigned long long)resp_desc1->next);
-        }
-        cxl_ce_debugf("submit_response flag_desc src_phys=%#llx dst_phys=%#llx len=%u desc_phys=%#llx",
-                      (unsigned long long)flag_desc->src,
-                      (unsigned long long)flag_desc->dest,
-                      flag_desc->len,
-                      (unsigned long long)flag_desc_phys);
-    }
-
     if (chan->chain_started) {
         if (!chan->last_desc) {
             if (!g_cxl_ce.warned) {
@@ -1780,7 +1707,6 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
             return 0;
         }
         chan->last_desc->next = desc_phys0;
-        submit_mode = "append";
         cxl_ce_mmio_write8(bar0,
                            chan->chan_mmio_base + CXL_CE_CHAN_COMMAND,
                            CXL_CE_CMD_APPEND_DMA);
@@ -1798,14 +1724,5 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
     conn->ce_chain_started = chan->chain_started;
     conn->ce_next_slot = chan->next_slot;
     conn->ce_last_desc = chan->last_desc;
-    if (cxl_ce_debug_enabled()) {
-        cxl_ce_debugf("submit_response queued rpc_id=%u slot=%zu first_desc=%#llx last_desc=%#llx next_slot=%zu mode=%s",
-                      rpc_id,
-                      slot,
-                      (unsigned long long)desc_phys0,
-                      (unsigned long long)flag_desc_phys,
-                      chan->next_slot,
-                      submit_mode);
-    }
     return 1;
 }

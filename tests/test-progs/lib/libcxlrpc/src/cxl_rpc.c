@@ -31,24 +31,7 @@ cxl_lib_debug_enabled(void)
     static int initialized = 0;
     static int enabled = 0;
     if (!initialized) {
-        const char *lib_debug = getenv("CXL_RPC_LIB_DEBUG");
-        if (lib_debug) {
-            enabled = cxl_env_flag_enabled("CXL_RPC_LIB_DEBUG");
-        } else {
-            enabled = cxl_env_flag_enabled("CXL_RPC_PROGRESS_DEBUG");
-        }
-        initialized = 1;
-    }
-    return enabled;
-}
-
-static int
-cxl_lib_trace_polls_enabled(void)
-{
-    static int initialized = 0;
-    static int enabled = 0;
-    if (!initialized) {
-        enabled = cxl_env_flag_enabled("CXL_RPC_LIB_TRACE_POLLS");
+        enabled = cxl_env_flag_enabled("CXL_RPC_LIB_DEBUG");
         initialized = 1;
     }
     return enabled;
@@ -85,6 +68,7 @@ cxl_lib_errorf(const char *fmt, ...)
 #define CXL_MQ_INVALIDATE_PREFETCHED 1
 #define CXL_BOOTSTRAP_LEN_MAGIC 0xFFFF0000u
 #define CXL_BOOTSTRAP_OP_REGISTER_DOORBELL 0x0001u
+#define CXL_BOOTSTRAP_OP_REGISTER_DOORBELL_PAGE_BASE 0x0200u
 #define CXL_BOOTSTRAP_OP_REGISTER_METADATA_PAGE_BASE 0x0100u
 
 static inline size_t
@@ -248,21 +232,12 @@ cxl_send_controller_bootstrap_doorbell(cxl_connection_t *conn,
                                        uint64_t data)
 {
     uint8_t doorbell_buf[16] __attribute__((aligned(16)));
-    uint64_t header_lo = 0;
 
     if (!conn || !conn->doorbell)
         return -1;
 
     cxl_build_doorbell(doorbell_buf, CXL_METHOD_REQUEST, 1,
                        bootstrap_len, conn->addrs.node_id, 0, data);
-    memcpy(&header_lo, doorbell_buf, sizeof(header_lo));
-    cxl_lib_debugf("bootstrap publish doorbell=%p node_id=%u len=%#x "
-                   "header_lo=%#llx data=%#llx",
-                   (void *)conn->doorbell,
-                   (unsigned)conn->addrs.node_id,
-                   (unsigned)bootstrap_len,
-                   (unsigned long long)header_lo,
-                   (unsigned long long)data);
     cxl_publish_doorbell_raw(conn->doorbell, doorbell_buf);
     return 0;
 }
@@ -271,31 +246,49 @@ static int
 cxl_bootstrap_controller_translation(cxl_connection_t *conn,
                                      size_t metadata_clear_size)
 {
-    uint64_t observed_doorbell = 0;
+    size_t doorbell_page_count = 0;
 
     if (!conn || !conn->doorbell || !conn->metadata_queue)
         return -1;
-
-    if (cxl_rpc_virt_to_phys_local((const void *)conn->doorbell,
-                                   &observed_doorbell) == 0) {
-        cxl_lib_debugf("bootstrap observed doorbell gpa=%#llx logical=%#llx "
-                       "metadata=%#llx node_id=%u",
-                       (unsigned long long)observed_doorbell,
-                       (unsigned long long)conn->addrs.doorbell_addr,
-                       (unsigned long long)conn->addrs.metadata_queue_addr,
-                       (unsigned)conn->addrs.node_id);
-    } else {
-        cxl_lib_debugf("bootstrap doorbell gpa unavailable before first "
-                       "publish logical=%#llx node_id=%u",
-                       (unsigned long long)conn->addrs.doorbell_addr,
-                       (unsigned)conn->addrs.node_id);
-    }
 
     if (cxl_send_controller_bootstrap_doorbell(
             conn,
             CXL_BOOTSTRAP_LEN_MAGIC | CXL_BOOTSTRAP_OP_REGISTER_DOORBELL,
             0) != 0) {
         return -1;
+    }
+
+    if (conn->addrs.metadata_queue_addr > conn->addrs.doorbell_addr) {
+        const uint64_t doorbell_bytes =
+            conn->addrs.metadata_queue_addr - conn->addrs.doorbell_addr;
+        doorbell_page_count =
+            (size_t)((doorbell_bytes + CXL_METADATA_TRANSLATION_PAGE_BYTES - 1u) /
+                     CXL_METADATA_TRANSLATION_PAGE_BYTES);
+    }
+    for (size_t page_index = 0; page_index < doorbell_page_count; ++page_index) {
+        volatile uint8_t *page_ptr =
+            conn->doorbell +
+            page_index * CXL_METADATA_TRANSLATION_PAGE_BYTES;
+        uint64_t observed_page = 0;
+        if (cxl_rpc_virt_to_phys_local((const void *)page_ptr,
+                                       &observed_page) != 0) {
+            cxl_lib_errorf("bootstrap failed to resolve doorbell page gpa "
+                           "page=%zu logical=%#llx",
+                           page_index,
+                           (unsigned long long)(conn->addrs.doorbell_addr +
+                               page_index * CXL_METADATA_TRANSLATION_PAGE_BYTES));
+            return -1;
+        }
+        observed_page &= ~((uint64_t)CXL_METADATA_TRANSLATION_PAGE_BYTES - 1u);
+
+        if (cxl_send_controller_bootstrap_doorbell(
+                conn,
+                CXL_BOOTSTRAP_LEN_MAGIC |
+                    (CXL_BOOTSTRAP_OP_REGISTER_DOORBELL_PAGE_BASE |
+                     (uint32_t)page_index),
+                observed_page) != 0) {
+            return -1;
+        }
     }
 
     size_t page_count =
@@ -316,12 +309,6 @@ cxl_bootstrap_controller_translation(cxl_connection_t *conn,
             return -1;
         }
         observed_page &= ~((uint64_t)CXL_METADATA_TRANSLATION_PAGE_BYTES - 1u);
-        cxl_lib_debugf("bootstrap metadata page=%zu logical=%#llx "
-                       "observed=%#llx",
-                       page_index,
-                       (unsigned long long)(conn->addrs.metadata_queue_addr +
-                           page_index * CXL_METADATA_TRANSLATION_PAGE_BYTES),
-                       (unsigned long long)observed_page);
 
         if (cxl_send_controller_bootstrap_doorbell(
                 conn,
@@ -332,13 +319,6 @@ cxl_bootstrap_controller_translation(cxl_connection_t *conn,
             return -1;
         }
     }
-
-    cxl_lib_debugf("controller bootstrap complete doorbell=%#llx metadata=%#llx "
-                   "pages=%zu node_id=%u",
-                   (unsigned long long)conn->addrs.doorbell_addr,
-                   (unsigned long long)conn->addrs.metadata_queue_addr,
-                   page_count,
-                   (unsigned)conn->addrs.node_id);
     return 0;
 }
 
@@ -510,6 +490,190 @@ static int cxl_rpc_phys_range_valid(const cxl_context_t *ctx,
         return 0;
 
     return 1;
+}
+
+static inline void
+cxl_invalidate_range_for_load(volatile uint8_t *ptr, size_t size)
+{
+    if (!ptr || size == 0)
+        return;
+
+    uintptr_t line_start = ((uintptr_t)ptr) & ~((uintptr_t)63);
+    uintptr_t line_end = (((uintptr_t)ptr + size) + 63u) & ~((uintptr_t)63);
+    for (uintptr_t line = line_start; line < line_end; line += 64u) {
+        cxl_invalidate_cacheline((volatile uint8_t *)line);
+    }
+    cxl_invalidate_load_barrier();
+}
+
+static inline void
+cxl_prefetch_range_ro(const volatile uint8_t *ptr, size_t size)
+{
+    if (!ptr || size == 0)
+        return;
+
+    uintptr_t line_start = ((uintptr_t)ptr) & ~((uintptr_t)63);
+    uintptr_t line_end = (((uintptr_t)ptr + size) + 63u) & ~((uintptr_t)63);
+    for (uintptr_t line = line_start; line < line_end; line += 64u) {
+        __builtin_prefetch((const void *)line, 0, 3);
+    }
+}
+
+static inline void
+cxl_prepare_payload_for_direct_read(volatile uint8_t *ptr, size_t size)
+{
+    cxl_invalidate_range_for_load(ptr, size);
+    cxl_prefetch_range_ro(ptr, size);
+}
+
+static inline uint32_t
+cxl_mq_line_slot_count(const cxl_connection_t *conn,
+                       uint32_t line_idx,
+                       uint32_t mq_entries_per_line)
+{
+    uint32_t line_base = 0;
+    uint32_t remaining = 0;
+
+    if (!conn || mq_entries_per_line == 0 || conn->mq_entries == 0)
+        return 0;
+
+    line_base = line_idx * mq_entries_per_line;
+    if (line_base >= conn->mq_entries)
+        return 0;
+
+    remaining = conn->mq_entries - line_base;
+    if (remaining > mq_entries_per_line)
+        remaining = mq_entries_per_line;
+    return remaining;
+}
+
+static inline void
+cxl_mq_payload_prepare_reset_for_head(cxl_connection_t *conn,
+                                      uint32_t mq_entries_per_line)
+{
+    uint32_t slot_in_line = 0;
+    uint32_t line_idx = 0;
+    uint32_t line_slot_count = 0;
+    uint32_t next_probe_slot = 0;
+
+    if (!conn || mq_entries_per_line == 0 || conn->mq_entries == 0) {
+        if (conn) {
+            conn->mq_payload_prepared_mask = 0;
+            conn->mq_payload_next_probe_slot = 0;
+        }
+        return;
+    }
+
+    slot_in_line = conn->mq_head % mq_entries_per_line;
+    line_idx = conn->mq_head / mq_entries_per_line;
+    line_slot_count = cxl_mq_line_slot_count(conn, line_idx,
+                                             mq_entries_per_line);
+    next_probe_slot = slot_in_line + 1u;
+    if (next_probe_slot > line_slot_count)
+        next_probe_slot = line_slot_count;
+
+    conn->mq_payload_prepared_mask = 0;
+    conn->mq_payload_next_probe_slot = (uint8_t)next_probe_slot;
+}
+
+static inline void
+cxl_mq_payload_prepare_after_advance(cxl_connection_t *conn,
+                                     uint32_t consumed_head_idx,
+                                     uint32_t mq_entries_per_line)
+{
+    uint32_t consumed_slot = 0;
+    uint32_t consumed_line_idx = 0;
+    uint32_t next_line_idx = 0;
+
+    if (!conn || mq_entries_per_line == 0 || conn->mq_entries == 0)
+        return;
+
+    consumed_slot = consumed_head_idx % mq_entries_per_line;
+    conn->mq_payload_prepared_mask &=
+        (uint8_t)~(uint8_t)(1u << consumed_slot);
+
+    consumed_line_idx = consumed_head_idx / mq_entries_per_line;
+    next_line_idx = conn->mq_head / mq_entries_per_line;
+    if (conn->mq_head <= consumed_head_idx ||
+        next_line_idx != consumed_line_idx) {
+        cxl_mq_payload_prepare_reset_for_head(conn, mq_entries_per_line);
+    }
+}
+
+static void
+cxl_prepare_future_payloads_same_line(cxl_connection_t *conn,
+                                      uint32_t head_idx,
+                                      uint32_t head_line_idx,
+                                      uint8_t expected_phase,
+                                      uint32_t mq_entries_per_line)
+{
+    volatile uint8_t *entry_line = NULL;
+    uint32_t line_slot_count = 0;
+    uint32_t current_slot = 0;
+    uint32_t start_slot = 0;
+
+    if (!conn || !conn->metadata_queue || !conn->ctx ||
+        mq_entries_per_line == 0) {
+        return;
+    }
+
+    line_slot_count = cxl_mq_line_slot_count(conn, head_line_idx,
+                                             mq_entries_per_line);
+    if (line_slot_count == 0)
+        return;
+
+    current_slot = head_idx % mq_entries_per_line;
+    start_slot = conn->mq_payload_next_probe_slot;
+    if (start_slot < current_slot + 1u)
+        start_slot = current_slot + 1u;
+    if (start_slot >= line_slot_count) {
+        conn->mq_payload_next_probe_slot = (uint8_t)line_slot_count;
+        return;
+    }
+
+    entry_line = conn->metadata_queue + ((size_t)head_line_idx * 64u);
+    for (uint32_t slot = start_slot; slot < line_slot_count; ++slot) {
+        volatile uint8_t *future_entry =
+            entry_line + ((size_t)slot * CXL_METADATA_ENTRY_SIZE);
+        uint64_t future_lo = *(volatile uint64_t *)future_entry;
+        uint8_t future_phase = (uint8_t)((future_lo >> 2) & 0x01u);
+
+        if (future_phase != expected_phase) {
+            conn->mq_payload_next_probe_slot = (uint8_t)slot;
+            return;
+        }
+
+        conn->mq_payload_next_probe_slot = (uint8_t)(slot + 1u);
+
+        uint8_t future_method = (uint8_t)(future_lo & 0x01u);
+        uint8_t future_inline = (uint8_t)((future_lo >> 1) & 0x01u);
+        uint32_t future_len = (uint32_t)((future_lo >> 3) & 0xFFFFFFFFu);
+        uint16_t future_rid =
+            (uint16_t)((future_lo >> 49) & CXL_RPC_ID_MASK);
+
+        if (future_method != CXL_METHOD_REQUEST || future_rid == 0 ||
+            future_inline) {
+            continue;
+        }
+
+        if (future_len == 0 || future_len > CXL_REQ_PAYLOAD_SOFT_MAX) {
+            continue;
+        }
+
+        uint64_t future_addr = *(volatile uint64_t *)(future_entry + 8);
+        if (!cxl_rpc_phys_range_valid(conn->ctx, future_addr,
+                                      (size_t)future_len)) {
+            continue;
+        }
+
+        volatile uint8_t *payload_ptr =
+            cxl_rpc_phys_to_virt(conn->ctx, future_addr);
+        if (!payload_ptr)
+            continue;
+
+        cxl_prepare_payload_for_direct_read(payload_ptr, (size_t)future_len);
+        conn->mq_payload_prepared_mask |= (uint8_t)(1u << slot);
+    }
 }
 
 /* ================================================================
@@ -875,10 +1039,20 @@ connection_finalize_setup(cxl_connection_t *conn,
                           size_t metadata_clear_size,
                           int bootstrap_owner)
 {
+    size_t doorbell_span = 0;
+
     if (!conn)
         return -1;
 
     connection_init_virt_ptrs(conn);
+    if (conn->addrs.metadata_queue_addr > conn->addrs.doorbell_addr) {
+        doorbell_span = (size_t)(conn->addrs.metadata_queue_addr -
+                                 conn->addrs.doorbell_addr);
+    }
+    if (doorbell_span > 0 && conn->doorbell) {
+        cxl_prefault_each_page_ro_and_flush_touched(conn->doorbell,
+                                                    doorbell_span);
+    }
     cxl_prefault_each_page_ro_and_flush_touched(conn->metadata_queue,
                                                 metadata_clear_size);
     cxl_prefault_each_page_ro_and_flush_touched(conn->response_data,
@@ -1005,6 +1179,7 @@ cxl_connection_create_fixed_internal(cxl_context_t *ctx,
     conn->addrs = *addrs;
     conn->mq_entries = mq_entries;
     conn->mq_phase = 1;  /* Must match RPC engine's initial phase (true=1) */
+    cxl_mq_payload_prepare_reset_for_head(conn, 64u / CXL_METADATA_ENTRY_SIZE);
     if (cxl_req_id_allocator_init(conn) != 0) {
         cxl_connection_destroy(conn);
         return NULL;
@@ -1379,13 +1554,6 @@ int cxl_poll_request(cxl_connection_t *conn,
         goto out;
     }
 
-    if (cxl_lib_trace_polls_enabled()) {
-        cxl_lib_debugf("poll_request begin mq_head=%u mq_phase=%u metadata=%#llx request_region=%#llx",
-                       conn->mq_head, conn->mq_phase,
-                       (unsigned long long)conn->addrs.metadata_queue_addr,
-                       (unsigned long long)conn->addrs.request_data_addr);
-    }
-
     /* Read metadata queue entry at head position */
     uint32_t head_idx = conn->mq_head;
     volatile uint8_t *entry = conn->metadata_queue +
@@ -1402,15 +1570,6 @@ int cxl_poll_request(cxl_connection_t *conn,
     uint64_t meta_hi = 0;
     uint8_t entry_phase = (uint8_t)((meta_lo >> 2) & 0x01u);
     uint8_t expected_phase = conn->mq_phase & 0x01;
-
-    if (cxl_lib_trace_polls_enabled()) {
-        cxl_lib_debugf("poll_request probe head=%u meta_lo=%#llx flags4=%#x entry_phase=%u expected_phase=%u",
-                       head_idx,
-                       (unsigned long long)meta_lo,
-                       (unsigned)(meta_lo & 0x0Fu),
-                       (unsigned)entry_phase,
-                       (unsigned)expected_phase);
-    }
 
     /* Check phase bit: new entry has phase matching our expected phase */
     if (entry_phase != expected_phase) {
@@ -1492,6 +1651,8 @@ int cxl_poll_request(cxl_connection_t *conn,
     uint32_t mq_len = (uint32_t)((meta_lo >> 3) & 0xFFFFFFFFu);
     uint16_t nid = (uint16_t)((meta_lo >> 35) & CXL_NODE_ID_MASK);
     uint16_t rid = (uint16_t)((meta_lo >> 49) & CXL_RPC_ID_MASK);
+    uint32_t slot_in_line = (mq_entries_per_line > 0) ?
+                            (head_idx % mq_entries_per_line) : 0;
 
     if (node_id) *node_id = nid;
     if (rpc_id)  *rpc_id = rid;
@@ -1504,6 +1665,8 @@ int cxl_poll_request(cxl_connection_t *conn,
                                         mq_entries_per_line,
                                         mq_total_lines,
                                         mq_invalidate_consumed);
+        cxl_mq_payload_prepare_after_advance(conn, head_idx,
+                                             mq_entries_per_line);
         ret = -1;
         goto out;
     }
@@ -1517,13 +1680,16 @@ int cxl_poll_request(cxl_connection_t *conn,
         /* Non-inline: bytes 8-15 contain an absolute logical payload address. */
         uint64_t data_addr = meta_hi;
         size_t msg_len = (size_t)mq_len;
+        const uint8_t prepared_bit = (uint8_t)(1u << slot_in_line);
         if (msg_len == 0 ||
-            msg_len > sizeof(conn->request_local_buf) ||
+            msg_len > CXL_REQ_PAYLOAD_SOFT_MAX ||
             !cxl_rpc_phys_range_valid(conn->ctx, data_addr, msg_len)) {
             cxl_advance_mq_head_with_policy(conn, head_idx, head_line_idx,
                                             mq_entries_per_line,
                                             mq_total_lines,
                                             mq_invalidate_consumed);
+            cxl_mq_payload_prepare_after_advance(conn, head_idx,
+                                                 mq_entries_per_line);
             ret = -1;
             goto out;
         }
@@ -1531,27 +1697,10 @@ int cxl_poll_request(cxl_connection_t *conn,
         volatile uint8_t *data_ptr = cxl_rpc_phys_to_virt(conn->ctx,
                                                           data_addr);
         if (data_ptr) {
-            const volatile uint8_t *payload_ptr = data_ptr;
-
-            /* Invalidate payload cacheline(s) before demand-load. */
-            uintptr_t line_start = ((uintptr_t)payload_ptr) & ~((uintptr_t)63);
-            uintptr_t line_end =
-                (((uintptr_t)payload_ptr + msg_len) + 63u) &
-                ~((uintptr_t)63);
-            for (uintptr_t line = line_start; line < line_end;
-                 line += 64u) {
-                __asm__ __volatile__(
-                    "clflushopt (%0)"
-                    :
-                    : "r"((void *)line)
-                    : "memory");
+            if ((conn->mq_payload_prepared_mask & prepared_bit) == 0) {
+                cxl_prepare_payload_for_direct_read(data_ptr, msg_len);
             }
-            cxl_invalidate_load_barrier();
-            if (msg_len > 0)
-                memcpy(conn->request_local_buf,
-                       (const void *)payload_ptr,
-                       msg_len);
-            *out_data_view = (const void *)conn->request_local_buf;
+            *out_data_view = (const void *)data_ptr;
             *out_len = msg_len;
         } else {
             ret = -1;
@@ -1559,11 +1708,17 @@ int cxl_poll_request(cxl_connection_t *conn,
         }
     }
 
+    cxl_prepare_future_payloads_same_line(conn, head_idx, head_line_idx,
+                                          expected_phase,
+                                          mq_entries_per_line);
+
     /* Advance head */
     cxl_advance_mq_head_with_policy(conn, head_idx, head_line_idx,
                                     mq_entries_per_line,
                                     mq_total_lines,
                                     mq_invalidate_consumed);
+    cxl_mq_payload_prepare_after_advance(conn, head_idx,
+                                         mq_entries_per_line);
 
     ret = 1;
 out:
@@ -1715,19 +1870,6 @@ int cxl_send_response(cxl_connection_t *conn,
     entry_size = cxl_response_entry_size(len);
     if (cxl_pick_peer_response_offset(conn, entry_size, &offset) != 0)
         return -1;
-
-    if (cxl_lib_debug_enabled()) {
-        size_t next_offset = offset + entry_size;
-        if (next_offset >= conn->peer_response_data_size)
-            next_offset = 0;
-        cxl_lib_debugf("send_response rpc_id=%u len=%zu entry_size=%zu offset=%zu next_offset=%zu flag_addr=%#llx",
-                       rpc_id,
-                       len,
-                       entry_size,
-                       offset,
-                       next_offset,
-                       (unsigned long long)conn->peer_flag_addr);
-    }
 
     /*
      * Preferred path: asynchronous CopyEngine offload.
