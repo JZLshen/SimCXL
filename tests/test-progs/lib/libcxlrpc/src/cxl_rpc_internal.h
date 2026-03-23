@@ -48,6 +48,8 @@ struct cxl_connection {
     uint32_t mq_prefetch_start_line;
     uint32_t mq_prefetch_nr_lines;
     uint8_t mq_prefetch_window_valid;
+    uint8_t mq_payload_prepared_mask;
+    uint8_t mq_payload_next_probe_slot;
 
     uint16_t rpc_id_seq_mask;
     uint16_t rpc_id_next;
@@ -74,10 +76,11 @@ struct cxl_connection {
     volatile uint8_t *peer_flag;
     size_t peer_resp_write_offset;
     int resp_tx_ready;
-    uint8_t request_local_buf[CXL_REQ_PAYLOAD_SOFT_MAX + 1];
 
     int ce_lane_bind_valid;
+    int ce_bind_lane_index_valid;
     size_t ce_bind_engine_index;
+    size_t ce_bind_lane_index;
     uint32_t ce_bind_channel_id;
 
     int ce_init_attempted;
