@@ -149,14 +149,10 @@ struct ClientConnection {
 };
 
 struct DoorbellWriteProbe {
+    // True only when this packet fully covers one 16B doorbell entry and the
+    // entry has already been parsed for reuse by the controller fast path.
     bool should_probe = false;
-    bool matched_connection = false;
-    bool covers_doorbell = false;
-    bool parsed_entry = false;
     Addr doorbell_addr = 0;
-    Addr logical_doorbell_addr = 0;
-    size_t doorbell_offset = 0;
-    uint32_t slot_index = 0;
     const ClientConnection* connection = nullptr;
     DoorbellEntry entry;
 };
@@ -170,11 +166,18 @@ struct DoorbellWriteProbe {
 class CXLRPCEngine : public SimObject
 {
   private:
+    struct ObservedDoorbellPageBinding
+    {
+        Addr logicalPage = 0;
+        ClientConnection* connection = nullptr;
+    };
+
     // Logical public doorbell span configured by the board layout.
     AddrRange doorbellRange;
 
     // Registered client connections (doorbell_addr -> connection)
     std::unordered_map<Addr, ClientConnection> connections;
+    std::unordered_map<Addr, ObservedDoorbellPageBinding> observedDoorbellPages;
 
     // Auto-register parameters
     bool autoRegister;
@@ -190,13 +193,14 @@ class CXLRPCEngine : public SimObject
 
     // Find connection whose doorbell slot overlaps [addr, addr + size).
     // base_addr is set to the matched observed slot start address.
-    // logical_addr is set to the matched logical slot start address.
     ClientConnection* findConnectionForAddr(
-        Addr addr, uint32_t size, Addr& base_addr,
-        Addr* logical_addr = nullptr, uint32_t* slot_index = nullptr);
+        Addr addr, uint32_t size, Addr& base_addr);
     const ClientConnection* findConnectionForAddr(
-        Addr addr, uint32_t size, Addr& base_addr,
-        Addr* logical_addr = nullptr, uint32_t* slot_index = nullptr) const;
+        Addr addr, uint32_t size, Addr& base_addr) const;
+    void bindDoorbellPage(ClientConnection& conn,
+                          Addr logical_page,
+                          Addr observed_page);
+    void unbindDoorbellPages(const ClientConnection& conn);
     Addr resolveMetadataSlotAddr(const ClientConnection& conn,
                                  uint32_t slot) const;
     std::array<std::vector<bool>, 4> remapByteEnableMasks;
@@ -210,7 +214,6 @@ class CXLRPCEngine : public SimObject
         statistics::Scalar doorbellWrites;
         statistics::Scalar requestsForwarded;
         statistics::Scalar headUpdatesReceived;
-        statistics::Scalar invalidHeadUpdates;
         statistics::Scalar queueFullEvents;
         statistics::Scalar metadataQueueWrites;
     };
@@ -242,7 +245,7 @@ class CXLRPCEngine : public SimObject
      * @return Handling result (handled / not handled / backpressure)
      */
     DoorbellHandleResult handleDoorbellWrite(
-        PacketPtr pkt, const DoorbellWriteProbe* probe = nullptr);
+        PacketPtr pkt, const DoorbellWriteProbe* probe);
 
     /**
      * Account for a remapped request doorbell that was successfully forwarded
@@ -267,16 +270,15 @@ class CXLRPCEngine : public SimObject
     bool isBootstrapRequest(const DoorbellEntry& entry) const;
     DoorbellHandleResult processBootstrapRequest(
         ClientConnection& conn, Addr doorbell_addr,
-        Addr logical_doorbell_addr, uint32_t slot_index,
         const DoorbellEntry& entry, PacketPtr pkt);
-    bool consumeBootstrapDoorbellBinding(PacketPtr pkt);
+    bool consumeBootstrapDoorbellBinding(PacketPtr pkt,
+                                         const DoorbellWriteProbe& probe);
 
     /**
      * Process a complete doorbell entry (dispatch by method type)
      */
     DoorbellHandleResult processDoorbellEntry(
         ClientConnection& conn, Addr doorbell_addr,
-        Addr logical_doorbell_addr, uint32_t slot_index,
         const DoorbellEntry& entry, PacketPtr pkt);
 
     /**
@@ -285,7 +287,6 @@ class CXLRPCEngine : public SimObject
      */
     DoorbellHandleResult processRequest(
         ClientConnection& conn, Addr doorbell_addr,
-        Addr logical_doorbell_addr, uint32_t slot_index,
         const DoorbellEntry& entry, PacketPtr pkt);
 
     /**
@@ -293,7 +294,6 @@ class CXLRPCEngine : public SimObject
      */
     DoorbellHandleResult processHeadUpdate(
         ClientConnection& conn, Addr doorbell_addr,
-        Addr logical_doorbell_addr, uint32_t slot_index,
         const DoorbellEntry& entry, PacketPtr pkt);
 };
 

@@ -197,47 +197,94 @@ checkpoint_readfile = f"""
 set -u
 CKPT_BOOTSTRAP_MAGIC="CXL_RPC_CKPT_BOOTSTRAP_V2"
 TRIES=300
+CPU_READY=0
 while [ "$TRIES" -gt 0 ]; do
   NPROC="$(nproc 2>/dev/null || echo 1)"
   if [ "$NPROC" -ge "{args.num_cpus}" ]; then
+    CPU_READY=1
     break
   fi
   TRIES=$((TRIES - 1))
   sleep 1
 done
+if [ "$CPU_READY" -ne 1 ]; then
+  echo "[ckpt-guest] ERROR: timed out waiting for ${{NPROC:-0}}/{args.num_cpus} CPUs"
+  m5 fail 101
+fi
 TRIES=300
+SYSTEM_READY=0
 while [ "$TRIES" -gt 0 ]; do
   SYS_STATE="$(systemctl is-system-running 2>/dev/null || true)"
   if systemctl is-active --quiet multi-user.target; then
     if [ "$SYS_STATE" = "running" ] || [ "$SYS_STATE" = "degraded" ]; then
+      SYSTEM_READY=1
       break
     fi
   fi
   TRIES=$((TRIES - 1))
   sleep 1
 done
+if [ "$SYSTEM_READY" -ne 1 ]; then
+  echo "[ckpt-guest] ERROR: timed out waiting for multi-user.target"
+  m5 fail 102
+fi
+TRIES=300
+SYSTEM_QUIESCED=0
+while [ "$TRIES" -gt 0 ]; do
+  JOB_COUNT="$(systemctl list-jobs --no-legend 2>/dev/null | wc -l || echo 1)"
+  TMPFILES_BUSY=0
+  TMPFILES_ACTIVE="none"
+  for svc in \
+    systemd-tmpfiles-setup.service \
+    systemd-tmpfiles-setup-dev.service \
+    systemd-tmpfiles-clean.service
+  do
+    TMPFILES_SUBSTATE="$(systemctl show --property=SubState --value "$svc" 2>/dev/null || true)"
+    case "$TMPFILES_SUBSTATE" in
+      running|start|start-pre|start-post|reload|stop-sigterm|stop-sigkill|stop-post|final-sigterm|final-sigkill)
+        TMPFILES_BUSY=1
+        TMPFILES_ACTIVE="$svc:$TMPFILES_SUBSTATE"
+        break
+        ;;
+    esac
+  done
+  if [ "${{JOB_COUNT:-1}}" -eq 0 ] && [ "$TMPFILES_BUSY" -eq 0 ]; then
+    SYSTEM_QUIESCED=1
+    break
+  fi
+  TRIES=$((TRIES - 1))
+  sleep 1
+done
+if [ "$SYSTEM_QUIESCED" -ne 1 ]; then
+  echo "[ckpt-guest] ERROR: timed out waiting for systemd jobs/tmpfiles to quiesce"
+  m5 fail 107
+fi
+sync
 m5 exit
 
 RESTORE_SCRIPT=/tmp/gem5_restore_script.sh
 RESTORE_TMP=/tmp/gem5_restore_script.sh.new
-RESTORE_ATTEMPTS=3
-while [ "$RESTORE_ATTEMPTS" -gt 0 ]; do
-  /sbin/m5 readfile > "$RESTORE_TMP" 2>/dev/null || true
-  if [ ! -s "$RESTORE_TMP" ]; then
-    rm -f "$RESTORE_TMP"
-    break
-  fi
-  if grep -q "$CKPT_BOOTSTRAP_MAGIC" "$RESTORE_TMP" 2>/dev/null; then
-    rm -f "$RESTORE_TMP"
-    RESTORE_ATTEMPTS=$((RESTORE_ATTEMPTS - 1))
-    continue
-  fi
-  mv -f "$RESTORE_TMP" "$RESTORE_SCRIPT"
-  chmod +x "$RESTORE_SCRIPT"
-  exec /bin/bash "$RESTORE_SCRIPT"
-done
 rm -f "$RESTORE_TMP"
-m5 exit
+if ! /sbin/m5 readfile > "$RESTORE_TMP" 2>/dev/null; then
+  rm -f "$RESTORE_TMP"
+  echo "[ckpt-guest] ERROR: restore readfile failed"
+  m5 fail 103
+fi
+if [ ! -s "$RESTORE_TMP" ]; then
+  rm -f "$RESTORE_TMP"
+  echo "[ckpt-guest] ERROR: restore readfile returned empty payload"
+  m5 fail 104
+fi
+if grep -q "$CKPT_BOOTSTRAP_MAGIC" "$RESTORE_TMP" 2>/dev/null; then
+  rm -f "$RESTORE_TMP"
+  echo "[ckpt-guest] ERROR: restore readfile returned checkpoint bootstrap payload again"
+  m5 fail 105
+fi
+mv -f "$RESTORE_TMP" "$RESTORE_SCRIPT"
+chmod +x "$RESTORE_SCRIPT"
+exec /bin/bash "$RESTORE_SCRIPT"
+echo "[ckpt-guest] ERROR: exec restore script failed"
+m5 fail 106
 """
 
 # Checkpoint saves KVM state, restore will switch CPU

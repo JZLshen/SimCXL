@@ -13,15 +13,11 @@ namespace
 {
 
 bool
-isConsumedHeadUpdateCandidate(PacketPtr pkt, const DoorbellWriteProbe& probe)
+isConsumedHeadUpdateCandidate(const DoorbellWriteProbe& probe)
 {
-    if (!pkt || !pkt->isWrite() || !pkt->hasData() ||
-        !probe.matched_connection || !probe.covers_doorbell ||
-        !probe.parsed_entry) {
-        return false;
-    }
-
-    return probe.entry.method == METHOD_HEAD_UPDATE;
+    return probe.should_probe &&
+           probe.connection != nullptr &&
+           probe.entry.method == METHOD_HEAD_UPDATE;
 }
 
 } // anonymous namespace
@@ -245,22 +241,48 @@ CXLMemCtrl::CXLResponsePort::recvTimingReq(PacketPtr pkt)
         doorbellProbe = ctrl.rpcEngine->probeDoorbellWrite(pkt);
     }
     const bool headUpdateBypassCandidate =
-        doorbellProbe.should_probe &&
-        isConsumedHeadUpdateCandidate(pkt, doorbellProbe);
+        isConsumedHeadUpdateCandidate(doorbellProbe);
 
     auto consumeHeadUpdateDoorbell =
         [&](const char *reason) -> std::optional<bool> {
+        const bool needs_response = pkt->needsResponse();
+        bool reserved_response = false;
+
         if (!headUpdateBypassCandidate) {
             return std::nullopt;
         }
 
+        /*
+         * HEAD_UPDATE bypass still replies with a normal WriteResp. Reserve
+         * response credit here so the response-port accounting stays identical
+         * to the regular admitted-request path.
+         */
+        if (needs_response) {
+            if (outstandingResponses == respQueueLimit) {
+                DPRINTF(CXLMemCtrl,
+                        "Cannot bypass HEAD_UPDATE while stalled (%s) at %#x: "
+                        "response queue full\n",
+                        reason, pkt->getAddr());
+                return std::nullopt;
+            }
+
+            ++outstandingResponses;
+            reserved_response = true;
+            ctrl.stats.rspOutStandDist.sample(outstandingResponses);
+        }
+
         auto dbResult = ctrl.rpcEngine->handleDoorbellWrite(pkt, &doorbellProbe);
         if (dbResult != DoorbellHandleResult::Consumed) {
+            if (reserved_response) {
+                assert(outstandingResponses != 0);
+                --outstandingResponses;
+                ctrl.stats.rspOutStandDist.sample(outstandingResponses);
+            }
             DPRINTF(CXLMemCtrl,
                     "Stalled %s path saw non-consumed HEAD_UPDATE candidate at %#x "
                     "(result=%d)\n",
                     reason, pkt->getAddr(), static_cast<int>(dbResult));
-            return false;
+            return std::nullopt;
         }
 
         DPRINTF(CXLMemCtrl,
@@ -269,7 +291,7 @@ CXLMemCtrl::CXLResponsePort::recvTimingReq(PacketPtr pkt)
 
         Tick receive_delay = pkt->headerDelay + pkt->payloadDelay;
         pkt->headerDelay = pkt->payloadDelay = 0;
-        if (pkt->needsResponse()) {
+        if (needs_response) {
             pkt->makeResponse();
             schedTimingResp(
                 pkt,

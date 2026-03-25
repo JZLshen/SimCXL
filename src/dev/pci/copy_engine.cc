@@ -45,9 +45,6 @@
 #include "dev/pci/copy_engine.hh"
 
 #include <algorithm>
-#include <cstring>
-#include <utility>
-
 #include "base/compiler.hh"
 #include "base/trace.hh"
 #include "debug/DMACopyEngine.hh"
@@ -62,56 +59,6 @@ namespace gem5
 {
 
 using namespace copy_engine_reg;
-
-static void
-dumpCopyBufferHead(const char *phase, int channelId,
-                   const DmaDesc *desc, const uint8_t *buf)
-{
-    if (!phase || !desc || !buf)
-        return;
-
-    uint64_t qword0 = 0;
-    uint64_t qword1 = 0;
-    const size_t copy0 = std::min<size_t>(sizeof(qword0), desc->len);
-    const size_t copy1 = (desc->len > sizeof(qword0)) ?
-        std::min<size_t>(sizeof(qword1), desc->len - sizeof(qword0)) : 0;
-
-    std::memcpy(&qword0, buf, copy0);
-    if (copy1 > 0)
-        std::memcpy(&qword1, buf + sizeof(qword0), copy1);
-
-    DPRINTF(DMACopyEngine,
-            "%s chan=%u len=%u src=%#x dst=%#x qword0=%#x qword1=%#x\n",
-            phase,
-            channelId,
-            desc->len,
-            desc->src,
-            desc->dest,
-            qword0,
-            qword1);
-}
-
-static void
-dumpBufferHead(const char *phase, int channelId,
-               Addr src, Addr dst, uint32_t len, const uint8_t *buf)
-{
-    if (!phase || !buf)
-        return;
-
-    uint64_t qword0 = 0;
-    uint64_t qword1 = 0;
-    const size_t copy0 = std::min<size_t>(sizeof(qword0), len);
-    const size_t copy1 = (len > sizeof(qword0)) ?
-        std::min<size_t>(sizeof(qword1), len - sizeof(qword0)) : 0;
-
-    std::memcpy(&qword0, buf, copy0);
-    if (copy1 > 0)
-        std::memcpy(&qword1, buf + sizeof(qword0), copy1);
-
-    DPRINTF(DMACopyEngine,
-            "%s chan=%u len=%u src=%#x dst=%#x qword0=%#x qword1=%#x\n",
-            phase, channelId, len, src, dst, qword0, qword1);
-}
 
 CopyEngine::CopyEngine(const Params &p)
     : PciDevice(p),
@@ -138,14 +85,10 @@ CopyEngine::CopyEngineChannel::CopyEngineChannel(CopyEngine *_ce, int cid)
       refreshNext(false), latBeforeBegin(ce->params().latBeforeBegin),
       latAfterCompletion(ce->params().latAfterCompletion),
       completionDataReg(0), nextState(Idle),
-      delayedVerifyActive(false),
       fetchCompleteEvent([this]{ fetchDescComplete(); }, name()),
       addrCompleteEvent([this]{ fetchAddrComplete(); }, name()),
       readCompleteEvent([this]{ readCopyBytesComplete(); }, name()),
       writeCompleteEvent([this]{ writeCopyBytesComplete(); }, name()),
-      verifyCompleteEvent([this]{ verifyWriteTargetComplete(); }, name()),
-      delayedVerifyKickEvent([this]{ startDelayedVerify(); }, name()),
-      delayedVerifyCompleteEvent([this]{ delayedVerifyComplete(); }, name()),
       statusCompleteEvent([this]{ writeStatusComplete(); }, name())
 
 {
@@ -156,10 +99,6 @@ CopyEngine::CopyEngineChannel::CopyEngineChannel(CopyEngine *_ce, int cid)
         curDmaDesc = new DmaDesc;
         memset(curDmaDesc, 0, sizeof(DmaDesc));
         copyBuffer = new uint8_t[ce->params().XferCap];
-        verifyBuffer = new uint8_t[ce->params().XferCap];
-        delayedVerifyBuffer = new uint8_t[ce->params().XferCap];
-        verifyAddress = 0;
-        verifyLength = 0;
 }
 
 CopyEngine::~CopyEngine()
@@ -173,8 +112,6 @@ CopyEngine::CopyEngineChannel::~CopyEngineChannel()
 {
     delete curDmaDesc;
     delete [] copyBuffer;
-    delete [] verifyBuffer;
-    delete [] delayedVerifyBuffer;
 }
 
 Port &
@@ -571,8 +508,6 @@ void
 CopyEngine::CopyEngineChannel::readCopyBytesComplete()
 {
     DPRINTF(DMACopyEngine, "Read of bytes to copy complete\n");
-    dumpCopyBufferHead("copyBuffer after read", channelId,
-                       curDmaDesc, copyBuffer);
 
     nextState = DMAWrite;
     if (inDrain()) return;
@@ -598,13 +533,6 @@ CopyEngine::CopyEngineChannel::writeCopyBytesComplete()
 {
     DPRINTF(DMACopyEngine, "Write of bytes to copy complete user1: %#x\n",
             curDmaDesc->user1);
-    dumpCopyBufferHead("copyBuffer after write", channelId,
-                       curDmaDesc, copyBuffer);
-
-    if (debug::DMACopyEngine && curDmaDesc->len > 0) {
-        verifyWriteTarget();
-        return;
-    }
 
     cr.status.compl_desc_addr(lastDescriptorAddr >> 6);
     completionDataReg = cr.status() | 1;
@@ -617,119 +545,6 @@ CopyEngine::CopyEngineChannel::writeCopyBytesComplete()
     }
 
     continueProcessing();
-}
-
-void
-CopyEngine::CopyEngineChannel::verifyWriteTarget()
-{
-    verifyAddress = curDmaDesc->dest;
-    verifyLength = curDmaDesc->len;
-    memset(verifyBuffer, 0, verifyLength);
-
-    DPRINTF(DMACopyEngine,
-            "Verifying write target by DMA readback from %#x(%#x), len=%u\n",
-            verifyAddress, ce->pciToDma(verifyAddress), verifyLength);
-    cePort.dmaAction(MemCmd::ReadReq, ce->pciToDma(verifyAddress),
-                     verifyLength, &verifyCompleteEvent, verifyBuffer, 0);
-}
-
-void
-CopyEngine::CopyEngineChannel::verifyWriteTargetComplete()
-{
-    dumpCopyBufferHead("destBuffer after write-readback", channelId,
-                       curDmaDesc, verifyBuffer);
-
-    const bool match = std::memcmp(copyBuffer, verifyBuffer, verifyLength) == 0;
-    DPRINTF(DMACopyEngine,
-            "Write target readback %s chan=%u len=%u dst=%#x\n",
-            match ? "matched" : "MISMATCH",
-            channelId, verifyLength, verifyAddress);
-
-    scheduleDelayedVerify(curDmaDesc->src, verifyAddress,
-                          verifyLength, copyBuffer);
-
-    cr.status.compl_desc_addr(lastDescriptorAddr >> 6);
-    completionDataReg = cr.status() | 1;
-
-    if (curDmaDesc->command & DESC_CTRL_CP_STS) {
-        nextState = CompletionWrite;
-        if (inDrain()) return;
-        writeCompletionStatus();
-        return;
-    }
-
-    continueProcessing();
-}
-
-void
-CopyEngine::CopyEngineChannel::scheduleDelayedVerify(Addr src, Addr dst,
-                                                     uint32_t len,
-                                                     const uint8_t *expected)
-{
-    if (!debug::DMACopyEngine || len == 0 || !expected)
-        return;
-
-    constexpr Tick delayedVerifyLatency = 1000000;
-
-    DelayedVerifyReq req;
-    req.src = src;
-    req.dst = dst;
-    req.len = len;
-    req.dueTick = curTick() + delayedVerifyLatency;
-    req.expected.assign(expected, expected + len);
-    delayedVerifyQueue.push_back(std::move(req));
-
-    if (!delayedVerifyActive && !delayedVerifyKickEvent.scheduled()) {
-        ce->schedule(delayedVerifyKickEvent, delayedVerifyQueue.front().dueTick);
-    }
-}
-
-void
-CopyEngine::CopyEngineChannel::startDelayedVerify()
-{
-    if (delayedVerifyActive || delayedVerifyQueue.empty())
-        return;
-
-    activeDelayedVerify = std::move(delayedVerifyQueue.front());
-    delayedVerifyQueue.pop_front();
-    delayedVerifyActive = true;
-    memset(delayedVerifyBuffer, 0, activeDelayedVerify.len);
-
-    DPRINTF(DMACopyEngine,
-            "Starting delayed DMA readback from %#x(%#x), len=%u due=%llu\n",
-            activeDelayedVerify.dst,
-            ce->pciToDma(activeDelayedVerify.dst),
-            activeDelayedVerify.len,
-            (unsigned long long)activeDelayedVerify.dueTick);
-    cePort.dmaAction(MemCmd::ReadReq, ce->pciToDma(activeDelayedVerify.dst),
-                     activeDelayedVerify.len, &delayedVerifyCompleteEvent,
-                     delayedVerifyBuffer, 0);
-}
-
-void
-CopyEngine::CopyEngineChannel::delayedVerifyComplete()
-{
-    dumpBufferHead("destBuffer after delayed-readback", channelId,
-                   activeDelayedVerify.src, activeDelayedVerify.dst,
-                   activeDelayedVerify.len, delayedVerifyBuffer);
-
-    const bool match =
-        activeDelayedVerify.expected.size() == activeDelayedVerify.len &&
-        std::memcmp(activeDelayedVerify.expected.data(),
-                    delayedVerifyBuffer,
-                    activeDelayedVerify.len) == 0;
-    DPRINTF(DMACopyEngine,
-            "Delayed write target readback %s chan=%u len=%u dst=%#x\n",
-            match ? "matched" : "MISMATCH",
-            channelId, activeDelayedVerify.len, activeDelayedVerify.dst);
-
-    delayedVerifyActive = false;
-
-    if (!delayedVerifyQueue.empty()) {
-        const Tick nextDue = std::max(curTick() + 1,
-                                      delayedVerifyQueue.front().dueTick);
-        ce->schedule(delayedVerifyKickEvent, nextDue);
-    }
 }
 
 void

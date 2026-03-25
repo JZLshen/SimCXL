@@ -4,7 +4,7 @@
  * Provides user-space API for CXL shared memory RPC:
  *   - Context: KM NUMA-backed shared mapping (no /dev/cxl_mem0 or /dev/mem)
  *   - Connection: caller-provided fixed shared-memory layout
- *   - Client: send_request + completion-flag probe + ordered response drain
+ *   - Client: send_request + producer-cursor probe + ordered response drain
  *   - Server: poll_request (metadata queue) + adaptive head sync
  */
 
@@ -33,7 +33,7 @@ extern "C" {
  * Response entry header layout (8 bytes):
  *   bytes 0-3:  payload_len (uint32 LE)
  *   bytes 4-5:  rpc_id      (uint16 LE, low 15 bits used)
- *   bytes 6-7:  response_id (uint16 LE, low 15 bits used)
+ *   bytes 6-7:  reserved (written as zero, ignored by consumer)
  */
 
 /*
@@ -126,46 +126,13 @@ cxl_connection_t *cxl_connection_create_client_attach(
 /**
  * Create a server-side response transmit endpoint.
  *
- * This role carries only CopyEngine response-transmit state. It does not map
+ * This role carries only server-side response-transmit state. It does not map
  * or initialize any local fixed-layout doorbell / metadata / response / flag
  * regions. Peer response-data / flag addresses are configured later via
  * cxl_connection_set_peer_response_data() and
  * cxl_connection_set_peer_response_flag_addr().
  */
 cxl_connection_t *cxl_connection_create_response_tx(cxl_context_t *ctx);
-
-/**
- * Create a connection with pre-assigned addresses. This is the owner path
- * for a fixed layout. It initializes local runtime state only; controller-side
- * registration is assumed to be configured out-of-band with final observed
- * addresses.
- *
- * Legacy compatibility constructor: initializes the full local state used by
- * earlier revisions. New code should prefer the role-specific constructors
- * above.
- */
-cxl_connection_t *cxl_connection_create_fixed_owner(cxl_context_t *ctx,
-                                                     const cxl_connection_addrs_t *addrs,
-                                                     uint32_t mq_entries);
-
-/**
- * Create a connection with pre-assigned addresses without modifying shared
- * request-side state.
- *
- * Legacy compatibility constructor: initializes the full local state used by
- * earlier revisions. New code should prefer the role-specific constructors
- * above.
- */
-cxl_connection_t *cxl_connection_create_fixed_attach(cxl_context_t *ctx,
-                                                      const cxl_connection_addrs_t *addrs,
-                                                      uint32_t mq_entries);
-
-/**
- * Convenience alias of cxl_connection_create_fixed_owner().
- */
-cxl_connection_t *cxl_connection_create_fixed(cxl_context_t *ctx,
-                                               const cxl_connection_addrs_t *addrs,
-                                               uint32_t mq_entries);
 
 /**
  * Destroy connection and release local runtime state.
@@ -179,11 +146,12 @@ const cxl_connection_addrs_t *cxl_connection_get_addrs(
     const cxl_connection_t *conn);
 
 /**
- * Bind one dedicated CopyEngine lane for server-side response DMA.
+ * Bind one dedicated CopyEngine lane for large-response DMA publish.
  *
- * A lane is one fixed `(engine_index, channel_index)` pair. The current
- * response path requires explicit binding before peer response-data / flag
- * setup. Public configs keep `channel_index = 0` and derive
+ * A lane is one fixed `(engine_index, channel_index)` pair. Small responses
+ * are still published by CPU store+flush, but `cxl_send_response()` requires
+ * one bound lane for payloads at or above the library's large-response DMA
+ * threshold. Public configs keep `channel_index = 0` and derive
  * `engine_index = node_id`, i.e. `1 node : 1 engine : 1 channel`.
  *
  * @param conn          Connection handle
@@ -222,6 +190,9 @@ int cxl_connection_bind_copyengine_lane_index(cxl_connection_t *conn,
  * Otherwise, writes request_data payload + absolute logical address in the
  * doorbell data field.
  *
+ * The current public request_data path is append-only for the lifetime of one
+ * connection. It does not reclaim or wrap request_data at runtime.
+ *
  * Doorbell length is a full 32-bit field. Current software limit remains
  * 256 KiB. The request source `node_id` is taken from `conn->addrs.node_id`.
  *
@@ -235,30 +206,88 @@ int cxl_send_request(cxl_connection_t *conn,
                      size_t len);
 
 /**
- * Read completion flag (latest completed rpc_id) from peer.
+ * Read response producer cursor from peer flag.
  *
- * This is a non-blocking flag probe. The returned rpc_id is the latest
- * completed response id visible in the single-flag protocol.
+ * The returned cursor is the producer's committed byte cursor for the shared
+ * response ring. It is monotonically increasing and counts wrap padding, so
+ * the client can distinguish real data from tail gaps without any extra
+ * sentinel metadata in response headers.
  *
- * Physical storage remains `uint16_t`, but only the low 15 bits are used.
+ * The client has unread responses iff the returned cursor differs from the
+ * local consumer cursor.
+ *
+ * Physical storage is one 64-bit value inside the 64B shared flag cacheline.
  *
  * @param conn        Connection handle
- * @param out_rpc_id  Out: latest rpc_id from flag
- * @return            1 if flag is non-zero, 0 if no completion yet, -1 on error
+ * @param out_cursor  Out: committed producer byte cursor
+ * @return            1 if unread responses exist, 0 if consumer is caught up,
+ *                    -1 on error
  */
-int cxl_peek_latest_completed_rpc_id(cxl_connection_t *conn,
+int cxl_peek_response_producer_cursor(cxl_connection_t *conn,
+                                      uint64_t *out_cursor);
+
+/**
+ * Peek the next response payload as an in-place view (non-blocking).
+ *
+ * This is the zero-copy counterpart to `cxl_consume_next_response()`.
+ * It returns a direct payload view into the shared response-data region at the
+ * current consumer head, but does not advance that head yet.
+ *
+ * The returned view remains valid only until the caller advances the response
+ * head or another agent overwrites the same shared slot.
+ *
+ * @param conn            Connection handle
+ * @param out_data_view   Out: direct payload view inside shared response_data
+ * @param out_len         Out: exact payload size
+ * @param out_rpc_id      Out: response rpc_id at current consumer head
+ * @return                1 if one response is available, 0 if pending, -1 on error
+ */
+int cxl_peek_next_response_view(cxl_connection_t *conn,
+                                const void **out_data_view,
+                                size_t *out_len,
+                                uint16_t *out_rpc_id);
+
+/**
+ * Advance the response consumer head after a successful zero-copy peek.
+ *
+ * The caller must pass the `(rpc_id, len)` pair previously returned by
+ * `cxl_peek_next_response_view()` for the current response head.
+ *
+ * @param conn        Connection handle
+ * @param rpc_id      Expected rpc_id at current consumer head
+ * @param len         Expected payload length at current consumer head
+ * @return            1 if advanced, 0 if no response pending, -1 on error/mismatch
+ */
+int cxl_advance_response_head(cxl_connection_t *conn,
+                              uint16_t rpc_id,
+                              size_t len);
+
+/**
+ * Consume the next response header in producer order (non-blocking).
+ *
+ * Reads only the response header at the current consumer head, returns the
+ * `(rpc_id, len)` pair, and advances the consumer head without copying or
+ * demand-loading the payload body into host memory.
+ *
+ * This is the lowest-overhead client receive path when the caller only needs
+ * completion ordering/latency and does not inspect response payload bytes.
+ *
+ * @param conn        Connection handle
+ * @param out_len     Out: exact payload size
+ * @param out_rpc_id  Out: consumed response rpc_id
+ * @return            1 if one response consumed, 0 if pending, -1 on error
+ */
+int cxl_consume_next_response_header(cxl_connection_t *conn,
+                                     size_t *out_len,
                                      uint16_t *out_rpc_id);
 
 /**
  * Consume the next response entry in producer order (non-blocking).
  *
  * Copies exactly one response payload from the current response-data head into
- * caller-owned local memory, then advances the consumer offset.
- *
- * This API is intended for single-flag multi-outstanding workflows where the
- * client first calls `cxl_peek_latest_completed_rpc_id()`, checks the
- * returned rpc_id against its pending set, and then drains response_data
- * in producer order until that rpc_id is consumed.
+ * caller-owned local memory, then advances the consumer offset. This is a
+ * compatibility wrapper around `cxl_peek_next_response_view()` plus
+ * `cxl_advance_response_head()`.
  *
  * The response is considered consumed only after this local copy completes.
  *
@@ -312,15 +341,35 @@ int cxl_poll_request(cxl_connection_t *conn,
 /**
  * Send an RPC response (server-side).
  *
- * Sends one response entry to peer `response_data` and then publishes the
- * corresponding `rpc_id` to peer `flag` through CopyEngine.
+ * Sends one variable-length response entry into peer `response_data` and then
+ * publishes the committed response producer cursor to peer `flag`.
  *
- * Physical storage remains `uint16_t`, but only the low 15 bits are used.
+ * The response ring is one large shared region. Entries are cacheline-aligned
+ * but do not use any fixed per-response slot size.
+ *
+ * Response entries whose `(header + payload)` size is at most 4 KiB are copied
+ * into peer `response_data` by CPU store plus `clflushopt`/`sfence`.
+ *
+ * When the same connection already has an older CopyEngine response publish
+ * in flight, the small-response payload still uses CPU copy, but the final
+ * producer-cursor flag write is serialized onto that same CopyEngine lane so
+ * the shared cursor never overtakes an older DMA response.
+ *
+ * Response entries whose `(header + payload)` size exceeds 4 KiB are published
+ * by one asynchronous CopyEngine descriptor chain:
+ *   response entry -> producer cursor flag
+ * This large-response path requires one dedicated CopyEngine lane to be bound
+ * on the connection before send time.
+ *
+ * Response headers remain 8 bytes wide for aligned 64-bit load/store, but
+ * their active semantics are only `(payload_len, rpc_id)`. The upper 16 bits
+ * are reserved and written as zero. The flag only advances the shared producer
+ * cursor for ordered response draining.
  *
  * @param conn    Server-side connection handle (with peer addresses set)
  * @param rpc_id  RPC ID to respond to (must be 1..32767)
  * @param data    Response payload
- * @param len     Payload length in bytes (current backend max: 4088)
+ * @param len     Payload length in bytes
  * @return        0 on success, -1 on error
  */
 int cxl_send_response(cxl_connection_t *conn,
@@ -332,8 +381,8 @@ int cxl_send_response(cxl_connection_t *conn,
  * Set peer response-data region for server sending responses.
  *
  * Must be called after connection creation, before send_response.
- * Resolves peer response_data into a local observed DMA page map once during
- * setup so the response send hot path only works with logical offsets.
+ * Maps peer `response_data` into the local CXL shared region used by the
+ * direct response-publish path.
  * Peer flag is configured separately via
  * cxl_connection_set_peer_response_flag_addr().
  *
@@ -347,10 +396,11 @@ int cxl_connection_set_peer_response_data(cxl_connection_t *conn,
                                           size_t peer_response_data_size);
 
 /**
- * Set peer response-flag address for server response completion publish.
+ * Set peer response-flag address for server response producer-cursor publish.
  *
  * The response path becomes ready only after both peer `response_data` and
- * peer `flag` are configured. Responses are then sent through CopyEngine.
+ * peer `flag` are configured. Responses are then published directly into the
+ * shared response ring and committed by producer cursor.
  *
  * @param conn            Connection handle
  * @param peer_flag_addr  Logical/protocol address of peer's flag region

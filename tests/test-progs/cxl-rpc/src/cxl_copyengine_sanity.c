@@ -12,8 +12,7 @@
 
 #define DEFAULT_MAX_POLLS 2000000
 #define DEFAULT_POLL_PAUSE 0
-#define TEST_RPC_ID 0x1234u
-
+#define SANITY_RESPONSE_BYTES 4096u
 static volatile int keep_running = 1;
 
 static void signal_handler(int sig)
@@ -58,19 +57,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    uint64_t server_base = region_base(SERVER_REGION_INDEX);
     uint64_t client_base = region_base(NODE_REGION_INDEX(0));
-
-    cxl_connection_addrs_t tx_addrs = {
-        .doorbell_addr = server_base + DOORBELL_OFFSET,
-        .metadata_queue_addr = server_base + METADATA_Q_OFFSET,
-        .metadata_queue_size = METADATA_Q_SIZE_BYTES,
-        .request_data_addr = server_base + REQUEST_DATA_OFFSET,
-        .request_data_size = REQUEST_DATA_BYTES,
-        .response_data_addr = server_base + RESPONSE_DATA_OFFSET,
-        .response_data_size = RESPONSE_DATA_BYTES,
-        .flag_addr = server_base + FLAG_OFFSET,
-    };
 
     cxl_connection_addrs_t rx_addrs = {
         .doorbell_addr = client_base + DOORBELL_OFFSET,
@@ -83,10 +70,10 @@ int main(int argc, char **argv)
         .flag_addr = client_base + FLAG_OFFSET,
     };
 
-    cxl_connection_t *tx = cxl_connection_create_fixed(ctx, &tx_addrs, 1024);
-    cxl_connection_t *rx = cxl_connection_create_fixed(ctx, &rx_addrs, 1024);
+    cxl_connection_t *tx = cxl_connection_create_response_tx(ctx);
+    cxl_connection_t *rx = cxl_connection_create_client_attach(ctx, &rx_addrs);
     if (!tx || !rx) {
-        fprintf(stderr, "sanity: failed to create fixed connections\n");
+        fprintf(stderr, "sanity: failed to create role-specific connections\n");
         cxl_connection_destroy(tx);
         cxl_connection_destroy(rx);
         cxl_rpc_destroy(ctx);
@@ -119,18 +106,30 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    sanity_resp_t resp = {
-        .sum = 0x1122334455667788LL,
-        .seq = 0xA5A5A5A5u,
-        .status = 0x600DCAFEu,
-    };
+    uint8_t resp[SANITY_RESPONSE_BYTES];
+    uint8_t got_resp[SANITY_RESPONSE_BYTES];
+    memset(resp, 0x5A, sizeof(resp));
+    memset(got_resp, 0, sizeof(got_resp));
+    sanity_resp_t *resp_hdr = (sanity_resp_t *)resp;
+    resp_hdr->sum = 0x1122334455667788LL;
+    resp_hdr->seq = 0xA5A5A5A5u;
+    resp_hdr->status = 0x600DCAFEu;
+    uint64_t dummy_request = 0x123456789ABCDEF0ULL;
+    int test_rpc_id = cxl_send_request(rx, &dummy_request, sizeof(dummy_request));
+    if (test_rpc_id <= 0) {
+        fprintf(stderr, "sanity: cxl_send_request failed\n");
+        cxl_connection_destroy(tx);
+        cxl_connection_destroy(rx);
+        cxl_rpc_destroy(ctx);
+        return 1;
+    }
 
     printf("=== COPYENGINE SANITY ===\n");
-    printf("rpc_id=%u\n", TEST_RPC_ID);
+    printf("rpc_id=%u\n", (unsigned)test_rpc_id);
     printf("dst_response=%#llx\n", (unsigned long long)(client_base + RESPONSE_DATA_OFFSET));
     printf("dst_flag=%#llx\n", (unsigned long long)(client_base + FLAG_OFFSET));
 
-    if (cxl_send_response(tx, TEST_RPC_ID, &resp, sizeof(resp)) < 0) {
+    if (cxl_send_response(tx, (uint16_t)test_rpc_id, resp, sizeof(resp)) < 0) {
         fprintf(stderr, "sanity: cxl_send_response failed\n");
         cxl_connection_destroy(tx);
         cxl_connection_destroy(rx);
@@ -138,53 +137,42 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    sanity_resp_t got_resp;
     int request_pending = 1;
     int ok = 0;
     for (int poll = 0; poll < max_polls && keep_running; poll++) {
-        uint16_t latest_completed_rpc_id = 0;
-        int peek_rc =
-            cxl_peek_latest_completed_rpc_id(rx, &latest_completed_rpc_id);
-        if (peek_rc < 0) {
+        size_t response_len = sizeof(got_resp);
+        uint16_t consumed_rpc_id = 0;
+        int consume_rc = cxl_consume_next_response(rx,
+                                                   &got_resp,
+                                                   &response_len,
+                                                   &consumed_rpc_id);
+        if (consume_rc < 0) {
             fprintf(stderr,
-                    "sanity: cxl_peek_latest_completed_rpc_id failed poll=%d\n",
-                    poll);
+                    "sanity: cxl_consume_next_response failed poll=%d rpc_id=%u\n",
+                    poll, consumed_rpc_id);
             break;
         }
-        if (peek_rc == 1 && request_pending &&
-            latest_completed_rpc_id == TEST_RPC_ID) {
-            size_t response_len = sizeof(got_resp);
-            uint16_t consumed_rpc_id = 0;
-            int consume_rc = cxl_consume_next_response(rx,
-                                                       &got_resp,
-                                                       &response_len,
-                                                       &consumed_rpc_id);
-            if (consume_rc < 0) {
+        if (consume_rc == 1 && request_pending) {
+            if (response_len != sizeof(resp) ||
+                consumed_rpc_id != (uint16_t)test_rpc_id) {
                 fprintf(stderr,
-                        "sanity: cxl_consume_next_response failed poll=%d rpc_id=%u\n",
-                        poll, consumed_rpc_id);
+                        "sanity: invalid consumed response len=%zu rpc_id=%u\n",
+                        response_len, consumed_rpc_id);
                 break;
             }
-            if (consume_rc == 1) {
-                if (response_len != sizeof(resp) ||
-                    consumed_rpc_id != TEST_RPC_ID) {
-                    fprintf(stderr,
-                            "sanity: invalid consumed response len=%zu rpc_id=%u\n",
-                            response_len, consumed_rpc_id);
-                    break;
-                }
-                if (memcmp(&got_resp, &resp, sizeof(resp)) != 0) {
-                    fprintf(stderr,
-                            "sanity: payload mismatch sum=%lld seq=%u status=%#x\n",
-                            (long long)got_resp.sum, got_resp.seq, got_resp.status);
-                    break;
-                }
-                request_pending = 0;
-                printf("sanity_poll_hit=%d\n", poll);
-                printf("sanity_result=PASS\n");
-                ok = 1;
+            if (memcmp(got_resp, resp, sizeof(resp)) != 0) {
+                fprintf(stderr,
+                        "sanity: payload mismatch sum=%lld seq=%u status=%#x\n",
+                        (long long)((const sanity_resp_t *)got_resp)->sum,
+                        ((const sanity_resp_t *)got_resp)->seq,
+                        ((const sanity_resp_t *)got_resp)->status);
                 break;
             }
+            request_pending = 0;
+            printf("sanity_poll_hit=%d\n", poll);
+            printf("sanity_result=PASS\n");
+            ok = 1;
+            break;
         }
         for (int i = 0; i < poll_pause; i++)
             __asm__ __volatile__("pause" ::: "memory");

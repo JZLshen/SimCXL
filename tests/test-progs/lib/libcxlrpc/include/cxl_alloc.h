@@ -25,9 +25,9 @@ extern "C" {
 #define CXL_DEFAULT_REQUEST_DATA_SIZE   (10 * 1024 * 1024)/* 10MB */
 #define CXL_DEFAULT_RESPONSE_DATA_SIZE  (10 * 1024 * 1024)/* 10MB */
 /*
- * Flag publishes a 15-bit logical rpc_id carried in a uint16_t slot, but the
- * storage region is still a full 64B cacheline because the CopyEngine writes
- * the whole line atomically.
+ * Flag publishes one 64-bit response producer cursor, while the storage
+ * region remains a full 64B cacheline because the CopyEngine writes the whole
+ * line atomically.
  */
 #define CXL_DEFAULT_FLAG_SIZE           64
 

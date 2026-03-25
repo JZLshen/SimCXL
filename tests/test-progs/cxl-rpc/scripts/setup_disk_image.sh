@@ -208,6 +208,7 @@ FIRST_REQ_BARRIER_PATH="${CXL_RPC_FIRST_REQ_BARRIER_PATH:-/tmp/cxl_rpc_first_req
 PIN_CORES="${CXL_RPC_PIN_CORES:-0}"
 SERVER_CORE="${CXL_RPC_SERVER_CORE:-0}"
 CLIENT_CORE_BASE="${CXL_RPC_CLIENT_CORE_BASE:-1}"
+DEBUG_LIVE="${CXL_RPC_DEBUG_LIVE:-0}"
 
 if ! [[ "$CLIENT_COUNT" =~ ^[0-9]+$ ]] || [ "$CLIENT_COUNT" -le 0 ]; then
     echo "ERROR: CXL_RPC_CLIENT_COUNT must be a positive integer"
@@ -265,6 +266,12 @@ if [[ "$SERVER_ARGS" != *"--num-clients"* ]]; then
     SERVER_ARGS="${SERVER_ARGS} --num-clients ${CLIENT_COUNT}"
 fi
 
+wrapper_log() {
+    if [ "${DEBUG_LIVE:-0}" != "0" ]; then
+        echo "[rpc-wrapper] $*"
+    fi
+}
+
 wait_for_server_ready() {
     if [ "$SERVER_READY_TIMEOUT_SEC" -gt 0 ] && command -v timeout >/dev/null 2>&1; then
         timeout --signal=TERM --kill-after=1 "${SERVER_READY_TIMEOUT_SEC}s" \
@@ -288,16 +295,40 @@ emit_tick_lines() {
     sed -nE "s/^req_([0-9]+)_(start|end|delta)_tick=([0-9]+)$/${prefix}req_\\1_\\2_tick=\\3/p" "$file"
 }
 
+emit_server_timing_lines() {
+    local file="$1"
+
+    if [ ! -f "$file" ]; then
+        return 0
+    fi
+
+    sed -nE "s/^(server_req_[0-9]+_(node_id|rpc_id|poll_tick|exec_tick|resp_submit_tick)=[0-9]+)$/\\1/p" "$file"
+}
+
 : > "$SERVER_LOG"
+wrapper_log "launch_server clients=${CLIENT_COUNT} pin=${PIN_CORES} core=${SERVER_CORE} log=${SERVER_LOG}"
 if [ "$PIN_CORES" != "0" ]; then
-    # shellcheck disable=SC2086
-    CXL_RPC_NUMA_NODE="$SERVER_NUMA_NODE" taskset -c "$SERVER_CORE" \
-        "$SERVER" $SERVER_ARGS >"$SERVER_LOG" 2>&1 &
+    if [ "$DEBUG_LIVE" != "0" ]; then
+        # shellcheck disable=SC2086
+        CXL_RPC_NUMA_NODE="$SERVER_NUMA_NODE" taskset -c "$SERVER_CORE" \
+            "$SERVER" $SERVER_ARGS > >(tee "$SERVER_LOG") 2>&1 &
+    else
+        # shellcheck disable=SC2086
+        CXL_RPC_NUMA_NODE="$SERVER_NUMA_NODE" taskset -c "$SERVER_CORE" \
+            "$SERVER" $SERVER_ARGS >"$SERVER_LOG" 2>&1 &
+    fi
 else
-    # shellcheck disable=SC2086
-    CXL_RPC_NUMA_NODE="$SERVER_NUMA_NODE" "$SERVER" $SERVER_ARGS >"$SERVER_LOG" 2>&1 &
+    if [ "$DEBUG_LIVE" != "0" ]; then
+        # shellcheck disable=SC2086
+        CXL_RPC_NUMA_NODE="$SERVER_NUMA_NODE" \
+            "$SERVER" $SERVER_ARGS > >(tee "$SERVER_LOG") 2>&1 &
+    else
+        # shellcheck disable=SC2086
+        CXL_RPC_NUMA_NODE="$SERVER_NUMA_NODE" "$SERVER" $SERVER_ARGS >"$SERVER_LOG" 2>&1 &
+    fi
 fi
 SERVER_PID=$!
+wrapper_log "server_pid=${SERVER_PID}"
 
 if ! wait_for_server_ready; then
     echo "server_ready_timeout" >&2
@@ -313,6 +344,7 @@ if ! wait_for_server_ready; then
     fi
     exit 125
 fi
+wrapper_log "server_ready pid=${SERVER_PID}"
 
 declare -a CLIENT_PIDS=()
 declare -a CLIENT_LOGS=()
@@ -333,32 +365,65 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
         client_cmd+=("--num-clients" "$CLIENT_COUNT" "--node-id" "$i")
     fi
 
+    wrapper_log "launch_client idx=${i} pin=${PIN_CORES} core=${client_core} log=${log} barrier=${FIRST_REQ_BARRIER_PATH}"
+
     if [ "$CLIENT_TIMEOUT_SEC" -gt 0 ]; then
         if [ "$PIN_CORES" != "0" ]; then
-            CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
-                timeout --signal=TERM --kill-after=2 \
-                "${CLIENT_TIMEOUT_SEC}s" \
-                taskset -c "$client_core" "${client_cmd[@]}" >"$log" 2>&1 &
+            if [ "$DEBUG_LIVE" != "0" ]; then
+                CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    timeout --signal=TERM --kill-after=2 \
+                    "${CLIENT_TIMEOUT_SEC}s" \
+                    taskset -c "$client_core" "${client_cmd[@]}" \
+                    > >(tee "$log") 2>&1 &
+            else
+                CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    timeout --signal=TERM --kill-after=2 \
+                    "${CLIENT_TIMEOUT_SEC}s" \
+                    taskset -c "$client_core" "${client_cmd[@]}" >"$log" 2>&1 &
+            fi
         else
-            CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
-                timeout --signal=TERM --kill-after=2 \
-                "${CLIENT_TIMEOUT_SEC}s" \
-                "${client_cmd[@]}" >"$log" 2>&1 &
+            if [ "$DEBUG_LIVE" != "0" ]; then
+                CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    timeout --signal=TERM --kill-after=2 \
+                    "${CLIENT_TIMEOUT_SEC}s" \
+                    "${client_cmd[@]}" > >(tee "$log") 2>&1 &
+            else
+                CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    timeout --signal=TERM --kill-after=2 \
+                    "${CLIENT_TIMEOUT_SEC}s" \
+                    "${client_cmd[@]}" >"$log" 2>&1 &
+            fi
         fi
     else
         if [ "$PIN_CORES" != "0" ]; then
-            CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
-                taskset -c "$client_core" "${client_cmd[@]}" >"$log" 2>&1 &
+            if [ "$DEBUG_LIVE" != "0" ]; then
+                CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    taskset -c "$client_core" "${client_cmd[@]}" \
+                    > >(tee "$log") 2>&1 &
+            else
+                CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    taskset -c "$client_core" "${client_cmd[@]}" >"$log" 2>&1 &
+            fi
         else
-            CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
-                "${client_cmd[@]}" >"$log" 2>&1 &
+            if [ "$DEBUG_LIVE" != "0" ]; then
+                CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    "${client_cmd[@]}" > >(tee "$log") 2>&1 &
+            else
+                CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
+                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    "${client_cmd[@]}" >"$log" 2>&1 &
+            fi
         fi
     fi
     CLIENT_PIDS[$i]=$!
+    wrapper_log "client_pid idx=${i} pid=${CLIENT_PIDS[$i]}"
 done
 
 overall_rc=0
@@ -367,6 +432,7 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
     wait "${CLIENT_PIDS[$i]}"
     CLIENT_RCS[$i]=$?
     set -e
+    wrapper_log "client_done idx=${i} rc=${CLIENT_RCS[$i]}"
     if [ "${CLIENT_RCS[$i]}" -ne 0 ] && [ "$overall_rc" -eq 0 ]; then
         overall_rc="${CLIENT_RCS[$i]}"
     fi
@@ -380,12 +446,14 @@ set +e
 wait "$SERVER_PID"
 SERVER_RC=$?
 set -e
+wrapper_log "server_done rc=${SERVER_RC}"
 
 if [ "$SERVER_RC" -ne 0 ] && [ "$overall_rc" -eq 0 ]; then
     overall_rc="$SERVER_RC"
 fi
 
 if [ "$overall_rc" -eq 0 ] && [ "$SERVER_RC" -eq 0 ]; then
+    emit_server_timing_lines "$SERVER_LOG"
     for ((i = 0; i < CLIENT_COUNT; i++)); do
         if [ "$CLIENT_COUNT" -eq 1 ]; then
             emit_tick_lines "${CLIENT_LOGS[$i]}" ""
@@ -448,22 +516,16 @@ set -u
 SCRIPT_FILE=/tmp/gem5_script.sh
 TMP_FILE=/tmp/gem5_script.sh.new
 
-echo "[gem5-readfile] fetching payload via m5 readfile"
 /sbin/m5 readfile > "$TMP_FILE" 2>/dev/null || true
 
 if [ ! -s "$TMP_FILE" ]; then
     rm -f "$TMP_FILE"
-    echo "[gem5-readfile] no payload supplied"
     exit 0
 fi
 
 mv -f "$TMP_FILE" "$SCRIPT_FILE"
 chmod +x "$SCRIPT_FILE"
-PAYLOAD_HASH="$(sha256sum "$SCRIPT_FILE" | awk '{print $1}')"
-echo "[gem5-readfile] launching payload hash=$PAYLOAD_HASH"
 nohup /bin/bash "$SCRIPT_FILE" >/dev/ttyS0 2>&1 </dev/null &
-PAYLOAD_PID=$!
-echo "[gem5-readfile] payload pid=$PAYLOAD_PID"
 exit 0
 RUNNER_EOF
 sudo chmod 755 "${MOUNT_POINT}/usr/local/sbin/gem5-readfile-once.sh"

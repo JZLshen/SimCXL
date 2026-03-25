@@ -129,21 +129,52 @@ CXLRPCEngine::startup()
 
 }
 
+void
+CXLRPCEngine::bindDoorbellPage(ClientConnection& conn,
+                               Addr logical_page,
+                               Addr observed_page)
+{
+    auto existing = conn.doorbell_page_addr_map.find(logical_page);
+    if (existing != conn.doorbell_page_addr_map.end() &&
+        existing->second != observed_page) {
+        auto observed = observedDoorbellPages.find(existing->second);
+        if (observed != observedDoorbellPages.end() &&
+            observed->second.connection == &conn &&
+            observed->second.logicalPage == logical_page) {
+            observedDoorbellPages.erase(observed);
+        }
+    }
+
+    conn.doorbell_page_addr_map[logical_page] = observed_page;
+    observedDoorbellPages[observed_page] =
+        ObservedDoorbellPageBinding{logical_page, &conn};
+}
+
+void
+CXLRPCEngine::unbindDoorbellPages(const ClientConnection& conn)
+{
+    for (const auto& doorbellPage : conn.doorbell_page_addr_map) {
+        auto observed = observedDoorbellPages.find(doorbellPage.second);
+        if (observed != observedDoorbellPages.end() &&
+            observed->second.connection == &conn &&
+            observed->second.logicalPage == doorbellPage.first) {
+            observedDoorbellPages.erase(observed);
+        }
+    }
+}
+
 ClientConnection*
 CXLRPCEngine::findConnectionForAddr(Addr addr, uint32_t size,
-                                    Addr& base_addr, Addr* logical_addr,
-                                    uint32_t* slot_index)
+                                    Addr& base_addr)
 {
     return const_cast<ClientConnection *>(
         static_cast<const CXLRPCEngine *>(this)->findConnectionForAddr(
-            addr, size, base_addr, logical_addr, slot_index));
+            addr, size, base_addr));
 }
 
 const ClientConnection*
 CXLRPCEngine::findConnectionForAddr(Addr addr, uint32_t size,
-                                    Addr& base_addr,
-                                    Addr* logical_addr,
-                                    uint32_t* slot_index) const
+                                    Addr& base_addr) const
 {
     if (size == 0) {
         return nullptr;
@@ -156,52 +187,53 @@ CXLRPCEngine::findConnectionForAddr(Addr addr, uint32_t size,
     }
 
     const Addr logicalDoorbellBytes = doorbellRange.size();
+    if (observedDoorbellPages.empty()) {
+        return nullptr;
+    }
 
-    for (auto& pair : connections) {
-        const ClientConnection& conn = pair.second;
-        for (const auto& doorbellPage : conn.doorbell_page_addr_map) {
-            const Addr logicalPage = doorbellPage.first;
-            const Addr observedPage = doorbellPage.second;
+    Addr observedPage = pktStart & kDoorbellPageMask;
+    while (true) {
+        auto binding = observedDoorbellPages.find(observedPage);
+        if (binding != observedDoorbellPages.end()) {
+            const ClientConnection& conn = *binding->second.connection;
+            const Addr logicalPage = binding->second.logicalPage;
             Addr observedPageEnd = observedPage + kDoorbellPageSize;
             if (observedPageEnd < observedPage) {
                 observedPageEnd = MaxAddr;
             }
-            if (!rangesOverlap(pktStart, pktEnd, observedPage, observedPageEnd)) {
-                continue;
+            if (rangesOverlap(pktStart, pktEnd, observedPage, observedPageEnd)) {
+                const Addr overlapStart = std::max(pktStart, observedPage);
+                const Addr logicalOverlap =
+                    logicalPage + (overlapStart - observedPage);
+                if (logicalOverlap >= conn.doorbell_addr) {
+                    const Addr logicalOffset = logicalOverlap - conn.doorbell_addr;
+                    if (logicalOffset < logicalDoorbellBytes) {
+                        const uint32_t resolvedSlotIndex =
+                            static_cast<uint32_t>(
+                                logicalOffset / kDoorbellSlotStride);
+                        const Addr resolvedLogicalAddr =
+                            conn.doorbell_addr +
+                            static_cast<Addr>(resolvedSlotIndex) *
+                                kDoorbellSlotStride;
+                        const Addr logicalPageBase =
+                            resolvedLogicalAddr & kDoorbellPageMask;
+                        const Addr pageSlotOffset =
+                            resolvedLogicalAddr - logicalPageBase;
+                        if (logicalPageBase == logicalPage &&
+                            pageSlotOffset < kDoorbellPageSize) {
+                            base_addr = observedPage + pageSlotOffset;
+                            return &conn;
+                        }
+                    }
+                }
             }
-
-            const Addr overlapStart = std::max(pktStart, observedPage);
-            const Addr logicalOverlap = logicalPage + (overlapStart - observedPage);
-            if (logicalOverlap < conn.doorbell_addr) {
-                continue;
-            }
-
-            const Addr logicalOffset = logicalOverlap - conn.doorbell_addr;
-            if (logicalOffset >= logicalDoorbellBytes) {
-                continue;
-            }
-
-            const uint32_t resolvedSlotIndex =
-                static_cast<uint32_t>(logicalOffset / kDoorbellSlotStride);
-            const Addr resolvedLogicalAddr =
-                conn.doorbell_addr +
-                static_cast<Addr>(resolvedSlotIndex) * kDoorbellSlotStride;
-            const Addr logicalPageBase = resolvedLogicalAddr & kDoorbellPageMask;
-            const Addr pageSlotOffset = resolvedLogicalAddr - logicalPageBase;
-            if (logicalPageBase != logicalPage ||
-                pageSlotOffset >= kDoorbellPageSize) {
-                continue;
-            }
-
-            base_addr = observedPage + pageSlotOffset;
-            if (logical_addr) {
-                *logical_addr = resolvedLogicalAddr;
-            }
-            if (slot_index) {
-                *slot_index = resolvedSlotIndex;
-            }
-            return &pair.second;
         }
+
+        if (observedPage > MaxAddr - kDoorbellPageSize ||
+            observedPage + kDoorbellPageSize >= pktEnd) {
+            break;
+        }
+        observedPage += kDoorbellPageSize;
     }
 
     return nullptr;
@@ -252,28 +284,20 @@ CXLRPCEngine::probeDoorbellWrite(PacketPtr pkt) const
     }
 
     Addr base_addr = 0;
-    Addr logical_base_addr = 0;
-    uint32_t slotIndex = 0;
     const ClientConnection* conn =
-        findConnectionForAddr(addr, size, base_addr, &logical_base_addr,
-                              &slotIndex);
+        findConnectionForAddr(addr, size, base_addr);
     if (conn) {
-        probe.should_probe = true;
-        probe.matched_connection = true;
         probe.connection = conn;
         probe.doorbell_addr = base_addr;
-        probe.logical_doorbell_addr = logical_base_addr;
-        probe.slot_index = slotIndex;
         if (pkt->hasData()) {
             const Addr dbStart = base_addr;
             const Addr dbEnd = base_addr + 16;
             if (addr <= dbStart && pktEnd >= dbEnd) {
-                probe.covers_doorbell = true;
-                probe.doorbell_offset =
+                const size_t doorbellOffset =
                     static_cast<size_t>(dbStart - addr);
                 probe.entry.parseFromBuffer(pkt->getConstPtr<uint8_t>() +
-                                            probe.doorbell_offset);
-                probe.parsed_entry = true;
+                                            doorbellOffset);
+                probe.should_probe = true;
             }
         }
     } else if (pkt->hasData() && (addr % kDoorbellSlotStride) == 0) {
@@ -282,6 +306,7 @@ CXLRPCEngine::probeDoorbellWrite(PacketPtr pkt) const
         entry.parseFromBuffer(raw);
         if (isBootstrapRequest(entry)) {
             probe.should_probe = true;
+            probe.entry = entry;
         }
     }
 
@@ -292,95 +317,45 @@ DoorbellHandleResult
 CXLRPCEngine::handleDoorbellWrite(PacketPtr pkt,
                                   const DoorbellWriteProbe* probe)
 {
-    Addr addr = pkt->getAddr();
-    uint32_t size = pkt->getSize();
+    if (!pkt || !probe || !probe->should_probe)
+        return DoorbellHandleResult::NotHandled;
 
-    // Find the connection (supports writes within doorbell entry range)
-    Addr base_addr = 0;
-    Addr logical_base_addr = 0;
-    uint32_t slotIndex = 0;
-    ClientConnection* conn = nullptr;
-    if (probe && probe->should_probe && probe->matched_connection) {
-        base_addr = probe->doorbell_addr;
-        logical_base_addr = probe->logical_doorbell_addr;
-        slotIndex = probe->slot_index;
-        conn = const_cast<ClientConnection*>(probe->connection);
-    }
-    if (!conn) {
-        conn = findConnectionForAddr(addr, size, base_addr, &logical_base_addr,
-                                     &slotIndex);
-    }
-    if (!conn) {
-        if (consumeBootstrapDoorbellBinding(pkt)) {
+    if (!probe->connection) {
+        if (consumeBootstrapDoorbellBinding(pkt, *probe)) {
             return DoorbellHandleResult::Consumed;
         }
         return DoorbellHandleResult::NotHandled;
     }
-    if (!pkt->hasData()) {
-        return DoorbellHandleResult::NotHandled;
-    }
 
-    // Parse doorbell entry only when this write fully covers bytes [0..15]
-    // of the logical doorbell. This supports cacheable 64B line writeback
-    // while naturally ignoring partial sub-entry stores.
-    const bool useProbeDoorbell =
-        probe && probe->should_probe && probe->matched_connection &&
-        probe->connection == conn && probe->doorbell_addr == base_addr;
-
-    size_t dbOffset = 0;
-    if (useProbeDoorbell && probe->covers_doorbell) {
-        dbOffset = probe->doorbell_offset;
-    } else {
-        const Addr pktStart = addr;
-        const Addr pktEnd = addr + static_cast<Addr>(size);
-        const Addr dbStart = base_addr;
-        const Addr dbEnd = base_addr + 16;
-        if (pktStart > dbStart || pktEnd < dbEnd) {
-            DPRINTF(CXLRPCEngine,
-                    "Ignoring partial doorbell write: addr=%#x size=%u db=%#x\n",
-                    addr, size, base_addr);
-            return DoorbellHandleResult::NotHandled;
-        }
-        dbOffset = static_cast<size_t>(dbStart - pktStart);
-    }
-
-    const uint8_t* raw = pkt->getConstPtr<uint8_t>() + dbOffset;
+    ClientConnection* conn = const_cast<ClientConnection*>(probe->connection);
 
     stats.doorbellWrites++;
 
-    DoorbellEntry entry;
-    if (useProbeDoorbell && probe->parsed_entry &&
-        probe->doorbell_offset == dbOffset) {
-        entry = probe->entry;
-    } else {
-        entry.parseFromBuffer(raw);
-    }
-
     DPRINTF(CXLRPCEngine, "Doorbell write: method=%u, node_id=%u, "
             "rpc_id=%u, len=%u, inline=%u\n",
-            static_cast<unsigned>(entry.method),
-            static_cast<unsigned>(entry.node_id),
-            static_cast<unsigned>(entry.rpc_id),
-            static_cast<unsigned>(entry.length),
-            static_cast<unsigned>(entry.is_inline));
+            static_cast<unsigned>(probe->entry.method),
+            static_cast<unsigned>(probe->entry.node_id),
+            static_cast<unsigned>(probe->entry.rpc_id),
+            static_cast<unsigned>(probe->entry.length),
+            static_cast<unsigned>(probe->entry.is_inline));
 
-    return processDoorbellEntry(*conn, base_addr, logical_base_addr, slotIndex,
-                                entry, pkt);
+    return processDoorbellEntry(*conn,
+                                probe->doorbell_addr,
+                                probe->entry,
+                                pkt);
 }
 
 DoorbellHandleResult
 CXLRPCEngine::processDoorbellEntry(
     ClientConnection& conn, Addr doorbell_addr,
-    Addr logical_doorbell_addr, uint32_t slot_index,
     const DoorbellEntry& entry, PacketPtr pkt)
 {
     switch (entry.method) {
         case METHOD_REQUEST:
-            return processRequest(conn, doorbell_addr, logical_doorbell_addr,
-                                  slot_index, entry, pkt);
+            return processRequest(conn, doorbell_addr, entry, pkt);
         case METHOD_HEAD_UPDATE:
-            return processHeadUpdate(conn, doorbell_addr, logical_doorbell_addr,
-                                     slot_index, entry, pkt);
+            return processHeadUpdate(conn, doorbell_addr,
+                                     entry, pkt);
         default:
             DPRINTF(CXLRPCEngine, "Unknown method type: %d\n", entry.method);
             return DoorbellHandleResult::NotHandled;
@@ -390,70 +365,16 @@ CXLRPCEngine::processDoorbellEntry(
 DoorbellHandleResult
 CXLRPCEngine::processRequest(
     ClientConnection& conn, Addr doorbell_addr,
-    Addr logical_doorbell_addr, uint32_t slot_index,
     const DoorbellEntry& entry, PacketPtr pkt)
 {
     constexpr size_t kDoorbellEntrySize = 16;
     constexpr Addr kCacheLineMask = ~Addr(0x3F);
 
     if (isBootstrapRequest(entry)) {
-        if (slot_index != 0) {
-            DPRINTF(CXLRPCEngine,
-                    "Ignoring bootstrap request on non-slot0 doorbell: "
-                    "slot=%u doorbell=%#x logical=%#x\n",
-                    slot_index, doorbell_addr, logical_doorbell_addr);
-            return DoorbellHandleResult::NotHandled;
-        }
-        return processBootstrapRequest(conn, doorbell_addr,
-                                       logical_doorbell_addr, slot_index,
-                                       entry, pkt);
+        return processBootstrapRequest(conn, doorbell_addr, entry, pkt);
     }
 
-    // Skip invalid doorbells (all-zero)
-    // This can happen during initialization when doorbell memory is zero
-    if (entry.rpc_id == 0 && entry.length == 0 &&
-        entry.node_id == 0 && entry.data == 0) {
-        DPRINTF(CXLRPCEngine, "Ignoring invalid all-zero doorbell\n");
-        return DoorbellHandleResult::Handled;
-    }
-
-    const Addr pktStart = pkt->getAddr();
     const size_t pktSize = pkt->getSize();
-    // Reserve slot 0 for server/head-update traffic so client request
-    // doorbells start from slot 1.
-    if (slot_index == 0 || logical_doorbell_addr == conn.doorbell_addr) {
-        DPRINTF(CXLRPCEngine,
-                "Request doorbell on reserved slot0 ignored: "
-                "doorbell=%#x logical=%#x conn_db=%#x\n",
-                doorbell_addr, logical_doorbell_addr, conn.doorbell_addr);
-        return DoorbellHandleResult::NotHandled;
-    }
-
-    if (entry.rpc_id == 0) {
-        DPRINTF(CXLRPCEngine,
-                "Ignoring request doorbell with rpc_id=0: slot=%u doorbell=%#x "
-                "logical=%#x node=%u len=%u inline=%u\n",
-                slot_index, doorbell_addr, logical_doorbell_addr,
-                static_cast<unsigned>(entry.node_id),
-                static_cast<unsigned>(entry.length),
-                static_cast<unsigned>(entry.is_inline));
-        return DoorbellHandleResult::NotHandled;
-    }
-
-    const uint32_t expectedNodeId = slot_index - 1;
-    if (entry.node_id != expectedNodeId) {
-        DPRINTF(CXLRPCEngine,
-                "Ignoring request doorbell with mismatched slot/node: "
-                "slot=%u expected_node=%u observed_node=%u "
-                "doorbell=%#x logical=%#x rpc_id=%u len=%u\n",
-                slot_index, expectedNodeId,
-                static_cast<unsigned>(entry.node_id),
-                doorbell_addr, logical_doorbell_addr,
-                static_cast<unsigned>(entry.rpc_id),
-                static_cast<unsigned>(entry.length));
-        return DoorbellHandleResult::NotHandled;
-    }
-
     MetadataQueue& queue = conn.metadata_queue;
 
     // Check if queue is full only for validated request doorbells.
@@ -514,16 +435,10 @@ CXLRPCEngine::processRequest(
         }
     }
 
-    const size_t doorbellOffset =
-        static_cast<size_t>(doorbell_addr - pktStart);
-    if (doorbellOffset != payloadOffset) {
-        std::memmove(pktData + payloadOffset,
-                     pktData + doorbellOffset,
-                     kDoorbellEntrySize);
-    }
-
     DoorbellEntry remapped = entry;
     remapped.phase = slotPhase ? 1u : 0u;
+    // The remapped metadata entry is fully materialized here, so no source
+    // payload shuffle is needed even when the packet spans a full cache line.
     remapped.serializeToBuffer(pktData + payloadOffset);
 
     pkt->setAddr(remapAddr);
@@ -546,37 +461,12 @@ CXLRPCEngine::processRequest(
 DoorbellHandleResult
 CXLRPCEngine::processHeadUpdate(
     ClientConnection& conn, Addr doorbell_addr,
-    Addr logical_doorbell_addr, uint32_t slot_index,
     const DoorbellEntry& entry, PacketPtr pkt)
 {
-    if (slot_index != 0 || logical_doorbell_addr != conn.doorbell_addr) {
-        DPRINTF(CXLRPCEngine,
-                "Ignoring HEAD_UPDATE on non-control slot: slot=%u "
-                "doorbell=%#x logical=%#x control=%#x\n",
-                slot_index, doorbell_addr, logical_doorbell_addr,
-                conn.doorbell_addr);
-        return DoorbellHandleResult::NotHandled;
-    }
-
     // The data field contains the new head value
     uint32_t new_head = entry.data & 0xFFFFFFFFu;
 
     MetadataQueue& queue = conn.metadata_queue;
-    if (queue.capacity == 0) {
-        stats.invalidHeadUpdates++;
-        DPRINTF(CXLRPCEngine,
-                "HEAD_UPDATE ignored for node %u: capacity is zero\n",
-                conn.node_id);
-        return DoorbellHandleResult::Handled;
-    }
-    if (new_head >= queue.capacity) {
-        stats.invalidHeadUpdates++;
-        DPRINTF(CXLRPCEngine,
-                "HEAD_UPDATE ignored for node %u: new_head=%u >= capacity=%u\n",
-                conn.node_id, new_head, queue.capacity);
-        return DoorbellHandleResult::Handled;
-    }
-
     // HEAD_UPDATE only needs to update controller-side head state. Keep this
     // control-path update in-controller and skip downstream memory writes.
     queue.head_cached = new_head;
@@ -609,17 +499,8 @@ CXLRPCEngine::isBootstrapRequest(const DoorbellEntry& entry) const
 DoorbellHandleResult
 CXLRPCEngine::processBootstrapRequest(
     ClientConnection& conn, Addr doorbell_addr,
-    Addr logical_doorbell_addr, uint32_t slot_index,
     const DoorbellEntry& entry, PacketPtr pkt)
 {
-    if (slot_index != 0 || logical_doorbell_addr != conn.doorbell_addr) {
-        DPRINTF(CXLRPCEngine,
-                "Ignoring bootstrap request on translated non-slot0 doorbell: "
-                "slot=%u doorbell=%#x logical=%#x\n",
-                slot_index, doorbell_addr, logical_doorbell_addr);
-        return DoorbellHandleResult::NotHandled;
-    }
-
     const uint16_t opcode = bootstrapOpcode(entry.length);
 
     if (opcode == kBootstrapOpRegisterDoorbell) {
@@ -652,7 +533,7 @@ CXLRPCEngine::processBootstrapRequest(
             return DoorbellHandleResult::Consumed;
         }
 
-        conn.doorbell_page_addr_map[logicalPage] = observedPage;
+        bindDoorbellPage(conn, logicalPage, observedPage);
 
         DPRINTF(CXLRPCEngine,
                 "Registered doorbell page translation: node=%u page=%u "
@@ -708,34 +589,16 @@ CXLRPCEngine::processBootstrapRequest(
 }
 
 bool
-CXLRPCEngine::consumeBootstrapDoorbellBinding(PacketPtr pkt)
+CXLRPCEngine::consumeBootstrapDoorbellBinding(PacketPtr pkt,
+                                              const DoorbellWriteProbe& probe)
 {
     if (!pkt || !pkt->isWrite() || !pkt->hasData() || pkt->getSize() < 16 ||
         connections.size() != 1 || (pkt->getAddr() % kDoorbellSlotStride) != 0) {
         return false;
     }
 
-    DoorbellEntry entry;
-    const uint8_t* raw = pkt->getConstPtr<uint8_t>();
-    uint64_t rawLo = 0;
-    uint64_t rawHi = 0;
-    entry.parseFromBuffer(raw);
-    std::memcpy(&rawLo, raw, sizeof(rawLo));
-    std::memcpy(&rawHi, raw + sizeof(rawLo), sizeof(rawHi));
-    if (!isBootstrapRequest(entry) ||
-        bootstrapOpcode(entry.length) != kBootstrapOpRegisterDoorbell) {
-        DPRINTF(CXLRPCEngine,
-                "Unregistered write did not qualify for doorbell learning: "
-                "addr=%#x size=%u raw_lo=%#x raw_hi=%#x method=%u inline=%u "
-                "phase=%u len=%#x node=%u rpc=%u opcode=%#x\n",
-                pkt->getAddr(), pkt->getSize(), rawLo, rawHi,
-                static_cast<unsigned>(entry.method),
-                static_cast<unsigned>(entry.is_inline),
-                static_cast<unsigned>(entry.phase),
-                static_cast<unsigned>(entry.length),
-                static_cast<unsigned>(entry.node_id),
-                static_cast<unsigned>(entry.rpc_id),
-                static_cast<unsigned>(bootstrapOpcode(entry.length)));
+    if (!probe.should_probe || !isBootstrapRequest(probe.entry) ||
+        bootstrapOpcode(probe.entry.length) != kBootstrapOpRegisterDoorbell) {
         return false;
     }
 
@@ -751,7 +614,7 @@ CXLRPCEngine::consumeBootstrapDoorbellBinding(PacketPtr pkt)
         return false;
     }
 
-    conn.doorbell_page_addr_map[logicalPage] = observedPage;
+    bindDoorbellPage(conn, logicalPage, observedPage);
 
     DPRINTF(CXLRPCEngine,
             "Bound bootstrap doorbell canonical page: logical=%#x "
@@ -771,6 +634,11 @@ CXLRPCEngine::registerConnection(uint32_t node_id,
                                   uint32_t response_data_capacity,
                                   Addr flag_addr)
 {
+    auto existing = connections.find(doorbell_addr);
+    if (existing != connections.end()) {
+        unbindDoorbellPages(existing->second);
+    }
+
     ClientConnection conn;
     conn.node_id = node_id;
     conn.doorbell_addr = doorbell_addr;
@@ -816,8 +684,6 @@ CXLRPCEngine::RPCEngineStats::RPCEngineStats(CXLRPCEngine& engine)
                "Number of requests forwarded to metadata queue"),
       ADD_STAT(headUpdatesReceived, statistics::units::Count::get(),
                "Number of HEAD_UPDATE messages received"),
-      ADD_STAT(invalidHeadUpdates, statistics::units::Count::get(),
-               "Number of invalid HEAD_UPDATE values ignored"),
       ADD_STAT(queueFullEvents, statistics::units::Count::get(),
                "Number of times metadata queue was full"),
       ADD_STAT(metadataQueueWrites, statistics::units::Count::get(),

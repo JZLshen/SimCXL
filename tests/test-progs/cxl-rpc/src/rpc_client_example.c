@@ -47,7 +47,9 @@
 #define MIN_REQUEST_SIZE 8
 #define MIN_RESPONSE_SIZE 8
 #define MAX_REQUEST_SIZE (256u * 1024u)
-#define MAX_RESPONSE_SIZE (4096u - 8u)
+#define MAX_RESPONSE_SIZE (RESPONSE_DATA_BYTES - 8ULL)
+#define CLIENT_RPC_ID_MAX 32767u
+#define CLIENT_RPC_ID_SPACE (CLIENT_RPC_ID_MAX + 1u)
 #define FIXED_SLIDING_WINDOW 16
 
 typedef struct __attribute__((packed)) {
@@ -55,7 +57,6 @@ typedef struct __attribute__((packed)) {
     uint32_t rhs;
 } add_request_t;
 
-#define RPC_ID_SPACE (1u << 15)
 #define FIRST_REQ_BARRIER_MAGIC 0x46524231u
 #define FIRST_REQ_BARRIER_WORDS (((MAX_CLIENTS) + 63) / 64)
 
@@ -427,12 +428,13 @@ send_one_request(cxl_connection_t *conn,
                  uint8_t *req_payload,
                  size_t request_size,
                  uint32_t *rng_state,
-                 uint32_t *pending_slot_by_rpc_id,
+                 int *rpc_id_to_request_index,
                  uint64_t *request_start_ticks,
                  int sent_requests)
 {
-    if (!conn || !req_payload || !rng_state || !pending_slot_by_rpc_id ||
-        !request_start_ticks || sent_requests < 0) {
+    if (!conn || !req_payload || !rng_state ||
+        !rpc_id_to_request_index || !request_start_ticks ||
+        sent_requests < 0) {
         return -1;
     }
 
@@ -449,79 +451,91 @@ send_one_request(cxl_connection_t *conn,
 
     uint64_t start_tick = current_tick();
     int rpc_id = cxl_send_request(conn, req_payload, request_size);
-    if (rpc_id <= 0 || rpc_id >= (int)RPC_ID_SPACE) {
+    if (rpc_id <= 0) {
         fprintf(stderr, "client: cxl_send_request failed\n");
         return -1;
     }
+    if ((unsigned int)rpc_id > CLIENT_RPC_ID_MAX ||
+        rpc_id_to_request_index[rpc_id] >= 0) {
+        fprintf(stderr, "client: rpc_id tracking overflow/duplicate\n");
+        return -1;
+    }
 
-    pending_slot_by_rpc_id[rpc_id] = (uint32_t)sent_requests + 1u;
+    rpc_id_to_request_index[rpc_id] = sent_requests;
     request_start_ticks[sent_requests] = start_tick;
     return rpc_id;
 }
 
 static int
 drain_completed_responses(cxl_connection_t *conn,
-                          uint8_t *response_buf,
-                          size_t response_buf_size,
-                          uint32_t *pending_slot_by_rpc_id,
+                          size_t expected_response_size,
+                          int *rpc_id_to_request_index,
                           uint64_t *request_end_ticks,
                           int *completed_requests)
 {
-    if (!conn || !response_buf || response_buf_size == 0 ||
-        !pending_slot_by_rpc_id || !request_end_ticks ||
-        !completed_requests) {
+    if (!conn || expected_response_size == 0 ||
+        !rpc_id_to_request_index ||
+        !request_end_ticks || !completed_requests) {
         return -1;
     }
-
-    uint16_t latest_completed_rpc_id = 0;
-    int peek_rc =
-        cxl_peek_latest_completed_rpc_id(conn, &latest_completed_rpc_id);
-    if (peek_rc < 0) {
-        fprintf(stderr, "client: cxl_peek_latest_completed_rpc_id failed\n");
-        return -1;
-    }
-    if (peek_rc == 0)
-        return 0;
 
     int drained = 0;
     while (keep_running) {
-        size_t response_len = response_buf_size;
+        const void *response_view = NULL;
+        size_t response_len = 0;
         uint16_t consumed_rpc_id = 0;
-        int consume_rc = cxl_consume_next_response(conn,
-                                                   response_buf,
-                                                   &response_len,
-                                                   &consumed_rpc_id);
-        if (consume_rc < 0) {
-            fprintf(stderr, "client: cxl_consume_next_response failed\n");
+        int peek_rc = cxl_peek_next_response_view(conn,
+                                                  &response_view,
+                                                  &response_len,
+                                                  &consumed_rpc_id);
+        if (peek_rc < 0) {
+            fprintf(stderr,
+                    "client: cxl_peek_next_response_view failed\n");
             return -1;
         }
-        if (consume_rc == 0) {
+        if (peek_rc == 0) {
             break;
         }
 
-        if (response_len != response_buf_size) {
+        if (response_len != expected_response_size) {
             fprintf(stderr,
                     "client: response size mismatch expect=%zu got=%zu\n",
-                    response_buf_size, response_len);
+                    expected_response_size, response_len);
+            return -1;
+        }
+        if (response_len > 0 && !response_view) {
+            fprintf(stderr, "client: zero-copy response view is NULL\n");
             return -1;
         }
 
-        uint32_t slot = pending_slot_by_rpc_id[consumed_rpc_id];
-        if (slot == 0) {
-            fprintf(stderr,
-                    "client: unexpected response rpc_id=%u not in pending list\n",
-                    consumed_rpc_id);
+        /*
+         * Measure the zero-copy payload-view receive path: response completion
+         * is recorded only after the shared-memory payload view has been
+         * prepared and the local consumer head has advanced.
+         */
+        if (cxl_advance_response_head(conn,
+                                      consumed_rpc_id,
+                                      response_len) != 1) {
+            fprintf(stderr, "client: cxl_advance_response_head failed\n");
             return -1;
         }
-        int idx = (int)(slot - 1u);
 
+        if ((unsigned int)consumed_rpc_id > CLIENT_RPC_ID_MAX) {
+            fprintf(stderr, "client: invalid consumed rpc_id=%u\n",
+                    (unsigned)consumed_rpc_id);
+            return -1;
+        }
+
+        int idx = rpc_id_to_request_index[consumed_rpc_id];
+        if (idx < 0 || request_end_ticks[idx] != UINT64_MAX) {
+            fprintf(stderr, "client: unmatched or duplicate response rpc_id=%u\n",
+                    (unsigned)consumed_rpc_id);
+            return -1;
+        }
         request_end_ticks[idx] = current_tick();
-        pending_slot_by_rpc_id[consumed_rpc_id] = 0;
+        rpc_id_to_request_index[consumed_rpc_id] = -1;
         (*completed_requests)++;
         drained = 1;
-
-        if (consumed_rpc_id == latest_completed_rpc_id)
-            break;
     }
 
     return drained;
@@ -543,11 +557,10 @@ main(int argc, char **argv)
 
     cxl_context_t *ctx = NULL;
     cxl_connection_t *conn = NULL;
+    int *rpc_id_to_request_index = NULL;
     uint64_t *request_start_ticks = NULL;
     uint64_t *request_end_ticks = NULL;
-    uint32_t *pending_slot_by_rpc_id = NULL;
     uint8_t *req_payload = NULL;
-    uint8_t *response_buf = NULL;
 
     int num_requests = parse_int_arg(argc, argv, "--requests",
                                      DEFAULT_NUM_REQUESTS);
@@ -577,7 +590,9 @@ main(int argc, char **argv)
     if (parse_size_arg(argc, argv, "--response-size", DEFAULT_RESPONSE_SIZE,
                        MIN_RESPONSE_SIZE, MAX_RESPONSE_SIZE,
                        &response_size) != 0) {
-        fprintf(stderr, "client: invalid --response-size (range 8B..4088B)\n");
+        fprintf(stderr,
+                "client: invalid --response-size (range %uB..%zuB)\n",
+                MIN_RESPONSE_SIZE, (size_t)MAX_RESPONSE_SIZE);
         return 1;
     }
 
@@ -619,25 +634,22 @@ main(int argc, char **argv)
     size_t reserve_n = (num_requests > 0) ? (size_t)num_requests : 1;
     request_start_ticks = (uint64_t *)calloc(reserve_n, sizeof(uint64_t));
     request_end_ticks = (uint64_t *)calloc(reserve_n, sizeof(uint64_t));
-    pending_slot_by_rpc_id =
-        (uint32_t *)calloc(RPC_ID_SPACE, sizeof(uint32_t));
-    if (!request_start_ticks || !request_end_ticks || !pending_slot_by_rpc_id) {
+    rpc_id_to_request_index =
+        (int *)malloc((size_t)CLIENT_RPC_ID_SPACE *
+                      sizeof(*rpc_id_to_request_index));
+    if (!request_start_ticks || !request_end_ticks ||
+        !rpc_id_to_request_index) {
         fprintf(stderr, "client: allocate tick buffers failed\n");
         rc = 1;
         goto cleanup;
     }
     memset(request_end_ticks, 0xFF, reserve_n * sizeof(*request_end_ticks));
+    for (size_t i = 0; i < (size_t)CLIENT_RPC_ID_SPACE; i++)
+        rpc_id_to_request_index[i] = -1;
 
     req_payload = (uint8_t *)calloc(1, request_size);
     if (!req_payload) {
         fprintf(stderr, "client: allocate request payload failed\n");
-        rc = 1;
-        goto cleanup;
-    }
-
-    response_buf = (uint8_t *)malloc(response_size);
-    if (!response_buf) {
-        fprintf(stderr, "client: allocate response buffer failed\n");
         rc = 1;
         goto cleanup;
     }
@@ -651,7 +663,8 @@ main(int argc, char **argv)
     if (keep_running && num_requests > 0) {
         int first_req_id = send_one_request(conn,
                                             req_payload, request_size,
-                                            &rng_state, pending_slot_by_rpc_id,
+                                            &rng_state,
+                                            rpc_id_to_request_index,
                                             request_start_ticks,
                                             sent_requests);
         if (first_req_id <= 0) {
@@ -675,7 +688,8 @@ main(int argc, char **argv)
         if (can_send && !should_poll) {
             int req_id = send_one_request(conn,
                                           req_payload, request_size,
-                                          &rng_state, pending_slot_by_rpc_id,
+                                          &rng_state,
+                                          rpc_id_to_request_index,
                                           request_start_ticks,
                                           sent_requests);
             if (req_id <= 0) {
@@ -687,17 +701,17 @@ main(int argc, char **argv)
         }
 
         int round_rc = drain_completed_responses(conn,
-                                                 response_buf,
                                                  response_size,
-                                                 pending_slot_by_rpc_id,
+                                                 rpc_id_to_request_index,
                                                  request_end_ticks,
                                                  &completed_requests);
         if (round_rc < 0) {
             rc = 1;
             break;
         }
-        if (round_rc == 0)
+        if (round_rc == 0) {
             spin_pause_iters(poll_pause_iters);
+        }
     }
 
     if (sent_requests != num_requests || completed_requests != num_requests)
@@ -728,9 +742,8 @@ cleanup:
 
     free(request_start_ticks);
     free(request_end_ticks);
-    free(pending_slot_by_rpc_id);
+    free(rpc_id_to_request_index);
     free(req_payload);
-    free(response_buf);
 
     return rc ? 1 : 0;
 }

@@ -34,7 +34,9 @@
 #define DEFAULT_IDLE_PAUSE_ITERS 0
 #define DEFAULT_RESPONSE_SIZE 16
 #define MIN_RESPONSE_SIZE 8
-#define MAX_RESPONSE_SIZE (4096u - 8u)
+#define MAX_RESPONSE_SIZE (RESPONSE_DATA_BYTES - 8ULL)
+#define RESPONSE_DMA_THRESHOLD 4096u
+#define RESPONSE_HEADER_BYTES 8u
 
 typedef struct __attribute__((packed)) {
     uint32_t lhs;
@@ -45,7 +47,21 @@ typedef struct __attribute__((packed)) {
     uint64_t sum;
 } add_response_t;
 
+typedef struct {
+    uint16_t node_id;
+    uint16_t rpc_id;
+    uint64_t poll_tick;
+    uint64_t exec_tick;
+    uint64_t resp_submit_tick;
+} server_request_timing_t;
+
 static volatile int keep_running = 1;
+
+static inline uint64_t
+current_tick(void)
+{
+    return m5_rpns();
+}
 
 static int
 parse_int_arg(int argc, char **argv, const char *flag, int default_val)
@@ -161,6 +177,8 @@ main(int argc, char **argv)
     cxl_connection_t *poll_conn = NULL;
     cxl_connection_t *resp_conns[MAX_CLIENTS] = {0};
     uint8_t *resp_payload = NULL;
+    server_request_timing_t *timings = NULL;
+    uint64_t poll_phase_start_tick = 0;
 
     int max_requests = parse_int_arg(argc, argv, "--max-requests",
                                      DEFAULT_MAX_REQUESTS);
@@ -172,7 +190,9 @@ main(int argc, char **argv)
     if (parse_size_arg(argc, argv, "--response-size", DEFAULT_RESPONSE_SIZE,
                        MIN_RESPONSE_SIZE, MAX_RESPONSE_SIZE,
                        &response_size) != 0) {
-        fprintf(stderr, "server: invalid --response-size (range 8B..4088B)\n");
+        fprintf(stderr,
+                "server: invalid --response-size (range %uB..%zuB)\n",
+                MIN_RESPONSE_SIZE, (size_t)MAX_RESPONSE_SIZE);
         return 1;
     }
 
@@ -209,22 +229,18 @@ main(int argc, char **argv)
     }
 
     for (int i = 0; i < num_clients; i++) {
-        if (num_clients == 1) {
-            resp_conns[i] = cxl_connection_create_response_tx(ctx);
-        } else {
-            resp_conns[i] = cxl_connection_create_response_tx(ctx);
-        }
+        resp_conns[i] = cxl_connection_create_response_tx(ctx);
         if (!resp_conns[i]) {
             fprintf(stderr, "server: create response-tx connection failed\n");
             rc = 1;
             goto cleanup;
         }
 
-        if (cxl_connection_bind_copyengine_lane_index(resp_conns[i],
+        if ((response_size + (size_t)RESPONSE_HEADER_BYTES) >
+                (size_t)RESPONSE_DMA_THRESHOLD &&
+            cxl_connection_bind_copyengine_lane_index(resp_conns[i],
                                                       (size_t)i) < 0) {
-            fprintf(stderr,
-                    "server: bind CopyEngine lane index failed for client %d\n",
-                    i);
+            fprintf(stderr, "server: bind dedicated CopyEngine lane failed\n");
             rc = 1;
             goto cleanup;
         }
@@ -248,20 +264,36 @@ main(int argc, char **argv)
 
     }
 
-    resp_payload = (uint8_t *)calloc(1, response_size);
-    if (!resp_payload) {
-        fprintf(stderr, "server: allocate response buffer failed\n");
-        rc = 1;
-        goto cleanup;
+    if (max_requests > 0) {
+        timings = (server_request_timing_t *)calloc((size_t)max_requests,
+                                                    sizeof(*timings));
+        if (!timings) {
+            fprintf(stderr, "server: allocate timing buffer failed\n");
+            rc = 1;
+            goto cleanup;
+        }
+    }
+
+    if (response_size != sizeof(add_response_t)) {
+        resp_payload = (uint8_t *)calloc(1, response_size);
+        if (!resp_payload) {
+            fprintf(stderr, "server: allocate response buffer failed\n");
+            rc = 1;
+            goto cleanup;
+        }
     }
 
     printf("server_ready=1\n");
+    poll_phase_start_tick = current_tick();
 
     while (keep_running) {
         uint16_t node_id = 0;
         uint16_t rpc_id = 0;
         const void *req_data_view = NULL;
         size_t req_len = 0;
+        uint64_t poll_end_tick = 0;
+        uint64_t exec_end_tick = 0;
+        uint64_t resp_end_tick = 0;
 
         int ret = cxl_poll_request(poll_conn,
                                    &node_id,
@@ -269,6 +301,7 @@ main(int argc, char **argv)
                                    &req_data_view,
                                    &req_len);
         if (ret == 1) {
+            poll_end_tick = current_tick();
             if (node_id >= (uint16_t)num_clients) {
                 fprintf(stderr, "server: invalid node_id=%u\n", node_id);
                 rc = 1;
@@ -286,14 +319,37 @@ main(int argc, char **argv)
             add_response_t add_resp = {
                 .sum = (uint64_t)req_view->lhs + (uint64_t)req_view->rhs,
             };
-            memcpy(resp_payload, &add_resp, sizeof(add_resp));
+            const void *resp_data = (const void *)&add_resp;
+            if (resp_payload) {
+                memcpy(resp_payload, &add_resp, sizeof(add_resp));
+                resp_data = (const void *)resp_payload;
+            }
+            exec_end_tick = current_tick();
 
             if (cxl_send_response(resp_conns[node_id], rpc_id,
-                                  resp_payload, response_size) < 0) {
+                                  resp_data, response_size) < 0) {
                 fprintf(stderr, "server: send response failed\n");
                 rc = 1;
                 break;
             }
+            resp_end_tick = current_tick();
+            if (timings &&
+                requests_processed < (uint64_t)max_requests) {
+                server_request_timing_t *record =
+                    &timings[requests_processed];
+                record->node_id = node_id;
+                record->rpc_id = rpc_id;
+                record->poll_tick =
+                    (poll_end_tick >= poll_phase_start_tick) ?
+                    (poll_end_tick - poll_phase_start_tick) : 0;
+                record->exec_tick =
+                    (exec_end_tick >= poll_end_tick) ?
+                    (exec_end_tick - poll_end_tick) : 0;
+                record->resp_submit_tick =
+                    (resp_end_tick >= exec_end_tick) ?
+                    (resp_end_tick - exec_end_tick) : 0;
+            }
+            poll_phase_start_tick = resp_end_tick;
             requests_processed++;
             if (max_requests > 0 &&
                 requests_processed >= (uint64_t)max_requests) {
@@ -310,6 +366,27 @@ main(int argc, char **argv)
     }
 
 cleanup:
+    if (timings) {
+        for (uint64_t i = 0;
+             i < requests_processed && i < (uint64_t)max_requests;
+             i++) {
+            const server_request_timing_t *record = &timings[i];
+            printf("server_req_%lu_node_id=%u\n",
+                   (unsigned long)i, (unsigned)record->node_id);
+            printf("server_req_%lu_rpc_id=%u\n",
+                   (unsigned long)i, (unsigned)record->rpc_id);
+            printf("server_req_%lu_poll_tick=%lu\n",
+                   (unsigned long)i, record->poll_tick);
+            printf("server_req_%lu_exec_tick=%lu\n",
+                   (unsigned long)i, record->exec_tick);
+            printf("server_req_%lu_resp_submit_tick=%lu\n",
+                   (unsigned long)i, record->resp_submit_tick);
+        }
+    }
+    fflush(stdout);
+    fflush(stderr);
+
+    free(timings);
     free(resp_payload);
 
     for (int i = 0; i < num_clients; i++) {

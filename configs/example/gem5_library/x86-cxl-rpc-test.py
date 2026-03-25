@@ -236,7 +236,10 @@ def _load_checkpoint_copyengine_topology(
             if not line:
                 continue
 
-            if re.match(r"^\[board\.pc\.south_bridge\.copy_engines\d+\]$", line):
+            if re.match(
+                r"^\[board\.pc\.south_bridge\.copy_engines(?:\d+)?\]$",
+                line,
+            ):
                 engine_sections += 1
                 current_is_engine = True
                 continue
@@ -420,6 +423,7 @@ script_lines.extend(
         "  bash -c \"$TEST_CMD\"",
         "  TEST_CMD_RC=$?",
         "fi",
+        "echo \"TEST_CMD_EXIT_CODE=${TEST_CMD_RC}\"",
     ]
 )
 
@@ -430,11 +434,6 @@ if fail_on_test_error:
             "  echo \"[gem5-test] m5 fail due to test failure rc=${TEST_CMD_RC}\"",
             "  m5 fail \"$TEST_CMD_RC\"",
             "fi",
-        ]
-    )
-else:
-    script_lines.extend(
-        [
         ]
     )
 

@@ -29,14 +29,6 @@ GROUP_SPECS = [
         "subtitle": "req=64B, resp=64B; compare different client counts",
         "x_label": "Clients",
         "x_field": "clients",
-        "rows": [
-            "req64_resp64_c1_r30",
-            "req64_resp64_c2_r30",
-            "req64_resp64_c4_r30",
-            "req64_resp64_c8_r30",
-            "req64_resp64_c16_r30",
-            "req64_resp64_c29_r30",
-        ],
     },
     {
         "slug": "response_size_sweep",
@@ -44,12 +36,6 @@ GROUP_SPECS = [
         "subtitle": "req=64B, clients=16; compare different response sizes",
         "x_label": "Response Size (B)",
         "x_field": "response_size",
-        "rows": [
-            "req64_resp8_c16_r30",
-            "req64_resp64_c16_r30",
-            "req64_resp256_c16_r30",
-            "req64_resp1024_c16_r30",
-        ],
     },
     {
         "slug": "request_size_sweep",
@@ -57,14 +43,6 @@ GROUP_SPECS = [
         "subtitle": "resp=64B, clients=16; compare different request sizes",
         "x_label": "Request Size (B)",
         "x_field": "request_size",
-        "rows": [
-            "req8_resp64_c16_r30",
-            "req64_resp64_c16_r30",
-            "req256_resp64_c16_r30",
-            "req1024_resp64_c16_r30",
-            "req4096_resp64_c16_r30",
-            "req8192_resp64_c16_r30",
-        ],
     },
 ]
 
@@ -244,6 +222,32 @@ def read_ticks(csv_path: Path) -> dict[str, list[TickRow]]:
             )
             rows_by_exp.setdefault(tick.exp_id, []).append(tick)
     return rows_by_exp
+
+
+def source_has_group(source: str, group_slug: str) -> bool:
+    return group_slug in {item.strip() for item in source.split(",") if item.strip()}
+
+
+def group_meta_sort_key(spec: dict[str, object], meta: ExperimentMeta) -> tuple[object, ...]:
+    x_field = str(spec["x_field"])
+    return (
+        getattr(meta, x_field),
+        meta.clients,
+        meta.request_size,
+        meta.response_size,
+        meta.requests_per_client,
+        meta.exp_id,
+    )
+
+
+def select_group_metas(spec: dict[str, object],
+                       metas: dict[str, ExperimentMeta]) -> list[ExperimentMeta]:
+    group_slug = str(spec["slug"])
+    selected = [
+        meta for meta in metas.values()
+        if source_has_group(meta.source, group_slug)
+    ]
+    return sorted(selected, key=lambda meta: group_meta_sort_key(spec, meta))
 
 
 def compare_ratio(left_count: int, left_span: int,
@@ -734,11 +738,13 @@ def main() -> int:
     skipped: list[str] = []
     for spec in GROUP_SPECS:
         group_slug = str(spec["slug"])
-        for exp_id in spec["rows"]:
-            meta = metas.get(exp_id)
-            if meta is None:
-                skipped.append(f"{exp_id}: missing metadata")
-                continue
+        group_metas = select_group_metas(spec, metas)
+        if not group_metas:
+            skipped.append(f"{group_slug}: no experiments matched this group")
+            continue
+
+        for meta in group_metas:
+            exp_id = meta.exp_id
             if meta.status != "ok":
                 skipped.append(f"{exp_id}: status={meta.status}")
                 continue
@@ -837,7 +843,16 @@ def main() -> int:
         group_items = [item for item in summary_objects if item.group_slug == group_slug]
         if not group_items:
             continue
-        group_items.sort(key=lambda item: spec["rows"].index(item.exp_id))
+        group_items.sort(
+            key=lambda item: (
+                getattr(item, str(spec["x_field"])),
+                item.clients,
+                item.request_size,
+                item.response_size,
+                item.requests_per_client,
+                item.exp_id,
+            )
+        )
         group_csv_rows = [
             summary_row(
                 item,
