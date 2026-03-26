@@ -190,9 +190,12 @@ board = X86Board(
 
 # Boot with KVM and wait for guest SMP bring-up before checkpoint.
 # If checkpoint is taken too early, only CPU0 may be online after restore,
-# which breaks server/client co-run workflows. After the handoff EXIT is
-# restored, this same script performs exactly one additional m5 readfile to
-# fetch the real test payload and exec it.
+# which breaks server/client co-run workflows. The checkpoint is not saved on
+# the first guest handoff EXIT anymore. Instead, the guest crosses the handoff
+# boundary once, settles briefly in KVM again, and then emits a second EXIT.
+# Saving on that second EXIT preserves the one-shot restore readfile handoff
+# while avoiding the sharpest edge of the initial exit trap for larger SMP
+# topologies.
 checkpoint_readfile = f"""
 set -u
 CKPT_BOOTSTRAP_MAGIC="CXL_RPC_CKPT_BOOTSTRAP_V2"
@@ -261,6 +264,9 @@ if [ "$SYSTEM_QUIESCED" -ne 1 ]; then
 fi
 sync
 m5 exit
+sleep 1
+sync
+m5 exit
 
 RESTORE_SCRIPT=/tmp/gem5_restore_script.sh
 RESTORE_TMP=/tmp/gem5_restore_script.sh.new
@@ -305,6 +311,7 @@ board.set_kernel_disk_workload(
 # Event handlers
 checkpoint_dir = Path(m5.options.outdir)
 checkpoint_trigger = {"tick": None, "events": 0, "saved": False}
+handoff_exit_target = 2
 run_step_ticks = max(1, args.run_step_ticks)
 status_wall_interval_sec = 15.0
 last_status_wall = {"pre_exit": 0.0}
@@ -327,9 +334,19 @@ def checkpoint_handler():
             continue
 
         checkpoint_trigger["tick"] = m5.curTick()
+        if checkpoint_trigger["events"] < handoff_exit_target:
+            print(
+                "Checkpoint handoff EXIT observed; continuing guest settle "
+                f"event_count={checkpoint_trigger['events']}/"
+                f"{handoff_exit_target} curTick={m5.curTick()}"
+            )
+            yield False
+            continue
+
         print(
-            "Checkpoint trigger observed; saving immediately to preserve "
-            f"one-shot restore readfile handoff curTick={m5.curTick()}"
+            "Checkpoint handoff EXIT observed; saving checkpoint "
+            f"event_count={checkpoint_trigger['events']}/"
+            f"{handoff_exit_target} curTick={m5.curTick()}"
         )
         save_checkpoint("guest-exit-readfile-handoff")
         checkpoint_trigger["saved"] = True
@@ -342,7 +359,7 @@ def save_checkpoint(reason: str):
     m5.checkpoint(str(checkpoint_dir))
     print("Checkpoint saved successfully!")
     print(f"  Location: {checkpoint_dir}")
-    print("  State: KVM (bootstrap script paused at handoff EXIT)")
+    print("  State: KVM (bootstrap script paused at second handoff EXIT)")
     print("  Restore can use: TIMING, O3, or KVM")
 
 simulator = Simulator(
@@ -360,7 +377,7 @@ print(f"  Disk: {args.disk}")
 print(f"  Checkpoint will be saved in KVM state (before CPU switch)")
 print("  This allows restore with TIMING, O3, or KVM")
 print(f"  Handoff deadline sim-seconds: {args.handoff_deadline_sim_seconds}")
-print("  Save policy: immediate at guest handoff EXIT")
+print("  Save policy: second guest handoff EXIT after guest-side settle")
 print(f"  Run step ticks: {run_step_ticks}")
 print(
     "  CopyEngine topology: "

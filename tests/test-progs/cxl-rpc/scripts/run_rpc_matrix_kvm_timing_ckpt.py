@@ -338,7 +338,7 @@ def parse_board_results(
         r"^req_(\d+)_(start|end|delta)_tick=(\d+)\s*$"
     )
     re_server = re.compile(
-        r"^server_req_(\d+)_(node_id|rpc_id|poll_tick|exec_tick|resp_submit_tick)=(\d+)\s*$"
+        r"^server_req_(\d+)_(node_id|rpc_id|poll_tick|poll_notify_tick|poll_req_data_tick|poll_tail_tick|exec_tick|resp_submit_tick)=(\d+)\s*$"
     )
 
     for line in board_path.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -384,33 +384,30 @@ def parse_board_results(
 
     client_rows: List[Dict[str, int]] = []
     for (node_id, ridx), vals in sorted(client_fields.items()):
-        if "start" in vals and "end" in vals and "delta" in vals:
+        if "start" in vals and "end" in vals:
+            start_tick = vals["start"]
+            end_tick = vals["end"]
             client_rows.append(
                 {
                     "node_id": node_id,
                     "req_index": ridx,
-                    "start_tick": vals["start"],
-                    "end_tick": vals["end"],
-                    "delta_tick": vals["delta"],
+                    "start_tick": start_tick,
+                    "end_tick": end_tick,
                 }
             )
 
     server_rows: List[Dict[str, int]] = []
     for req_index, vals in sorted(server_fields.items()):
-        required = (
-            "node_id",
-            "rpc_id",
-            "poll_tick",
-            "exec_tick",
-            "resp_submit_tick",
-        )
+        required = ("node_id", "exec_tick", "resp_submit_tick")
         if all(name in vals for name in required):
+            poll_notify_tick = vals.get("poll_notify_tick", vals.get("poll_tick", 0))
+            poll_req_data_tick = vals.get("poll_req_data_tick", 0)
             server_rows.append(
                 {
                     "server_req_index": req_index,
                     "node_id": vals["node_id"],
-                    "rpc_id": vals["rpc_id"],
-                    "poll_tick": vals["poll_tick"],
+                    "poll_notify_tick": poll_notify_tick,
+                    "poll_req_data_tick": poll_req_data_tick,
                     "exec_tick": vals["exec_tick"],
                     "resp_submit_tick": vals["resp_submit_tick"],
                 }
@@ -611,7 +608,6 @@ def main() -> int:
         "req_index",
         "start_tick",
         "end_tick",
-        "delta_tick",
         "output_dir",
     ]
     server_tick_fields = [
@@ -622,8 +618,8 @@ def main() -> int:
         "requests_per_client",
         "server_req_index",
         "node_id",
-        "rpc_id",
-        "poll_tick",
+        "poll_notify_tick",
+        "poll_req_data_tick",
         "exec_tick",
         "resp_submit_tick",
         "output_dir",
@@ -835,6 +831,9 @@ def main() -> int:
             server_args = f"--silent --response-size {key.response_size}"
             test_cmd = (
                 f"CXL_RPC_CLIENT_COUNT={key.clients} "
+                f"CXL_RPC_CLIENT_TIMEOUT_SEC=0 "
+                f"CXL_RPC_SERVER_READY_TIMEOUT_SEC=0 "
+                f"CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS=0 "
                 f"CXL_RPC_PIN_CORES=1 "
                 f"CXL_RPC_SERVER_CORE=0 "
                 f"CXL_RPC_CLIENT_CORE_BASE=1 "
@@ -961,7 +960,6 @@ def main() -> int:
                         "req_index": row["req_index"],
                         "start_tick": row["start_tick"],
                         "end_tick": row["end_tick"],
-                        "delta_tick": row["delta_tick"],
                         "output_dir": str(run_outdir),
                     },
                     tick_fields,
@@ -978,8 +976,8 @@ def main() -> int:
                         "requests_per_client": key.requests_per_client,
                         "server_req_index": row["server_req_index"],
                         "node_id": row["node_id"],
-                        "rpc_id": row["rpc_id"],
-                        "poll_tick": row["poll_tick"],
+                        "poll_notify_tick": row["poll_notify_tick"],
+                        "poll_req_data_tick": row["poll_req_data_tick"],
                         "exec_tick": row["exec_tick"],
                         "resp_submit_tick": row["resp_submit_tick"],
                         "output_dir": str(run_outdir),

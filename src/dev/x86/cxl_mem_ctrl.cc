@@ -340,14 +340,12 @@ CXLMemCtrl::CXLResponsePort::recvTimingReq(PacketPtr pkt)
 
     // Only pay doorbell handling costs after admission succeeds.
     DoorbellHandleResult doorbellResult = DoorbellHandleResult::NotHandled;
-    bool remappedDoorbell = false;
     if (doorbellProbe.should_probe) {
         auto dbResult = ctrl.rpcEngine->handleDoorbellWrite(pkt, &doorbellProbe);
         doorbellResult = dbResult;
         if (dbResult != DoorbellHandleResult::NotHandled) {
             DPRINTF(CXLRPCEngine, "Intercepting doorbell write at %#x\n",
                     pkt->getAddr());
-            remappedDoorbell = (dbResult == DoorbellHandleResult::Remapped);
         }
     }
 
@@ -379,9 +377,6 @@ CXLMemCtrl::CXLResponsePort::recvTimingReq(PacketPtr pkt)
     }
 
     memReqPort.schedTimingReq(pkt, ctrl.clockEdge(protoProcLat) + receive_delay);
-    if (remappedDoorbell && ctrl.rpcEngine) {
-        ctrl.rpcEngine->accountRemappedDoorbellForward();
-    }
 
     return !retryReq;
 }
@@ -578,10 +573,6 @@ CXLMemCtrl::CXLResponsePort::recvAtomic(PacketPtr pkt)
 
     Tick access_delay = memReqPort.sendAtomic(pkt);
 
-    if (atomicDoorbellResult == DoorbellHandleResult::Remapped && ctrl.rpcEngine) {
-        ctrl.rpcEngine->accountRemappedDoorbellForward();
-    }
-
     DPRINTF(CXLMemCtrl, "access_delay=%ld, proto_proc_lat=%ld, total=%ld\n",
             access_delay, delay, delay * ctrl.clockPeriod() + access_delay);
     return delay * ctrl.clockPeriod() + access_delay;
@@ -625,11 +616,6 @@ CXLMemCtrl::CXLResponsePort::recvAtomicBackdoor(
     }
 
     Tick access_delay = memReqPort.sendAtomicBackdoor(pkt, backdoor);
-
-    if (backdoorDoorbellResult == DoorbellHandleResult::Remapped &&
-        ctrl.rpcEngine) {
-        ctrl.rpcEngine->accountRemappedDoorbellForward();
-    }
 
     return delay * ctrl.clockPeriod() + access_delay;
 }

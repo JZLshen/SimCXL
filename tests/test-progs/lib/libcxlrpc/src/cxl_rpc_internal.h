@@ -7,20 +7,30 @@
 #include "cxl_rpc.h"
 
 #define CXL_RPC_ID_MASK            0x00007FFFu
-#define CXL_RPC_ID_SPACE           0x00008000u
-#define CXL_RPC_ID_BITMAP_WORDS    (CXL_RPC_ID_SPACE / 64u)
 #define CXL_NODE_ID_MASK           0x00003FFFu
 #define CXL_REQ_PAYLOAD_SOFT_MAX   (256u * 1024u)
 #define CXL_DOORBELL_ENTRY_LEN     16u
 #define CXL_DOORBELL_PUBLISH_LEN   16u
-#define CXL_FLAG_PUBLISH_LEN       2u
+#define CXL_FLAG_PUBLISH_LEN       8u
 #define CXL_FLAG_CACHELINE_BYTES   64u
 #define CXL_RESP_HEADER_LEN        8u
-#define CXL_RESP_SLOT_BYTES        4096u
-#define CXL_RESP_PAYLOAD_SOFT_MAX  (CXL_RESP_SLOT_BYTES - CXL_RESP_HEADER_LEN)
 #define CXL_METADATA_TRANSLATION_PAGE_BYTES 4096u
 
+#define CXL_CONN_CAP_REQUEST_RX     (1u << 0)
+#define CXL_CONN_CAP_REQUEST_TX     (1u << 1)
+#define CXL_CONN_CAP_RESPONSE_RX    (1u << 2)
+#define CXL_CONN_CAP_RESPONSE_TX    (1u << 3)
+#define CXL_CONN_CAP_BOOTSTRAP      (1u << 4)
+#define CXL_CONN_CAP_HEAD_SYNC      (1u << 5)
+
 typedef struct cxl_ce_desc cxl_ce_desc_t;
+
+static inline uint64_t
+cxl_pack_response_header(uint32_t payload_len, uint16_t rpc_id)
+{
+    return (uint64_t)payload_len |
+           ((uint64_t)rpc_id << 32);
+}
 
 struct cxl_context {
     volatile uint8_t *base;
@@ -33,6 +43,7 @@ struct cxl_context {
 
 struct cxl_connection {
     cxl_context_t *ctx;
+    uint32_t caps;
 
     cxl_connection_addrs_t addrs;
 
@@ -43,6 +54,7 @@ struct cxl_connection {
     volatile uint8_t *flag;
 
     uint32_t mq_entries;
+    uint32_t mq_total_lines;
     uint32_t mq_head;
     uint32_t mq_phase;
     uint32_t mq_prefetch_start_line;
@@ -51,20 +63,14 @@ struct cxl_connection {
     uint8_t mq_payload_prepared_mask;
     uint8_t mq_payload_next_probe_slot;
 
-    uint16_t rpc_id_seq_mask;
     uint16_t rpc_id_next;
-    uint32_t rpc_id_inflight_count;
-    uint32_t rpc_id_capacity;
-    uint64_t *rpc_id_inflight_bitmap;
-    uint32_t *req_entry_offsets;
-    uint32_t *req_entry_sizes;
-    uint16_t *req_entry_next;
-    uint8_t *req_entry_complete;
-    uint16_t req_ring_head_id;
-    uint16_t req_ring_tail_id;
-    size_t req_reclaim_offset;
-    size_t req_ring_used_bytes;
-    size_t resp_read_offset;
+    uint64_t resp_read_cursor;
+    uint64_t resp_known_producer_cursor;
+    uint64_t resp_peek_cursor;
+    size_t resp_peek_len;
+    uint16_t resp_peek_rpc_id;
+    uint8_t resp_peek_valid;
+    uint8_t resp_peek_payload_loaded;
     size_t req_write_offset;
 
     cxl_adaptive_sync_t *sync;
@@ -74,7 +80,7 @@ struct cxl_connection {
     size_t peer_response_data_size;
     volatile uint8_t *peer_response_data;
     volatile uint8_t *peer_flag;
-    size_t peer_resp_write_offset;
+    uint64_t peer_resp_write_cursor;
     int resp_tx_ready;
 
     int ce_lane_bind_valid;
@@ -83,24 +89,10 @@ struct cxl_connection {
     size_t ce_bind_lane_index;
     uint32_t ce_bind_channel_id;
 
-    int ce_init_attempted;
-    int ce_ready;
-    int ce_warned;
-    int ce_chain_started;
     int ce_lane_assigned;
-    int ce_bar_fd;
-    volatile uint8_t *ce_bar0;
-    void *ce_bar_map_base;
-    size_t ce_bar_map_len;
     size_t ce_engine_index;
     size_t ce_channel_index;
     uint32_t ce_hw_channel_id;
-    size_t ce_slots;
-    size_t ce_next_slot;
-    uint8_t *ce_resp_src_pool;
-    uint8_t *ce_flag_src_pool;
-    cxl_ce_desc_t *ce_desc_pool;
-    cxl_ce_desc_t *ce_last_desc;
 
     uint64_t *ce_peer_resp_page_phys;
     uint64_t ce_peer_resp_logical_page_base;
@@ -114,15 +106,17 @@ struct cxl_connection {
 void cxl_connection_init_runtime_defaults(cxl_connection_t *conn);
 void cxl_copyengine_disable(cxl_connection_t *conn);
 int cxl_copyengine_prepare(cxl_connection_t *conn);
-int cxl_copyengine_ensure_response_slots(cxl_connection_t *conn);
 int cxl_copyengine_update_peer_response_mapping(cxl_connection_t *conn);
 int cxl_copyengine_update_peer_flag_mapping(cxl_connection_t *conn);
 int cxl_copyengine_validate_submit_invariants(cxl_connection_t *conn);
+int cxl_copyengine_response_publish_pending(cxl_connection_t *conn);
+int cxl_copyengine_submit_flag_async(cxl_connection_t *conn,
+                                     uint64_t producer_cursor);
 int cxl_copyengine_submit_response_async(cxl_connection_t *conn,
                                          uint16_t rpc_id,
                                          const void *data,
                                          size_t len,
-                                         size_t dst_resp_offset,
-                                         size_t resp_transfer_size);
+                                         uint64_t producer_cursor,
+                                         size_t dst_resp_offset);
 
 #endif

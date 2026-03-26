@@ -18,7 +18,6 @@
 #include <vector>
 
 #include "base/addr_range.hh"
-#include "base/statistics.hh"
 #include "base/types.hh"
 #include "mem/packet.hh"
 #include "params/CXLRPCEngine.hh"
@@ -206,20 +205,6 @@ class CXLRPCEngine : public SimObject
     std::array<std::vector<bool>, 4> remapByteEnableMasks;
     std::vector<bool> remapByteEnableScratch;
 
-    // Statistics
-    struct RPCEngineStats : public statistics::Group
-    {
-        RPCEngineStats(CXLRPCEngine& engine);
-
-        statistics::Scalar doorbellWrites;
-        statistics::Scalar requestsForwarded;
-        statistics::Scalar headUpdatesReceived;
-        statistics::Scalar queueFullEvents;
-        statistics::Scalar metadataQueueWrites;
-    };
-
-    RPCEngineStats stats;
-
   public:
     PARAMS(CXLRPCEngine);
     CXLRPCEngine(const Params& p);
@@ -246,12 +231,6 @@ class CXLRPCEngine : public SimObject
      */
     DoorbellHandleResult handleDoorbellWrite(
         PacketPtr pkt, const DoorbellWriteProbe* probe);
-
-    /**
-     * Account for a remapped request doorbell that was successfully forwarded
-     * downstream as one metadata queue write.
-     */
-    void accountRemappedDoorbellForward();
 
     /**
      * Register a new client connection

@@ -90,8 +90,7 @@ CXLRPCEngine::CXLRPCEngine(const Params& p)
       defaultRequestDataCapacity(p.default_request_data_capacity),
       defaultResponseDataAddr(p.default_response_data_addr),
       defaultResponseDataCapacity(p.default_response_data_capacity),
-      defaultFlagAddr(p.default_flag_addr),
-      stats(*this)
+      defaultFlagAddr(p.default_flag_addr)
 {
     for (size_t maskIndex = 0; maskIndex < remapByteEnableMasks.size();
          ++maskIndex) {
@@ -329,8 +328,6 @@ CXLRPCEngine::handleDoorbellWrite(PacketPtr pkt,
 
     ClientConnection* conn = const_cast<ClientConnection*>(probe->connection);
 
-    stats.doorbellWrites++;
-
     DPRINTF(CXLRPCEngine, "Doorbell write: method=%u, node_id=%u, "
             "rpc_id=%u, len=%u, inline=%u\n",
             static_cast<unsigned>(probe->entry.method),
@@ -379,7 +376,6 @@ CXLRPCEngine::processRequest(
 
     // Check if queue is full only for validated request doorbells.
     if (queue.isFull()) {
-        stats.queueFullEvents++;
         DPRINTF(CXLRPCEngine,
                 "Metadata queue full for node %u, requesting retry\n",
                 static_cast<unsigned>(entry.node_id));
@@ -470,7 +466,6 @@ CXLRPCEngine::processHeadUpdate(
     // HEAD_UPDATE only needs to update controller-side head state. Keep this
     // control-path update in-controller and skip downstream memory writes.
     queue.head_cached = new_head;
-    stats.headUpdatesReceived++;
 
     if (pkt && pkt->isWrite()) {
         DPRINTF(CXLRPCEngine,
@@ -666,29 +661,6 @@ CXLRPCEngine::registerConnection(uint32_t node_id,
             node_id, doorbell_addr, metadata_queue_addr,
             request_data_addr, request_data_capacity,
             response_data_addr, response_data_capacity, flag_addr);
-}
-
-void
-CXLRPCEngine::accountRemappedDoorbellForward()
-{
-    stats.requestsForwarded++;
-    stats.metadataQueueWrites++;
-}
-
-// Statistics
-CXLRPCEngine::RPCEngineStats::RPCEngineStats(CXLRPCEngine& engine)
-    : statistics::Group(&engine),
-      ADD_STAT(doorbellWrites, statistics::units::Count::get(),
-               "Number of doorbell writes received"),
-      ADD_STAT(requestsForwarded, statistics::units::Count::get(),
-               "Number of requests forwarded to metadata queue"),
-      ADD_STAT(headUpdatesReceived, statistics::units::Count::get(),
-               "Number of HEAD_UPDATE messages received"),
-      ADD_STAT(queueFullEvents, statistics::units::Count::get(),
-               "Number of times metadata queue was full"),
-      ADD_STAT(metadataQueueWrites, statistics::units::Count::get(),
-               "Number of metadata queue DMA writes")
-{
 }
 
 } // namespace gem5

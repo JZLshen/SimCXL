@@ -18,6 +18,20 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 
+#if defined(__has_include)
+#if __has_include(<gem5/m5ops.h>)
+#include <gem5/m5ops.h>
+#elif __has_include("gem5/m5ops.h")
+#include "gem5/m5ops.h"
+#elif __has_include(<m5ops.h>)
+#include <m5ops.h>
+#else
+#error "m5ops.h is not found"
+#endif
+#else
+#include <gem5/m5ops.h>
+#endif
+
 static inline int
 cxl_env_flag_enabled(const char *name)
 {
@@ -49,6 +63,12 @@ cxl_lib_debugf(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);
+}
+
+static inline uint64_t
+cxl_trace_tick(void)
+{
+    return m5_rpns();
 }
 
 static void
@@ -1024,7 +1044,6 @@ connection_finalize_setup(cxl_connection_t *conn,
 {
     size_t doorbell_span = 0;
     const int has_req_rx = cxl_connection_has_cap(conn, CXL_CONN_CAP_REQUEST_RX);
-    const int has_req_tx = cxl_connection_has_cap(conn, CXL_CONN_CAP_REQUEST_TX);
     const int has_resp_rx = cxl_connection_has_cap(conn, CXL_CONN_CAP_RESPONSE_RX);
     const int has_bootstrap = cxl_connection_has_cap(conn, CXL_CONN_CAP_BOOTSTRAP);
     const int has_head_sync = cxl_connection_has_cap(conn, CXL_CONN_CAP_HEAD_SYNC);
@@ -1048,13 +1067,7 @@ connection_finalize_setup(cxl_connection_t *conn,
         cxl_prefault_each_page_ro_and_flush_touched(conn->metadata_queue,
                                                     metadata_clear_size);
     }
-    if (has_req_tx && conn->request_data && conn->addrs.request_data_size > 0) {
-        cxl_prefault_each_page_ro_and_flush_touched(conn->request_data,
-                                                    conn->addrs.request_data_size);
-    }
     if (has_resp_rx) {
-        cxl_prefault_each_page_ro_and_flush_touched(conn->response_data,
-                                                    conn->addrs.response_data_size);
         cxl_prefault_each_page_ro_and_flush_touched(conn->flag,
                                                     CXL_DEFAULT_FLAG_SIZE);
     }
@@ -1729,17 +1742,27 @@ int cxl_consume_next_response(cxl_connection_t *conn,
  * Server API
  * ================================================================ */
 
-int cxl_poll_request(cxl_connection_t *conn,
-                     uint16_t *node_id,
-                     uint16_t *rpc_id,
-                     const void **out_data_view,
-                     size_t *out_len)
+int cxl_poll_request_timed(cxl_connection_t *conn,
+                           uint16_t *node_id,
+                           uint16_t *rpc_id,
+                           const void **out_data_view,
+                           size_t *out_len,
+                           cxl_request_poll_timing_t *out_timing)
 {
     int ret = -1;
     const int mq_invalidate_consumed = CXL_MQ_INVALIDATE_CONSUMED;
     const int mq_invalidate_prefetched = CXL_MQ_INVALIDATE_PREFETCHED;
     const uint32_t mq_prefetch_lines = CXL_MQ_PREFETCH_LINES;
     const uint32_t mq_total_lines = conn ? conn->mq_total_lines : 0;
+    uint64_t notify_ready_tick = 0;
+    uint64_t req_data_ready_tick = 0;
+    uint64_t poll_done_tick = 0;
+
+    if (out_timing) {
+        out_timing->notify_ready_tick = 0;
+        out_timing->req_data_ready_tick = 0;
+        out_timing->poll_done_tick = 0;
+    }
 
     if (out_data_view)
         *out_data_view = NULL;
@@ -1871,11 +1894,14 @@ int cxl_poll_request(cxl_connection_t *conn,
         goto out;
     }
 
+    notify_ready_tick = cxl_trace_tick();
+
     if (mq_inline) {
         /* Inline: payload view is in bytes 8-15. */
         size_t msg_len = mq_len <= 8 ? (size_t)mq_len : 8;
         *out_data_view = (const void *)(entry + 8);
         *out_len = msg_len;
+        req_data_ready_tick = notify_ready_tick;
     } else {
         /* Non-inline: bytes 8-15 contain an absolute logical payload address. */
         uint64_t data_addr = meta_hi;
@@ -1895,6 +1921,10 @@ int cxl_poll_request(cxl_connection_t *conn,
             cxl_prepare_payload_for_direct_read(data_ptr, msg_len);
         *out_data_view = (const void *)data_ptr;
         *out_len = msg_len;
+        req_data_ready_tick =
+            ((conn->mq_payload_prepared_mask & prepared_bit) != 0) ?
+            notify_ready_tick :
+            cxl_trace_tick();
     }
 
     cxl_prepare_future_payloads_same_line(conn, head_idx, head_line_idx,
@@ -1904,10 +1934,31 @@ int cxl_poll_request(cxl_connection_t *conn,
     cxl_advance_mq_head_with_policy(conn, head_idx, head_line_idx,
                                     mq_invalidate_consumed);
     cxl_mq_payload_prepare_after_advance(conn, head_idx);
+    poll_done_tick = cxl_trace_tick();
+
+    if (out_timing) {
+        out_timing->notify_ready_tick = notify_ready_tick;
+        out_timing->req_data_ready_tick = req_data_ready_tick;
+        out_timing->poll_done_tick = poll_done_tick;
+    }
 
     ret = 1;
 out:
     return ret;
+}
+
+int cxl_poll_request(cxl_connection_t *conn,
+                     uint16_t *node_id,
+                     uint16_t *rpc_id,
+                     const void **out_data_view,
+                     size_t *out_len)
+{
+    return cxl_poll_request_timed(conn,
+                                  node_id,
+                                  rpc_id,
+                                  out_data_view,
+                                  out_len,
+                                  NULL);
 }
 
 /* ================================================================
@@ -2108,8 +2159,11 @@ int cxl_connection_set_peer_response_data(cxl_connection_t *conn,
     conn->peer_response_data_addr = peer_response_data_addr;
     conn->peer_response_data_size = peer_response_data_size;
     conn->peer_response_data = (volatile uint8_t *)response_ptr;
-    cxl_prefault_each_page_ro_and_flush_touched(conn->peer_response_data,
-                                                conn->peer_response_data_size);
+    /*
+     * Response payload windows stay fully on-demand: CPU publish flushes only
+     * the written entry, response RX invalidates only the consumed entry, and
+     * large-response DMA resolves destination pages lazily as they are touched.
+     */
     conn->peer_resp_write_cursor = 0;
     if (cxl_prepare_response_tx_path(conn) != 0)
         return -1;

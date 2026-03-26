@@ -169,6 +169,9 @@ def read_ticks(csv_path: Path) -> list[TickRow]:
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            start_ns = int(row["start_tick"])
+            end_ns = int(row["end_tick"])
+            delta_raw = row.get("delta_tick")
             rows.append(
                 TickRow(
                     exp_id=row["exp_id"],
@@ -178,9 +181,13 @@ def read_ticks(csv_path: Path) -> list[TickRow]:
                     requests_per_client=int(row["requests_per_client"]),
                     client_id=int(row["node_id"]),
                     req_index=int(row["req_index"]),
-                    start_ns=int(row["start_tick"]),
-                    end_ns=int(row["end_tick"]),
-                    latency_ns=int(row["delta_tick"]),
+                    start_ns=start_ns,
+                    end_ns=end_ns,
+                    latency_ns=(
+                        int(delta_raw)
+                        if delta_raw not in (None, "")
+                        else max(0, end_ns - start_ns)
+                    ),
                     output_dir=row["output_dir"],
                 )
             )

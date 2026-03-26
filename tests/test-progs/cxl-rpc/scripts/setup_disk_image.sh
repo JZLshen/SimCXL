@@ -196,19 +196,24 @@ shift 2 || true
 CLIENT_COUNT="${CXL_RPC_CLIENT_COUNT:-1}"
 SERVER_NUMA_NODE="${CXL_RPC_SERVER_NUMA_NODE:-1}"
 CLIENT_NUMA_NODE="${CXL_RPC_CLIENT_NUMA_NODE:-1}"
-CLIENT_TIMEOUT_SEC="${CXL_RPC_CLIENT_TIMEOUT_SEC:-600}"
+CLIENT_TIMEOUT_SEC="${CXL_RPC_CLIENT_TIMEOUT_SEC:-0}"
 SERVER_ARGS="${CXL_RPC_SERVER_ARGS:---silent}"
 SERVER_MAX_REQUESTS="${CXL_RPC_SERVER_MAX_REQUESTS:-}"
 SERVER_LOG="${CXL_RPC_SERVER_LOG:-/home/test_code/cxl_rpc_server_runtime.log}"
 CLIENT_LOG="${CXL_RPC_CLIENT_LOG:-/home/test_code/cxl_rpc_client_runtime.log}"
 CLIENT_LOG_PREFIX="${CXL_RPC_CLIENT_LOG_PREFIX:-/home/test_code/cxl_rpc_client_runtime}"
 SERVER_READY_MARKER="${CXL_RPC_SERVER_READY_MARKER:-server_ready=1}"
-SERVER_READY_TIMEOUT_SEC="${CXL_RPC_SERVER_READY_TIMEOUT_SEC:-60}"
-FIRST_REQ_BARRIER_PATH="${CXL_RPC_FIRST_REQ_BARRIER_PATH:-/tmp/cxl_rpc_first_req_${$}_$RANDOM}"
+SERVER_READY_TIMEOUT_SEC="${CXL_RPC_SERVER_READY_TIMEOUT_SEC:-0}"
+FIRST_COMPLETION_BARRIER_PATH="${CXL_RPC_FIRST_COMPLETION_BARRIER_PATH:-/tmp/cxl_rpc_first_completion_${$}_$RANDOM}"
+FIRST_COMPLETION_BARRIER_TIMEOUT_MS="${CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS:-0}"
 PIN_CORES="${CXL_RPC_PIN_CORES:-0}"
 SERVER_CORE="${CXL_RPC_SERVER_CORE:-0}"
 CLIENT_CORE_BASE="${CXL_RPC_CLIENT_CORE_BASE:-1}"
 DEBUG_LIVE="${CXL_RPC_DEBUG_LIVE:-0}"
+
+if [ "${CXL_RPC_MARKERS:-0}" != "0" ] && [ "$DEBUG_LIVE" = "0" ]; then
+    DEBUG_LIVE=1
+fi
 
 if ! [[ "$CLIENT_COUNT" =~ ^[0-9]+$ ]] || [ "$CLIENT_COUNT" -le 0 ]; then
     echo "ERROR: CXL_RPC_CLIENT_COUNT must be a positive integer"
@@ -217,6 +222,16 @@ fi
 
 if ! [[ "$CLIENT_TIMEOUT_SEC" =~ ^[0-9]+$ ]]; then
     echo "ERROR: CXL_RPC_CLIENT_TIMEOUT_SEC must be a non-negative integer"
+    exit 2
+fi
+
+if ! [[ "$SERVER_READY_TIMEOUT_SEC" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: CXL_RPC_SERVER_READY_TIMEOUT_SEC must be a non-negative integer"
+    exit 2
+fi
+
+if ! [[ "$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS must be a non-negative integer"
     exit 2
 fi
 
@@ -302,7 +317,7 @@ emit_server_timing_lines() {
         return 0
     fi
 
-    sed -nE "s/^(server_req_[0-9]+_(node_id|rpc_id|poll_tick|exec_tick|resp_submit_tick)=[0-9]+)$/\\1/p" "$file"
+    sed -nE "s/^(server_req_[0-9]+_(node_id|poll_notify_tick|poll_req_data_tick|exec_tick|resp_submit_tick)=[0-9]+)$/\\1/p" "$file"
 }
 
 : > "$SERVER_LOG"
@@ -365,20 +380,22 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
         client_cmd+=("--num-clients" "$CLIENT_COUNT" "--node-id" "$i")
     fi
 
-    wrapper_log "launch_client idx=${i} pin=${PIN_CORES} core=${client_core} log=${log} barrier=${FIRST_REQ_BARRIER_PATH}"
+    wrapper_log "launch_client idx=${i} pin=${PIN_CORES} core=${client_core} log=${log} barrier=${FIRST_COMPLETION_BARRIER_PATH}"
 
     if [ "$CLIENT_TIMEOUT_SEC" -gt 0 ]; then
         if [ "$PIN_CORES" != "0" ]; then
             if [ "$DEBUG_LIVE" != "0" ]; then
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     timeout --signal=TERM --kill-after=2 \
                     "${CLIENT_TIMEOUT_SEC}s" \
                     taskset -c "$client_core" "${client_cmd[@]}" \
                     > >(tee "$log") 2>&1 &
             else
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     timeout --signal=TERM --kill-after=2 \
                     "${CLIENT_TIMEOUT_SEC}s" \
                     taskset -c "$client_core" "${client_cmd[@]}" >"$log" 2>&1 &
@@ -386,13 +403,15 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
         else
             if [ "$DEBUG_LIVE" != "0" ]; then
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     timeout --signal=TERM --kill-after=2 \
                     "${CLIENT_TIMEOUT_SEC}s" \
                     "${client_cmd[@]}" > >(tee "$log") 2>&1 &
             else
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     timeout --signal=TERM --kill-after=2 \
                     "${CLIENT_TIMEOUT_SEC}s" \
                     "${client_cmd[@]}" >"$log" 2>&1 &
@@ -402,22 +421,26 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
         if [ "$PIN_CORES" != "0" ]; then
             if [ "$DEBUG_LIVE" != "0" ]; then
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     taskset -c "$client_core" "${client_cmd[@]}" \
                     > >(tee "$log") 2>&1 &
             else
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     taskset -c "$client_core" "${client_cmd[@]}" >"$log" 2>&1 &
             fi
         else
             if [ "$DEBUG_LIVE" != "0" ]; then
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     "${client_cmd[@]}" > >(tee "$log") 2>&1 &
             else
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_REQ_BARRIER_PATH="$FIRST_REQ_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
+                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     "${client_cmd[@]}" >"$log" 2>&1 &
             fi
         fi
@@ -464,7 +487,7 @@ if [ "$overall_rc" -eq 0 ] && [ "$SERVER_RC" -eq 0 ]; then
 else
     echo "rpc_test_failed rc=${overall_rc} server_rc=${SERVER_RC}" >&2
 fi
-rm -f "$FIRST_REQ_BARRIER_PATH" 2>/dev/null || true
+rm -f "$FIRST_COMPLETION_BARRIER_PATH" 2>/dev/null || true
 exit "$overall_rc"
 UNIFIED_HELPER_SCRIPT
 sudo chmod +x "${MOUNT_POINT}${DEST_DIR}/run_rpc_server_clients.sh"

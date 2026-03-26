@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,8 +50,8 @@ typedef struct __attribute__((packed)) {
 
 typedef struct {
     uint16_t node_id;
-    uint16_t rpc_id;
-    uint64_t poll_tick;
+    uint64_t poll_notify_tick;
+    uint64_t poll_req_data_tick;
     uint64_t exec_tick;
     uint64_t resp_submit_tick;
 } server_request_timing_t;
@@ -61,6 +62,40 @@ static inline uint64_t
 current_tick(void)
 {
     return m5_rpns();
+}
+
+static int
+rpc_marker_enabled(void)
+{
+    static int initialized = 0;
+    static int enabled = 0;
+
+    if (!initialized) {
+        const char *env = getenv("CXL_RPC_MARKERS");
+        enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+        initialized = 1;
+    }
+
+    return enabled;
+}
+
+static void
+rpc_markerf(const char *phase, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!rpc_marker_enabled())
+        return;
+
+    fprintf(stderr, "rpc_marker,role=server,phase=%s,tick=%lu",
+            phase ? phase : "unknown", current_tick());
+    if (fmt && fmt[0] != '\0') {
+        fputc(',', stderr);
+        va_start(ap, fmt);
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+    }
+    fputc('\n', stderr);
 }
 
 static int
@@ -172,6 +207,8 @@ int
 main(int argc, char **argv)
 {
     int rc = 0;
+    int first_poll_marker_emitted = 0;
+    int first_resp_marker_emitted = 0;
     uint64_t requests_processed = 0;
     cxl_context_t *ctx = NULL;
     cxl_connection_t *poll_conn = NULL;
@@ -200,6 +237,9 @@ main(int argc, char **argv)
     signal(SIGTERM, signal_handler);
     setlinebuf(stdout);
     setvbuf(stderr, NULL, _IONBF, 0);
+    rpc_markerf("init_begin",
+                "num_clients=%d,max_requests=%d,response_size=%zu",
+                num_clients, max_requests, response_size);
 
     ctx = cxl_rpc_init(CXL_BASE, CXL_SIZE);
     if (!ctx) {
@@ -207,6 +247,7 @@ main(int argc, char **argv)
         rc = 1;
         goto cleanup;
     }
+    rpc_markerf("ctx_ready", "num_clients=%d", num_clients);
 
     uint64_t server_base = SERVER_REGION_BASE;
     cxl_connection_addrs_t addrs = {
@@ -221,12 +262,14 @@ main(int argc, char **argv)
         .node_id = 0,
     };
 
+    rpc_markerf("poll_conn_begin", "mq_entries=%u", METADATA_Q_ENTRIES);
     poll_conn = cxl_connection_create_server_poll_owner(ctx, &addrs, 1024);
     if (!poll_conn) {
         fprintf(stderr, "server: connection_create_server_poll_owner failed\n");
         rc = 1;
         goto cleanup;
     }
+    rpc_markerf("poll_conn_ready", "mq_entries=%u", METADATA_Q_ENTRIES);
 
     for (int i = 0; i < num_clients; i++) {
         resp_conns[i] = cxl_connection_create_response_tx(ctx);
@@ -245,6 +288,8 @@ main(int argc, char **argv)
             goto cleanup;
         }
 
+        rpc_markerf("peer_response_data_begin", "node=%d,bytes=%zu",
+                    i, (size_t)RESPONSE_DATA_BYTES);
         if (cxl_connection_set_peer_response_data(resp_conns[i],
                                                   node_region_base(i) +
                                                       RESPONSE_DATA_OFFSET,
@@ -253,6 +298,8 @@ main(int argc, char **argv)
             rc = 1;
             goto cleanup;
         }
+        rpc_markerf("peer_response_data_ready", "node=%d,bytes=%zu",
+                    i, (size_t)RESPONSE_DATA_BYTES);
 
         if (cxl_connection_set_peer_response_flag_addr(resp_conns[i],
                                                        node_region_base(i) +
@@ -261,6 +308,7 @@ main(int argc, char **argv)
             rc = 1;
             goto cleanup;
         }
+        rpc_markerf("peer_flag_ready", "node=%d", i);
 
     }
 
@@ -284,6 +332,7 @@ main(int argc, char **argv)
     }
 
     printf("server_ready=1\n");
+    rpc_markerf("server_ready", "num_clients=%d", num_clients);
     poll_phase_start_tick = current_tick();
 
     while (keep_running) {
@@ -291,17 +340,27 @@ main(int argc, char **argv)
         uint16_t rpc_id = 0;
         const void *req_data_view = NULL;
         size_t req_len = 0;
-        uint64_t poll_end_tick = 0;
+        cxl_request_poll_timing_t poll_timing = {0};
+        uint64_t poll_done_tick = 0;
         uint64_t exec_end_tick = 0;
         uint64_t resp_end_tick = 0;
 
-        int ret = cxl_poll_request(poll_conn,
-                                   &node_id,
-                                   &rpc_id,
-                                   &req_data_view,
-                                   &req_len);
+        int ret = cxl_poll_request_timed(poll_conn,
+                                         &node_id,
+                                         &rpc_id,
+                                         &req_data_view,
+                                         &req_len,
+                                         &poll_timing);
         if (ret == 1) {
-            poll_end_tick = current_tick();
+            poll_done_tick = (poll_timing.poll_done_tick != 0) ?
+                             poll_timing.poll_done_tick :
+                             current_tick();
+            if (!first_poll_marker_emitted) {
+                rpc_markerf("first_request_polled",
+                            "node=%u,rpc_id=%u,req_len=%zu",
+                            (unsigned)node_id, (unsigned)rpc_id, req_len);
+                first_poll_marker_emitted = 1;
+            }
             if (node_id >= (uint16_t)num_clients) {
                 fprintf(stderr, "server: invalid node_id=%u\n", node_id);
                 rc = 1;
@@ -333,18 +392,26 @@ main(int argc, char **argv)
                 break;
             }
             resp_end_tick = current_tick();
+            if (!first_resp_marker_emitted) {
+                rpc_markerf("first_response_submitted",
+                            "node=%u,rpc_id=%u,response_size=%zu",
+                            (unsigned)node_id, (unsigned)rpc_id, response_size);
+                first_resp_marker_emitted = 1;
+            }
             if (timings &&
                 requests_processed < (uint64_t)max_requests) {
                 server_request_timing_t *record =
                     &timings[requests_processed];
                 record->node_id = node_id;
-                record->rpc_id = rpc_id;
-                record->poll_tick =
-                    (poll_end_tick >= poll_phase_start_tick) ?
-                    (poll_end_tick - poll_phase_start_tick) : 0;
+                record->poll_notify_tick =
+                    (poll_timing.notify_ready_tick >= poll_phase_start_tick) ?
+                    (poll_timing.notify_ready_tick - poll_phase_start_tick) : 0;
+                record->poll_req_data_tick =
+                    (poll_done_tick >= poll_timing.notify_ready_tick) ?
+                    (poll_done_tick - poll_timing.notify_ready_tick) : 0;
                 record->exec_tick =
-                    (exec_end_tick >= poll_end_tick) ?
-                    (exec_end_tick - poll_end_tick) : 0;
+                    (exec_end_tick >= poll_done_tick) ?
+                    (exec_end_tick - poll_done_tick) : 0;
                 record->resp_submit_tick =
                     (resp_end_tick >= exec_end_tick) ?
                     (resp_end_tick - exec_end_tick) : 0;
@@ -373,10 +440,10 @@ cleanup:
             const server_request_timing_t *record = &timings[i];
             printf("server_req_%lu_node_id=%u\n",
                    (unsigned long)i, (unsigned)record->node_id);
-            printf("server_req_%lu_rpc_id=%u\n",
-                   (unsigned long)i, (unsigned)record->rpc_id);
-            printf("server_req_%lu_poll_tick=%lu\n",
-                   (unsigned long)i, record->poll_tick);
+            printf("server_req_%lu_poll_notify_tick=%lu\n",
+                   (unsigned long)i, record->poll_notify_tick);
+            printf("server_req_%lu_poll_req_data_tick=%lu\n",
+                   (unsigned long)i, record->poll_req_data_tick);
             printf("server_req_%lu_exec_tick=%lu\n",
                    (unsigned long)i, record->exec_tick);
             printf("server_req_%lu_resp_submit_tick=%lu\n",

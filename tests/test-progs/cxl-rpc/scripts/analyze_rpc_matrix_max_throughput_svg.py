@@ -207,6 +207,9 @@ def read_ticks(csv_path: Path) -> dict[str, list[TickRow]]:
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            start_tick = int(row["start_tick"])
+            end_tick = int(row["end_tick"])
+            delta_raw = row.get("delta_tick")
             tick = TickRow(
                 exp_id=row["exp_id"],
                 request_size=int(row["request_size"]),
@@ -215,9 +218,13 @@ def read_ticks(csv_path: Path) -> dict[str, list[TickRow]]:
                 requests_per_client=int(row["requests_per_client"]),
                 client_id=int(row["node_id"]),
                 req_index=int(row["req_index"]),
-                start_tick=int(row["start_tick"]),
-                end_tick=int(row["end_tick"]),
-                delta_tick=int(row["delta_tick"]),
+                start_tick=start_tick,
+                end_tick=end_tick,
+                delta_tick=(
+                    int(delta_raw)
+                    if delta_raw not in (None, "")
+                    else max(0, end_tick - start_tick)
+                ),
                 output_dir=row["output_dir"],
             )
             rows_by_exp.setdefault(tick.exp_id, []).append(tick)

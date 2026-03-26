@@ -101,6 +101,12 @@ volatile void *cxl_rpc_phys_to_virt(const cxl_context_t *ctx,
 
 typedef struct cxl_connection cxl_connection_t;
 
+typedef struct {
+    uint64_t notify_ready_tick;
+    uint64_t req_data_ready_tick;
+    uint64_t poll_done_tick;
+} cxl_request_poll_timing_t;
+
 /**
  * Create a server-side metadata-queue polling connection for a fixed layout.
  *
@@ -330,13 +336,32 @@ int cxl_consume_next_response(cxl_connection_t *conn,
  *
  * @param out_data_view Out: payload view pointer (inline or request_data)
  * @param out_len       Out: exact payload size from metadata
- * @return           1 if request available, 0 if empty, -1 on error
+ * @return              1 if request available, 0 if empty, -1 on error
  */
 int cxl_poll_request(cxl_connection_t *conn,
                      uint16_t *node_id,
                      uint16_t *rpc_id,
                      const void **out_data_view,
                      size_t *out_len);
+
+/**
+ * Poll metadata queue and return fine-grained success-path timing cut points.
+ *
+ * `out_timing` is filled only when the call returns 1:
+ *   - `notify_ready_tick`: current head metadata entry is confirmed valid and
+ *     its notification fields are fully parsed.
+ *   - `req_data_ready_tick`: current request payload view is ready for
+ *     consumption. For inline requests or already-prepared payloads, this can
+ *     equal `notify_ready_tick`.
+ *   - `poll_done_tick`: the library has finished same-line prefetch/bookkeeping
+ *     and the poll path is ready to hand control back to the caller.
+ */
+int cxl_poll_request_timed(cxl_connection_t *conn,
+                           uint16_t *node_id,
+                           uint16_t *rpc_id,
+                           const void **out_data_view,
+                           size_t *out_len,
+                           cxl_request_poll_timing_t *out_timing);
 
 /**
  * Send an RPC response (server-side).
