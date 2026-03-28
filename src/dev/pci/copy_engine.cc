@@ -45,6 +45,8 @@
 #include "dev/pci/copy_engine.hh"
 
 #include <algorithm>
+#include <iomanip>
+#include <sstream>
 #include "base/compiler.hh"
 #include "base/trace.hh"
 #include "debug/DMACopyEngine.hh"
@@ -59,6 +61,22 @@ namespace gem5
 {
 
 using namespace copy_engine_reg;
+
+namespace
+{
+
+std::string
+dumpHexBytes(const uint8_t *data, size_t bytes)
+{
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (size_t i = 0; i < bytes; ++i) {
+        oss << std::setw(2) << static_cast<unsigned>(data[i]);
+    }
+    return oss.str();
+}
+
+} // anonymous namespace
 
 CopyEngine::CopyEngine(const Params &p)
     : PciDevice(p),
@@ -508,6 +526,25 @@ void
 CopyEngine::CopyEngineChannel::readCopyBytesComplete()
 {
     DPRINTF(DMACopyEngine, "Read of bytes to copy complete\n");
+
+    if (curDmaDesc->len > 0) {
+        const size_t total = static_cast<size_t>(curDmaDesc->len);
+        const size_t first_dump = std::min<size_t>(32, total);
+        DPRINTF(DMACopyEngine, "copyBuffer_first32=%s\n",
+                dumpHexBytes(copyBuffer, first_dump).c_str());
+
+        if (total > 64) {
+            DPRINTF(DMACopyEngine, "copyBuffer_line64_32=%s\n",
+                    dumpHexBytes(copyBuffer + 64, 32).c_str());
+        }
+
+        if (total > 32) {
+            const size_t tail_dump = std::min<size_t>(32, total);
+            DPRINTF(DMACopyEngine, "copyBuffer_tail32=%s\n",
+                    dumpHexBytes(copyBuffer + total - tail_dump,
+                                 tail_dump).c_str());
+        }
+    }
 
     nextState = DMAWrite;
     if (inDrain()) return;

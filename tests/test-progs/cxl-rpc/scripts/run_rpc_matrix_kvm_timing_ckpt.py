@@ -4,7 +4,8 @@ Run CXL RPC matrix experiments with:
   - KVM boot + TIMING CPU test phase
   - inject guest binaries once per batch
   - reuse one checkpoint per client-count topology
-  - automatic result extraction from board.pc.com_1.device
+  - automatic result extraction from guest writefile artifacts
+    (fallback to board.pc.com_1.device for older runs)
 
 Default experiment matrix (deduplicated):
   A) client sweep:
@@ -319,36 +320,92 @@ def resolve_checkpoint_dir(path: Path) -> Optional[Path]:
     return None
 
 
+CLIENT_MULTI_RE = re.compile(
+    r"^\[CLIENT\[(\d+)\]\]\s+req_(\d+)_(start|end|delta)_tick=(\d+)\s*$"
+)
+CLIENT_SINGLE_RE = re.compile(
+    r"^\[CLIENT\]\s+req_(\d+)_(start|end|delta)_tick=(\d+)\s*$"
+)
+CLIENT_BARE_RE = re.compile(
+    r"^req_(\d+)_(start|end|delta)_tick=(\d+)\s*$"
+)
+SERVER_LINE_RE = re.compile(
+    r"^server_req_(\d+)_(node_id|rpc_id|poll_tick|poll_notify_tick|"
+    r"poll_req_data_tick|poll_tail_tick|exec_tick|resp_submit_tick)=(\d+)\s*$"
+)
+CLIENT_HOST_LOG_RE = re.compile(r"^rpc_client_runtime_(\d+)\.log$")
+
+
+def parse_test_rc_lines(lines: List[str]) -> Optional[int]:
+    test_rc: Optional[int] = None
+
+    for line in lines:
+        if "TEST_CMD_EXIT_CODE=" not in line:
+            continue
+        try:
+            test_rc = int(line.split("TEST_CMD_EXIT_CODE=", 1)[1].strip())
+        except ValueError:
+            continue
+
+    return test_rc
+
+
+def build_client_rows(
+    client_fields: Dict[Tuple[int, int], Dict[str, int]]
+) -> List[Dict[str, int]]:
+    client_rows: List[Dict[str, int]] = []
+
+    for (node_id, ridx), vals in sorted(client_fields.items()):
+        if "start" not in vals or "end" not in vals:
+            continue
+        client_rows.append(
+            {
+                "node_id": node_id,
+                "req_index": ridx,
+                "start_tick": vals["start"],
+                "end_tick": vals["end"],
+            }
+        )
+
+    return client_rows
+
+
+def build_server_rows(
+    server_fields: Dict[int, Dict[str, int]]
+) -> List[Dict[str, int]]:
+    server_rows: List[Dict[str, int]] = []
+
+    for req_index, vals in sorted(server_fields.items()):
+        required = ("node_id", "exec_tick", "resp_submit_tick")
+        if not all(name in vals for name in required):
+            continue
+        server_rows.append(
+            {
+                "server_req_index": req_index,
+                "node_id": vals["node_id"],
+                "poll_notify_tick": vals.get("poll_notify_tick", vals.get("poll_tick", 0)),
+                "poll_req_data_tick": vals.get("poll_req_data_tick", 0),
+                "exec_tick": vals["exec_tick"],
+                "resp_submit_tick": vals["resp_submit_tick"],
+            }
+        )
+
+    return server_rows
+
+
 def parse_board_results(
     board_path: Path,
 ) -> Tuple[Optional[int], List[Dict[str, int]], List[Dict[str, int]]]:
     if not board_path.exists():
         return None, [], []
 
-    test_rc: Optional[int] = None
+    lines = board_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    test_rc = parse_test_rc_lines(lines)
     client_fields: Dict[Tuple[int, int], Dict[str, int]] = {}
     server_fields: Dict[int, Dict[str, int]] = {}
-    re_multi = re.compile(
-        r"^\[CLIENT\[(\d+)\]\]\s+req_(\d+)_(start|end|delta)_tick=(\d+)\s*$"
-    )
-    re_single = re.compile(
-        r"^\[CLIENT\]\s+req_(\d+)_(start|end|delta)_tick=(\d+)\s*$"
-    )
-    re_bare = re.compile(
-        r"^req_(\d+)_(start|end|delta)_tick=(\d+)\s*$"
-    )
-    re_server = re.compile(
-        r"^server_req_(\d+)_(node_id|rpc_id|poll_tick|poll_notify_tick|poll_req_data_tick|poll_tail_tick|exec_tick|resp_submit_tick)=(\d+)\s*$"
-    )
 
-    for line in board_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        if "TEST_CMD_EXIT_CODE=" in line:
-            try:
-                test_rc = int(line.split("TEST_CMD_EXIT_CODE=", 1)[1].strip())
-            except ValueError:
-                pass
-
-        m = re_multi.match(line)
+    for line in lines:
+        m = CLIENT_MULTI_RE.match(line)
         if m:
             node_id = int(m.group(1))
             ridx = int(m.group(2))
@@ -357,63 +414,109 @@ def parse_board_results(
             client_fields.setdefault((node_id, ridx), {})[kind] = val
             continue
 
-        m = re_single.match(line)
+        m = CLIENT_SINGLE_RE.match(line)
         if m:
-            node_id = 0
             ridx = int(m.group(1))
             kind = m.group(2)
             val = int(m.group(3))
-            client_fields.setdefault((node_id, ridx), {})[kind] = val
+            client_fields.setdefault((0, ridx), {})[kind] = val
             continue
 
-        m = re_bare.match(line)
+        m = CLIENT_BARE_RE.match(line)
         if m:
-            node_id = 0
             ridx = int(m.group(1))
             kind = m.group(2)
             val = int(m.group(3))
-            client_fields.setdefault((node_id, ridx), {})[kind] = val
+            client_fields.setdefault((0, ridx), {})[kind] = val
             continue
 
-        m = re_server.match(line)
+        m = SERVER_LINE_RE.match(line)
         if m:
             req_index = int(m.group(1))
             kind = m.group(2)
             val = int(m.group(3))
             server_fields.setdefault(req_index, {})[kind] = val
 
+    return test_rc, build_client_rows(client_fields), build_server_rows(server_fields)
+
+
+def parse_status_file(status_path: Path) -> Optional[int]:
+    if not status_path.exists():
+        return None
+
+    return parse_test_rc_lines(
+        status_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    )
+
+
+def parse_client_log(
+    log_path: Path,
+    node_id: int,
+) -> List[Dict[str, int]]:
+    client_fields: Dict[Tuple[int, int], Dict[str, int]] = {}
+
+    for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        m = CLIENT_BARE_RE.match(line.strip())
+        if not m:
+            continue
+        ridx = int(m.group(1))
+        kind = m.group(2)
+        val = int(m.group(3))
+        client_fields.setdefault((node_id, ridx), {})[kind] = val
+
+    return build_client_rows(client_fields)
+
+
+def parse_server_log(log_path: Path) -> List[Dict[str, int]]:
+    server_fields: Dict[int, Dict[str, int]] = {}
+
+    for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        m = SERVER_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        req_index = int(m.group(1))
+        kind = m.group(2)
+        val = int(m.group(3))
+        server_fields.setdefault(req_index, {})[kind] = val
+
+    return build_server_rows(server_fields)
+
+
+def parse_writefile_results(
+    run_outdir: Path,
+) -> Tuple[Optional[int], List[Dict[str, int]], List[Dict[str, int]]]:
+    status_path = run_outdir / "rpc_status.txt"
+    server_log_path = run_outdir / "rpc_server_runtime.log"
+    client_logs = sorted(run_outdir.glob("rpc_client_runtime_*.log"))
+
+    if not status_path.exists() and not server_log_path.exists() and not client_logs:
+        return None, [], []
+
     client_rows: List[Dict[str, int]] = []
-    for (node_id, ridx), vals in sorted(client_fields.items()):
-        if "start" in vals and "end" in vals:
-            start_tick = vals["start"]
-            end_tick = vals["end"]
-            client_rows.append(
-                {
-                    "node_id": node_id,
-                    "req_index": ridx,
-                    "start_tick": start_tick,
-                    "end_tick": end_tick,
-                }
-            )
+    for client_log in client_logs:
+        m = CLIENT_HOST_LOG_RE.match(client_log.name)
+        if not m:
+            continue
+        client_rows.extend(parse_client_log(client_log, int(m.group(1))))
 
-    server_rows: List[Dict[str, int]] = []
-    for req_index, vals in sorted(server_fields.items()):
-        required = ("node_id", "exec_tick", "resp_submit_tick")
-        if all(name in vals for name in required):
-            poll_notify_tick = vals.get("poll_notify_tick", vals.get("poll_tick", 0))
-            poll_req_data_tick = vals.get("poll_req_data_tick", 0)
-            server_rows.append(
-                {
-                    "server_req_index": req_index,
-                    "node_id": vals["node_id"],
-                    "poll_notify_tick": poll_notify_tick,
-                    "poll_req_data_tick": poll_req_data_tick,
-                    "exec_tick": vals["exec_tick"],
-                    "resp_submit_tick": vals["resp_submit_tick"],
-                }
-            )
+    if not client_logs:
+        single_client_log = run_outdir / "rpc_client_runtime.log"
+        if single_client_log.exists():
+            client_rows.extend(parse_client_log(single_client_log, 0))
 
+    server_rows = parse_server_log(server_log_path) if server_log_path.exists() else []
+    test_rc = parse_status_file(status_path)
     return test_rc, client_rows, server_rows
+
+
+def parse_run_results(
+    run_outdir: Path,
+) -> Tuple[Optional[int], List[Dict[str, int]], List[Dict[str, int]]]:
+    test_rc, client_rows, server_rows = parse_writefile_results(run_outdir)
+    if test_rc is not None or client_rows or server_rows:
+        return test_rc, client_rows, server_rows
+
+    return parse_board_results(run_outdir / "board.pc.com_1.device")
 
 
 def read_success_exp_ids(csv_path: Path) -> set[str]:
@@ -471,6 +574,12 @@ def main() -> int:
         help="1-based experiment index to start from (skip earlier ones)",
     )
     parser.add_argument(
+        "--end-index",
+        type=int,
+        default=0,
+        help="1-based experiment index to stop at (0 means run through the end)",
+    )
+    parser.add_argument(
         "--copy-engine-channels",
         type=int,
         default=0,
@@ -514,6 +623,12 @@ def main() -> int:
     batch_dir.mkdir(parents=True, exist_ok=True)
     if args.start_index < 1:
         print("[fatal] --start-index must be >= 1")
+        return 2
+    if args.end_index < 0:
+        print("[fatal] --end-index must be >= 0")
+        return 2
+    if args.end_index != 0 and args.end_index < args.start_index:
+        print("[fatal] --end-index must be >= --start-index when set")
         return 2
     if args.copy_engine_channels < 0:
         print("[fatal] --copy-engine-channels must be >= 0")
@@ -568,6 +683,10 @@ def main() -> int:
     print(f"[matrix] total unique experiments: {len(experiments)}")
     print(f"[matrix] max required cores (server+clients): {max_required_cpus}")
     print(f"[matrix] start index: {args.start_index}")
+    print(
+        f"[matrix] end index: "
+        f"{args.end_index if args.end_index != 0 else len(experiments)}"
+    )
     print(f"[matrix] batch dir: {batch_dir}")
 
     experiments_csv = batch_dir / "experiments.csv"
@@ -676,6 +795,12 @@ def main() -> int:
                     f"before --start-index={args.start_index}: {exp.exp_id}"
                 )
                 continue
+            if args.end_index != 0 and idx > args.end_index:
+                print(
+                    f"[stop] reached --end-index={args.end_index}; "
+                    "ending batch run"
+                )
+                break
             if exp.exp_id in done_ids:
                 print(f"[skip {idx}/{len(experiments)}] already done: {exp.exp_id}")
                 continue
@@ -895,9 +1020,8 @@ def main() -> int:
                 except RuntimeError as exc:
                     print(f"[fatal] {exc}")
                     return 2
-                board_path = run_outdir / "board.pc.com_1.device"
-                test_cmd_rc, client_rows, server_rows = parse_board_results(
-                    board_path
+                test_cmd_rc, client_rows, server_rows = parse_run_results(
+                    run_outdir
                 )
 
             end_time = time.time()

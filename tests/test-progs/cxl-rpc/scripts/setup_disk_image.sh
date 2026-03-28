@@ -199,9 +199,11 @@ CLIENT_NUMA_NODE="${CXL_RPC_CLIENT_NUMA_NODE:-1}"
 CLIENT_TIMEOUT_SEC="${CXL_RPC_CLIENT_TIMEOUT_SEC:-0}"
 SERVER_ARGS="${CXL_RPC_SERVER_ARGS:---silent}"
 SERVER_MAX_REQUESTS="${CXL_RPC_SERVER_MAX_REQUESTS:-}"
-SERVER_LOG="${CXL_RPC_SERVER_LOG:-/home/test_code/cxl_rpc_server_runtime.log}"
-CLIENT_LOG="${CXL_RPC_CLIENT_LOG:-/home/test_code/cxl_rpc_client_runtime.log}"
-CLIENT_LOG_PREFIX="${CXL_RPC_CLIENT_LOG_PREFIX:-/home/test_code/cxl_rpc_client_runtime}"
+RUNTIME_DIR="${CXL_RPC_RUNTIME_DIR:-/dev/shm/cxl_rpc_runtime}"
+SERVER_LOG="${CXL_RPC_SERVER_LOG:-${RUNTIME_DIR}/cxl_rpc_server_runtime_${$}.log}"
+CLIENT_LOG="${CXL_RPC_CLIENT_LOG:-${RUNTIME_DIR}/cxl_rpc_client_runtime_${$}.log}"
+CLIENT_LOG_PREFIX="${CXL_RPC_CLIENT_LOG_PREFIX:-${RUNTIME_DIR}/cxl_rpc_client_runtime_${$}}"
+STATUS_FILE="${CXL_RPC_STATUS_FILE:-${RUNTIME_DIR}/cxl_rpc_status_${$}.txt}"
 SERVER_READY_MARKER="${CXL_RPC_SERVER_READY_MARKER:-server_ready=1}"
 SERVER_READY_TIMEOUT_SEC="${CXL_RPC_SERVER_READY_TIMEOUT_SEC:-0}"
 FIRST_COMPLETION_BARRIER_PATH="${CXL_RPC_FIRST_COMPLETION_BARRIER_PATH:-/tmp/cxl_rpc_first_completion_${$}_$RANDOM}"
@@ -210,6 +212,9 @@ PIN_CORES="${CXL_RPC_PIN_CORES:-0}"
 SERVER_CORE="${CXL_RPC_SERVER_CORE:-0}"
 CLIENT_CORE_BASE="${CXL_RPC_CLIENT_CORE_BASE:-1}"
 DEBUG_LIVE="${CXL_RPC_DEBUG_LIVE:-0}"
+HOST_STATUS_FILE="${CXL_RPC_HOST_STATUS_FILE:-rpc_status.txt}"
+HOST_SERVER_FILE="${CXL_RPC_HOST_SERVER_FILE:-rpc_server_runtime.log}"
+HOST_CLIENT_FILE_PREFIX="${CXL_RPC_HOST_CLIENT_FILE_PREFIX:-rpc_client_runtime}"
 
 if [ "${CXL_RPC_MARKERS:-0}" != "0" ] && [ "$DEBUG_LIVE" = "0" ]; then
     DEBUG_LIVE=1
@@ -237,6 +242,11 @@ fi
 
 if [ "$CLIENT_TIMEOUT_SEC" -gt 0 ] && ! command -v timeout >/dev/null 2>&1; then
     echo "ERROR: timeout command not found in guest while timeout is enabled"
+    exit 2
+fi
+
+if ! mkdir -p "$RUNTIME_DIR"; then
+    echo "ERROR: failed to create runtime dir: $RUNTIME_DIR"
     exit 2
 fi
 
@@ -299,25 +309,47 @@ wait_for_server_ready() {
         < <(tail -n +1 -F --pid="$SERVER_PID" "$SERVER_LOG" 2>/dev/null)
 }
 
-emit_tick_lines() {
-    local file="$1"
-    local prefix="$2"
-
-    if [ ! -f "$file" ]; then
-        return 0
-    fi
-
-    sed -nE "s/^req_([0-9]+)_(start|end|delta)_tick=([0-9]+)$/${prefix}req_\\1_\\2_tick=\\3/p" "$file"
+write_status_file() {
+    {
+        echo "TEST_CMD_EXIT_CODE=${overall_rc}"
+        echo "SERVER_RC=${SERVER_RC}"
+        echo "CLIENT_COUNT=${CLIENT_COUNT}"
+        for ((status_i = 0; status_i < CLIENT_COUNT; status_i++)); do
+            echo "CLIENT_${status_i}_RC=${CLIENT_RCS[$status_i]}"
+        done
+    } > "$STATUS_FILE"
 }
 
-emit_server_timing_lines() {
-    local file="$1"
+write_guest_artifact() {
+    local guest_path="$1"
+    local host_path="$2"
 
-    if [ ! -f "$file" ]; then
-        return 0
+    if [ ! -f "$guest_path" ]; then
+        echo "ERROR: guest artifact missing: ${guest_path}" >&2
+        return 1
     fi
 
-    sed -nE "s/^(server_req_[0-9]+_(node_id|poll_notify_tick|poll_req_data_tick|exec_tick|resp_submit_tick)=[0-9]+)$/\\1/p" "$file"
+    if ! /sbin/m5 writefile "$guest_path" "$host_path" >/dev/null 2>&1; then
+        echo "ERROR: m5 writefile failed guest=${guest_path} host=${host_path}" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+export_guest_artifacts() {
+    local export_rc=0
+
+    write_status_file || return 1
+    write_guest_artifact "$STATUS_FILE" "$HOST_STATUS_FILE" || export_rc=1
+    write_guest_artifact "$SERVER_LOG" "$HOST_SERVER_FILE" || export_rc=1
+
+    for ((export_i = 0; export_i < CLIENT_COUNT; export_i++)); do
+        write_guest_artifact "${CLIENT_LOGS[$export_i]}" \
+            "${HOST_CLIENT_FILE_PREFIX}_${export_i}.log" || export_rc=1
+    done
+
+    return "$export_rc"
 }
 
 : > "$SERVER_LOG"
@@ -475,16 +507,13 @@ if [ "$SERVER_RC" -ne 0 ] && [ "$overall_rc" -eq 0 ]; then
     overall_rc="$SERVER_RC"
 fi
 
-if [ "$overall_rc" -eq 0 ] && [ "$SERVER_RC" -eq 0 ]; then
-    emit_server_timing_lines "$SERVER_LOG"
-    for ((i = 0; i < CLIENT_COUNT; i++)); do
-        if [ "$CLIENT_COUNT" -eq 1 ]; then
-            emit_tick_lines "${CLIENT_LOGS[$i]}" ""
-        else
-            emit_tick_lines "${CLIENT_LOGS[$i]}" "[CLIENT[$i]] "
-        fi
-    done
-else
+if ! export_guest_artifacts; then
+    if [ "$overall_rc" -eq 0 ]; then
+        overall_rc=126
+    fi
+fi
+
+if [ "$overall_rc" -ne 0 ] || [ "$SERVER_RC" -ne 0 ]; then
     echo "rpc_test_failed rc=${overall_rc} server_rc=${SERVER_RC}" >&2
 fi
 rm -f "$FIRST_COMPLETION_BARRIER_PATH" 2>/dev/null || true

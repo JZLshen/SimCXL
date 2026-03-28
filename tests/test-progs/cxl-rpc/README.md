@@ -17,11 +17,12 @@ library interface.
 
 The client response path uses exactly one model:
 
-1. The client keeps a local pending `rpc_id` set or list.
-2. The client polls only the completion flag.
-3. If the flag `rpc_id` is still pending, the client drains `resp_data` in
-   producer order.
-4. Draining stops when the consumed response `rpc_id` matches the flag snapshot.
+1. The client tracks its local consumer cursor in `response_data`.
+2. The client polls only the shared producer cursor flag.
+3. If the producer cursor is ahead of the local consumer cursor, the client
+   drains `response_data` strictly in producer order.
+4. Draining stops when the local consumer cursor catches the producer cursor
+   snapshot read from the flag.
 
 A response is not considered complete until its payload has been copied into
 client-owned local memory.
@@ -33,33 +34,31 @@ client-owned local memory.
 The public `libcxlrpc` flow uses caller-provided fixed shared-memory ranges.
 There is no public dynamic allocator path anymore.
 
-Use one of these constructors:
+Preferred role-specific constructors:
 
 ```c
-cxl_connection_t *cxl_connection_create_fixed_owner(
+cxl_connection_t *cxl_connection_create_server_poll_owner(
     cxl_context_t *ctx,
     const cxl_connection_addrs_t *addrs,
     uint32_t mq_entries);
 
-cxl_connection_t *cxl_connection_create_fixed_attach(
+cxl_connection_t *cxl_connection_create_client_attach(
     cxl_context_t *ctx,
-    const cxl_connection_addrs_t *addrs,
-    uint32_t mq_entries);
+    const cxl_connection_addrs_t *addrs);
 
-cxl_connection_t *cxl_connection_create_fixed(
-    cxl_context_t *ctx,
-    const cxl_connection_addrs_t *addrs,
-    uint32_t mq_entries);
+cxl_connection_t *cxl_connection_create_response_tx(
+    cxl_context_t *ctx);
 ```
 
 Notes:
 
-- `fixed_owner` is the destructive bootstrap path for the owner of a fixed
-  region. It may clear shared metadata / flag state and reset controller-side
-  queue state.
-- `fixed_attach` is the non-destructive attach path for peers joining an
-  already-defined fixed layout.
-- `fixed` is a convenience alias of `fixed_owner`.
+- `create_server_poll_owner()` is the destructive bootstrap path for the
+  shared request queue. It initializes only server request-poll state.
+- `create_client_attach()` initializes only the client request-send and
+  response-drain state.
+- `create_response_tx()` initializes only server response transmit state and
+  does not map any local fixed-layout doorbell / metadata / response / flag
+  ranges.
 
 ### Doorbell / RPC ID layout
 
@@ -80,8 +79,6 @@ bytes 8..15:
 ```
 
 - `rpc_id` is a connection-local logical request ID in `[1, 32767]`
-- `rpc_id` stays reserved until the response payload has been consumed into
-  local memory
 - `node_id` identifies which client/node the server should route the response to
 - `service_id`, `method_id`, and `client_tag` are no longer part of the public
   protocol
@@ -99,9 +96,9 @@ int cxl_send_request(
     const void *data,
     size_t len);
 
-int cxl_peek_latest_completed_rpc_id(
+int cxl_peek_response_producer_cursor(
     cxl_connection_t *conn,
-    uint16_t *out_rpc_id);
+    uint64_t *out_cursor);
 
 int cxl_consume_next_response(
     cxl_connection_t *conn,
@@ -113,14 +110,22 @@ int cxl_consume_next_response(
 Notes:
 
 - `cxl_send_request()` returns the allocated `rpc_id` on success.
-- `cxl_peek_latest_completed_rpc_id()` reads only the flag.
+- The current public `request_data` path is append-only for one connection
+  lifetime. It does not reclaim or wrap `request_data` at runtime.
+- `cxl_peek_response_producer_cursor()` reads only the flag and returns the
+  committed response producer cursor.
 - `cxl_consume_next_response()` consumes exactly one response in producer order.
 - `cxl_consume_next_response()` copies the payload into caller-owned local
-  memory before reclaiming the `rpc_id`.
+  memory and then advances the local response consumer cursor.
 - If `*out_len` is too small, `cxl_consume_next_response()` returns `-1`,
   writes back the exact required size, and does not consume the entry.
-- Server-side response connections must bind one dedicated CopyEngine lane
-  explicitly before response-data / flag setup.
+- Server-side response connections always need peer `response_data` / `flag`
+  setup.
+- Response entries whose `header + payload` size is at most `4 KiB` publish by
+  CPU store+flush only.
+- Response entries whose `header + payload` size exceeds `4 KiB` publish by one
+  ordered asynchronous CopyEngine chain and therefore require one dedicated lane
+  to be bound first.
 
 ### Server-side API
 
@@ -131,6 +136,14 @@ int cxl_poll_request(
     uint16_t *rpc_id,
     const void **out_data_view,
     size_t *out_len);
+
+int cxl_poll_request_timed(
+    cxl_connection_t *conn,
+    uint16_t *node_id,
+    uint16_t *rpc_id,
+    const void **out_data_view,
+    size_t *out_len,
+    cxl_request_poll_timing_t *out_timing);
 
 int cxl_send_response(
     cxl_connection_t *conn,
@@ -152,15 +165,19 @@ Notes:
 
 - `cxl_poll_request()` is non-blocking.
 - `cxl_poll_request()` returns the source `node_id` and request `rpc_id`.
-- With the current backend, `cxl_send_response()` supports payloads up to
-  `4088` bytes.
-- Server responses are sent through `CopyEngine` after one fixed lane is
-  bound and both peer `response_data` and peer `flag` are configured.
+- `cxl_poll_request_timed()` additionally returns three success-path cut points:
+  notification parsed, current request-data view ready, and poll tail done.
+- `cxl_send_response()` writes variable-length, cacheline-aligned entries into
+  one large shared response ring.
+- Small responses publish directly by CPU copy plus `clflushopt`/`sfence`.
+- Large response entries (`header + payload > 4 KiB`) publish by one
+  asynchronous CopyEngine descriptor chain: response entry, then producer cursor
+  flag.
 
 ## CopyEngine Lane Binding
 
-Each server-side response connection binds one dedicated CopyEngine lane, where
-one lane means one `(engine, channel)` pair.
+Dedicated CopyEngine lanes are required for the large-response DMA path. One
+lane still means one `(engine, channel)` pair.
 
 Implications:
 
@@ -297,7 +314,6 @@ Important markers in that file:
 - `server_ready=1`
 - `req_<n>_start_tick=<...>`
 - `req_<n>_end_tick=<...>`
-- `req_<n>_delta_tick=<...>`
 - `TEST_CMD_EXIT_CODE=<...>`
 
 Tick conversion in this setup:

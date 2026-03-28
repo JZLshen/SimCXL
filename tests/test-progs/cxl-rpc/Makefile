@@ -8,6 +8,7 @@ LIBS = -lnuma $(M5_LIB)
 # Keep libcxlrpc's own include path/flags local to its directory so top-level
 # CFLAGS overrides for this Makefile don't leak into the sub-build.
 LIBCXLRPC_CFLAGS ?= -O2 -Wall -Wextra -I./include -I../../../../include
+CE_SANITY_LIBCXLRPC_CFLAGS = $(LIBCXLRPC_CFLAGS) -DCXL_RPC_TEST_FORCE_COPYENGINE=1
 
 TARGETS = rpc_client_example \
           rpc_server_example \
@@ -48,7 +49,8 @@ cxl_copyengine_bw: src/cxl_copyengine_bw.c libcxlrpc
 cpu_memmove_bw: src/cpu_memmove_bw.c libcxlrpc
 	$(CC) $(CFLAGS) -pthread -o $@ $< $(LIBCXLRPC) $(LIBS)
 
-cxl_copyengine_sanity: src/cxl_copyengine_sanity.c libcxlrpc
+cxl_copyengine_sanity: src/cxl_copyengine_sanity.c
+	$(MAKE) -C ../lib/libcxlrpc clean all CFLAGS="$(CE_SANITY_LIBCXLRPC_CFLAGS)"
 	$(CC) $(CFLAGS) -o $@ $< $(LIBCXLRPC) $(LIBS)
 clean:
 	rm -f $(TARGETS) $(LEGACY_CLEAN_PATTERNS)
