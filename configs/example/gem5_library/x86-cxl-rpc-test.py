@@ -2,8 +2,8 @@
 CXL RPC test configuration (simplified).
 
 Flow:
-    - Boot from KVM.
-    - If target cpu != KVM, one guest-side m5 exit triggers host switch.
+    - Boot from the configured boot CPU.
+    - If target cpu != boot cpu, one guest-side m5 exit triggers host switch.
     - Run one test command in guest.
     - One final guest-side m5 exit terminates simulation.
 """
@@ -112,11 +112,18 @@ parser.add_argument(
     help="Additional CXL media latency in nanoseconds on top of the board baseline.",
 )
 parser.add_argument(
+    "--boot_cpu_type",
+    type=str,
+    choices=["KVM", "TIMING", "ATOMIC"],
+    default="KVM",
+    help="CPU type used during boot or checkpoint restore.",
+)
+parser.add_argument(
     "--cpu_type",
     type=str,
     choices=["TIMING", "O3", "KVM", "ATOMIC"],
     default="TIMING",
-    help="CPU type after KVM boot",
+    help="CPU type used for post-boot execution.",
 )
 parser.add_argument(
     "--checkpoint",
@@ -153,6 +160,8 @@ if args.rpc_metadata_entries < 1 or args.rpc_metadata_entries > 1024:
     parser.error("--rpc_metadata_entries must be in [1, 1024]")
 if args.cxl_extra_latency_ns < 0:
     parser.error("--cxl_extra_latency_ns must be >= 0")
+if args.boot_cpu_type != "KVM" and args.cpu_type == "KVM":
+    parser.error("--cpu_type KVM requires --boot_cpu_type KVM")
 
 KVM_UNSUPPORTED_M5_RPNS_BINS = {
     "rpc_client_example",
@@ -347,11 +356,13 @@ cpu_type_map = {
     "KVM": CPUTypes.KVM,
     "ATOMIC": CPUTypes.ATOMIC,
 }
+needs_switch = args.cpu_type != args.boot_cpu_type
 
-if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+if (args.boot_cpu_type == "KVM" and
+        not os.access("/dev/kvm", os.R_OK | os.W_OK)):
     parser.error(
         "x86-cxl-rpc-test.py requires read/write access to /dev/kvm for the "
-        "mandatory KVM boot path"
+        "selected KVM boot path"
     )
 
 checkpoint_topology = _load_checkpoint_copyengine_topology(args.checkpoint)
@@ -392,14 +403,12 @@ else:
     )
 
 processor = SimpleSwitchableProcessor(
-    starting_core_type=CPUTypes.KVM,
+    starting_core_type=cpu_type_map[args.boot_cpu_type],
     switch_core_type=cpu_type_map[args.cpu_type],
     isa=ISA.X86,
     num_cores=args.num_cpus,
 )
 
-for proc in processor.start:
-    proc.core.usePerf = False
 for core_list in getattr(processor, "_switchable_cores", {}).values():
     for proc in core_list:
         if hasattr(proc, "core") and hasattr(proc.core, "usePerf"):
@@ -425,7 +434,7 @@ test_timeout_sec = max(0, args.test_timeout_sec)
 effective_test_cmd = args.test_cmd
 
 script_lines = []
-if args.cpu_type != "KVM":
+if needs_switch:
     script_lines.extend(
         [
             "sync",
@@ -498,7 +507,10 @@ if args.checkpoint:
     print(f"  Checkpoint: {args.checkpoint}")
 else:
     print("Running CXL RPC test simulation...")
-print(f"  CPU type: KVM -> {cpu_type_map[args.cpu_type].name}")
+print(
+    f"  CPU type: {cpu_type_map[args.boot_cpu_type].name} -> "
+    f"{cpu_type_map[args.cpu_type].name}"
+)
 print(f"  Kernel: {args.kernel}")
 print(f"  Disk: {args.disk}")
 print(f"  Test command: {args.test_cmd}")
@@ -529,7 +541,7 @@ def _terminate_on_first_exit_handler():
 
 exit_handler = (
     _terminate_on_first_exit_handler()
-    if args.cpu_type == "KVM"
+    if not needs_switch
     else _switch_exit_handler()
 )
 

@@ -779,6 +779,16 @@ def main() -> int:
             "0 keeps the checkpoint script default."
         ),
     )
+    parser.add_argument(
+        "--boot-cpu-type",
+        type=str,
+        choices=["KVM", "TIMING", "ATOMIC"],
+        default="KVM",
+        help=(
+            "CPU type used during checkpoint creation and pre-test restore. "
+            "TIMING/ATOMIC avoid /dev/kvm but are much slower than KVM."
+        ),
+    )
     parser.add_argument("--skip-inject", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force-rerun", action="store_true")
@@ -996,15 +1006,18 @@ def main() -> int:
     ]
     started_experiments = 0
     running_as_root = hasattr(os, "geteuid") and os.geteuid() == 0
+    boot_requires_kvm = args.boot_cpu_type == "KVM"
     direct_kvm_access = os.access("/dev/kvm", os.R_OK | os.W_OK)
     sudo_n_available = sudo_nopass_available()
     kvm_cmd_prefix: List[str] = []
-    checkpoint_cache: Dict[Tuple[int, int, int, int], Path] = {}
-    checkpoint_failure_cache: Dict[Tuple[int, int, int, int], Tuple[str, int]] = {}
+    checkpoint_cache: Dict[Tuple[str, int, int, int, int], Path] = {}
+    checkpoint_failure_cache: Dict[Tuple[str, int, int, int, int], Tuple[str, int]] = {}
     kvm_signal_prefix: Optional[List[str]] = None
     lock_fp = None
 
-    if direct_kvm_access:
+    if not boot_requires_kvm:
+        print(f"[matrix] boot CPU type is {args.boot_cpu_type}; /dev/kvm not required")
+    elif direct_kvm_access:
         print("[matrix] /dev/kvm is directly accessible by current user")
     else:
         print("[matrix] /dev/kvm is not directly accessible by current user")
@@ -1080,6 +1093,7 @@ def main() -> int:
             run_log = run_outdir / "gem5_run.log"
             required_cpus = key.clients + 1
             checkpoint_key = (
+                args.boot_cpu_type,
                 key.clients,
                 key.response_lane_count,
                 key.mq_entries,
@@ -1088,6 +1102,8 @@ def main() -> int:
             checkpoint_dir = checkpoint_cache.get(checkpoint_key)
             checkpoint_failure = checkpoint_failure_cache.get(checkpoint_key)
             checkpoint_label = (
+                f"boot_{args.boot_cpu_type.lower()}"
+                f"_"
                 f"clients_{key.clients}"
                 f"_lanes_{key.response_lane_count}"
                 f"_mq_{key.mq_entries}"
@@ -1146,6 +1162,8 @@ def main() -> int:
                         str(save_ckpt_cfg),
                         "--disk",
                         str(disk_img),
+                        "--boot_cpu_type",
+                        args.boot_cpu_type,
                         "--num_cpus",
                         str(required_cpus),
                         "--rpc_client_count",
@@ -1304,6 +1322,8 @@ def main() -> int:
                 str(test_cfg),
                 "--disk",
                 str(disk_img),
+                "--boot_cpu_type",
+                args.boot_cpu_type,
                 "--cpu_type",
                 "TIMING",
                 "--num_cpus",

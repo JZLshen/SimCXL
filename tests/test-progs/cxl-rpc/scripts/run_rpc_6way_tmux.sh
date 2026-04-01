@@ -34,6 +34,7 @@ DISK="$REPO_ROOT/files/parsec.img"
 COPY_ENGINE_CHANNELS=0
 CHECKPOINT_HANDOFF_DEADLINE_SIM_SECONDS=0
 INTER_EXPERIMENT_SLEEP_SEC=0
+BOOT_CPU_TYPE="KVM"
 SKIP_INJECT=0
 FORCE_RERUN=0
 DRY_RUN=0
@@ -55,6 +56,7 @@ Options:
   --copy-engine-channels N               Pass-through to both runners
   --checkpoint-handoff-deadline-sim-seconds N
                                          Pass-through to both runners
+  --boot-cpu-type TYPE                   KVM, TIMING, or ATOMIC (default: ${BOOT_CPU_TYPE})
   --inter-experiment-sleep-sec N         Pass-through to both runners (default: ${INTER_EXPERIMENT_SLEEP_SEC})
   --skip-inject                          Reuse the current disk image contents
   --force-rerun                          Pass-through to both runners
@@ -131,6 +133,11 @@ while [[ $# -gt 0 ]]; do
             CHECKPOINT_HANDOFF_DEADLINE_SIM_SECONDS="$2"
             shift 2
             ;;
+        --boot-cpu-type)
+            [[ $# -ge 2 ]] || die "--boot-cpu-type requires a value"
+            BOOT_CPU_TYPE="$2"
+            shift 2
+            ;;
         --inter-experiment-sleep-sec)
             [[ $# -ge 2 ]] || die "--inter-experiment-sleep-sec requires a value"
             INTER_EXPERIMENT_SLEEP_SEC="$2"
@@ -169,6 +176,8 @@ done
     die "--checkpoint-handoff-deadline-sim-seconds must be >= 0"
 [[ "$INTER_EXPERIMENT_SLEEP_SEC" =~ ^[0-9]+$ ]] || \
     die "--inter-experiment-sleep-sec must be >= 0"
+[[ "$BOOT_CPU_TYPE" = "KVM" || "$BOOT_CPU_TYPE" = "TIMING" || "$BOOT_CPU_TYPE" = "ATOMIC" ]] || \
+    die "--boot-cpu-type must be KVM, TIMING, or ATOMIC"
 [[ -f "$BARE_RUNNER" ]] || die "bare runner not found: $BARE_RUNNER"
 [[ -f "$APP_RUNNER" ]] || die "app runner not found: $APP_RUNNER"
 [[ -f "$INJECT_SCRIPT" ]] || die "inject script not found: $INJECT_SCRIPT"
@@ -219,6 +228,7 @@ if [[ "$FOREGROUND" != "1" ]]; then
         --copy-engine-channels "$COPY_ENGINE_CHANNELS"
         --checkpoint-handoff-deadline-sim-seconds
         "$CHECKPOINT_HANDOFF_DEADLINE_SIM_SECONDS"
+        --boot-cpu-type "$BOOT_CPU_TYPE"
         --inter-experiment-sleep-sec "$INTER_EXPERIMENT_SLEEP_SEC"
     )
     if [[ "$SKIP_INJECT" = "1" ]]; then
@@ -251,6 +261,7 @@ echo "[launcher] session=$SESSION_NAME"
 echo "[launcher] repo_root=$REPO_ROOT"
 echo "[launcher] output_base=$OUTPUT_BASE_ABS"
 echo "[launcher] disk=$DISK"
+echo "[launcher] boot_cpu_type=$BOOT_CPU_TYPE"
 echo "[launcher] slot=$SLOT bare=${BARE_START}-${BARE_END} app=${APP_START}-${APP_END}"
 echo "[launcher] log=$LOG_PATH"
 echo "[launcher] started_at=$(date --iso-8601=seconds)"
@@ -278,6 +289,7 @@ bare_cmd=(
     --output-base "$OUTPUT_BASE"
     --batch-name "$BARE_BATCH"
     --disk "$DISK"
+    --boot-cpu-type "$BOOT_CPU_TYPE"
     --start-index "$BARE_START"
     --end-index "$BARE_END"
     --skip-inject
@@ -307,6 +319,7 @@ if [[ "$APP_START" -gt 0 ]]; then
         --output-base "$OUTPUT_BASE"
         --batch-name "$APP_BATCH"
         --disk "$DISK"
+        --boot-cpu-type "$BOOT_CPU_TYPE"
         --start-index "$APP_START"
         --end-index "$APP_END"
         --skip-inject

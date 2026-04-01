@@ -1,13 +1,13 @@
 """
 CXL RPC Checkpoint Save
 
-Boot Linux with KVM, save checkpoint in KVM state (before CPU switch).
-This allows checkpoint restore to switch to the supported post-boot CPU
-types (TIMING/O3/KVM).
+Boot Linux with a configurable boot CPU, then save a checkpoint before any
+post-boot CPU switch.
 
 Checkpoint is saved after boot completes but BEFORE CPU switch, so:
-  - save-checkpoint: KVM boot -> save checkpoint (KVM state)
-  - test.py restore: restore checkpoint (KVM state) -> switch CPU -> run test
+  - save-checkpoint: boot CPU -> save checkpoint (matching boot CPU state)
+  - test.py restore: restore checkpoint with the same boot CPU type,
+    optionally switch CPU, then run test
 
 Usage:
     ./build/X86/gem5.opt -d output/cxl_rpc_checkpoint \\
@@ -109,6 +109,22 @@ parser.add_argument(
     help=('Maximum ticks per simulator.run() chunk while waiting for trigger '
           'or settle completion.'),
 )
+parser.add_argument(
+    '--boot_cpu_type',
+    type=str,
+    choices=['KVM', 'TIMING', 'ATOMIC'],
+    default='KVM',
+    help=('CPU type used during Linux boot and checkpoint creation. '
+          'TIMING/ATOMIC avoid /dev/kvm but are much slower than KVM.'),
+)
+parser.add_argument(
+    '--iomem_relaxed',
+    type=str,
+    choices=['true', 'false'],
+    default='true',
+    help=('Whether to append iomem=relaxed to the kernel command line during '
+          'checkpoint boot.'),
+)
 parser.add_argument('--kernel', type=str, default=str(default_kernel),
                     help='Path to Linux kernel image')
 parser.add_argument('--disk', type=str, default=str(default_disk),
@@ -124,7 +140,8 @@ if args.rpc_metadata_entries < 1 or args.rpc_metadata_entries > 1024:
     parser.error('--rpc_metadata_entries must be in [1, 1024]')
 if args.cxl_extra_latency_ns < 0:
     parser.error('--cxl_extra_latency_ns must be >= 0')
-if not os.access('/dev/kvm', os.R_OK | os.W_OK):
+if (args.boot_cpu_type == 'KVM' and
+        not os.access('/dev/kvm', os.R_OK | os.W_OK)):
     parser.error(
         'x86-cxl-rpc-save-checkpoint.py requires read/write access to '
         '/dev/kvm on the host'
@@ -192,17 +209,19 @@ cache_hierarchy = PrivateL1PrivateL2SharedL3CacheHierarchy(
 memory = DIMM_DDR5_4400(size="3GB")
 cxl_dram = DIMM_DDR5_4400(size="8GB")
 
-# Use TIMING as switch target - checkpoint is saved in KVM state,
-# so this doesn't affect the checkpoint. Restore can use TIMING/O3/KVM.
+# The switch target is unused during checkpoint creation; the checkpoint is
+# always saved in the configured boot CPU state before any host-side switch.
 processor = SimpleSwitchableProcessor(
-    starting_core_type=CPUTypes.KVM,
+    starting_core_type=CPUTypes[args.boot_cpu_type],
     switch_core_type=CPUTypes.TIMING,
     isa=ISA.X86,
     num_cores=args.num_cpus,
 )
 
-for proc in processor.start:
-    proc.core.usePerf = False
+for core_list in getattr(processor, "_switchable_cores", {}).values():
+    for proc in core_list:
+        if hasattr(proc, "core") and hasattr(proc.core, "usePerf"):
+            proc.core.usePerf = False
 
 board = X86Board(
     clk_freq="2.4GHz",
@@ -221,7 +240,8 @@ board = X86Board(
 # Board-level wiring already handles IDE/CXL DMA and response ports.
 # Keep config-side wiring minimal to avoid duplicate-port fatals.
 
-# Boot with KVM and wait for guest SMP bring-up before checkpoint.
+# Boot with the selected CPU type and wait for guest SMP bring-up before
+# checkpoint.
 # If checkpoint is taken too early, only CPU0 may be online after restore,
 # which breaks server/client co-run workflows. The checkpoint is not saved on
 # the first guest handoff EXIT anymore. Instead, the guest crosses the handoff
@@ -326,7 +346,8 @@ echo "[ckpt-guest] ERROR: exec restore script failed"
 m5 fail 106
 """
 
-# Checkpoint saves KVM state, restore will switch CPU
+# Checkpoint saves the selected boot CPU state. Restore must use the same
+# boot CPU type before any optional CPU switch.
 board.set_kernel_disk_workload(
     kernel=KernelResource(local_path=args.kernel),
     disk_image=DiskImageResource(local_path=args.disk),
@@ -336,7 +357,7 @@ board.set_kernel_disk_workload(
         "lpj=7999923",
         "root={root_value}",
         "idle=poll",
-        "iomem=relaxed",
+        *([] if args.iomem_relaxed == 'false' else ["iomem=relaxed"]),
     ],
     readfile_contents=checkpoint_readfile,
 )
@@ -392,8 +413,9 @@ def save_checkpoint(reason: str):
     m5.checkpoint(str(checkpoint_dir))
     print("Checkpoint saved successfully!")
     print(f"  Location: {checkpoint_dir}")
-    print("  State: KVM (bootstrap script paused at second handoff EXIT)")
-    print("  Restore can use: TIMING, O3, or KVM")
+    print("  State: "
+          f"{args.boot_cpu_type} (bootstrap script paused at second handoff EXIT)")
+    print("  Restore should use the same --boot_cpu_type value")
 
 simulator = Simulator(
     board=board,
@@ -407,8 +429,9 @@ print(f"  CPUs: {args.num_cpus}")
 print("  Mode: CPU-to-CPU")
 print(f"  Kernel: {args.kernel}")
 print(f"  Disk: {args.disk}")
-print(f"  Checkpoint will be saved in KVM state (before CPU switch)")
-print("  This allows restore with TIMING, O3, or KVM")
+print(f"  Boot CPU type: {args.boot_cpu_type}")
+print(f"  iomem=relaxed: {args.iomem_relaxed}")
+print("  Checkpoint will be saved before any host-side CPU switch")
 print(f"  Handoff deadline sim-seconds: {args.handoff_deadline_sim_seconds}")
 print("  Save policy: second guest handoff EXIT after guest-side settle")
 print(f"  Run step ticks: {run_step_ticks}")

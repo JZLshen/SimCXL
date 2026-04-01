@@ -169,6 +169,16 @@ def main() -> int:
             "0 keeps the checkpoint script default."
         ),
     )
+    parser.add_argument(
+        "--boot-cpu-type",
+        type=str,
+        choices=["KVM", "TIMING", "ATOMIC"],
+        default="KVM",
+        help=(
+            "CPU type used during checkpoint creation and pre-test restore. "
+            "TIMING/ATOMIC avoid /dev/kvm but are much slower than KVM."
+        ),
+    )
     parser.add_argument("--skip-inject", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force-rerun", action="store_true")
@@ -356,6 +366,7 @@ def main() -> int:
     ]
 
     started_experiments = 0
+    boot_requires_kvm = args.boot_cpu_type == "KVM"
     direct_kvm_access = os.access("/dev/kvm", os.R_OK | os.W_OK)
     sudo_n_available = sudo_nopass_available()
     kvm_cmd_prefix: List[str] = []
@@ -364,7 +375,12 @@ def main() -> int:
     kvm_signal_prefix: Optional[List[str]] = None
     lock_fp = None
 
-    if direct_kvm_access:
+    if not boot_requires_kvm:
+        print(
+            f"[threshold] boot CPU type is {args.boot_cpu_type}; "
+            "/dev/kvm not required"
+        )
+    elif direct_kvm_access:
         print("[threshold] /dev/kvm is directly accessible by current user")
     else:
         print("[threshold] /dev/kvm is not directly accessible by current user")
@@ -406,7 +422,9 @@ def main() -> int:
             else:
                 print("[dry-run] skip inject execution")
 
-        checkpoint_label = f"clients_{DEFAULT_CLIENTS}"
+        checkpoint_label = (
+            f"boot_{args.boot_cpu_type.lower()}_clients_{DEFAULT_CLIENTS}"
+        )
         ckpt_outdir = (
             batch_dir / "checkpoints" / checkpoint_label / "cxl_rpc_checkpoint"
         )
@@ -504,6 +522,8 @@ def main() -> int:
                         str(save_ckpt_cfg),
                         "--disk",
                         str(disk_img),
+                        "--boot_cpu_type",
+                        args.boot_cpu_type,
                         "--num_cpus",
                         str(required_cpus),
                         "--rpc_client_count",
@@ -653,6 +673,8 @@ def main() -> int:
                 str(test_cfg),
                 "--disk",
                 str(disk_img),
+                "--boot_cpu_type",
+                args.boot_cpu_type,
                 "--cpu_type",
                 "TIMING",
                 "--num_cpus",
