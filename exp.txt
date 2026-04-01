@@ -1,0 +1,95 @@
+实验：
+
+一、motivation：dedicated不行（polling开销，non-cc加剧，稀疏请求加剧），shared不行（Peterson锁，竞争开销）
+
+（1）稀疏请求加剧polling开销【dedicated】
+
+横坐标client，纵坐标throughput，四条线
+
+slow16：0%，25%，50%，100%（不用测应该） / 4/8/12 （3*3=9个实验）
+
+slow32：0%，25%，50%，100%（不用测应该） / 4/8/16/20/24/28（3*6=18个实验）
+
+（2）non-cc加剧polling开销【dedicated】
+
+breakdown：poll通知/execute/response（写response到CXL+通知），延迟：median/avg/p50/p99
+
+staging non-cc CXL
+
+direct non-cc CXL
+
+direct cc CXL
+
+req64B，resp64B，1/2/3/4/8/16/32 client（3*6=18个实验）
+
+（3）response大小加剧开销【dedicated】
+
+（CXL write 和 DRAM write 用IOPS）
+
+dedicated固定client，改变response大小，测throughput
+
+req64B，resp8B/64B/256B/1KB/4KB/8KB（6个实验）
+
+（4）竞争加剧开销【shared】
+
+req64B，resp64B，1/2/4/8/16/32 client（6个实验）
+
+二、overall（每个实验需要对比同系列的shared和dedicated）：
+
+（1）req64B，resp64B，裸RPC
+
+（2）req1530B，resp315B，裸RPC，https://homes.cs.washington.edu/~arvind/papers/google-rpc.pdf
+
+（3）req38B，resp230B，裸RPC，[**http://usenix.org/system/files/osdi20-yang.pdf**](http://usenix.org/system/files/osdi20-yang.pdf)
+
+shared，dedicated，当前
+
+1/2/4/8/16/32 client（3*3*6=54个实验）
+
+三、敏感性（每个实验需要对比同参数的shared和dedicated）：
+
+（1）req8B/64B/256B/1KB/4KB/8KB，resp64B，32 client（6个实验）
+
+（2）req64B，resp8B/64B/256B/1KB/4KB/8KB，32 client（6个实验）
+
+（3）ring queue大小：16/32/64/128/256/512/1024，req64B，resp64B，32 client（7个实验）
+
+（4）server延迟同步head：8/16/32/64/128/256/512，ring queue 1024，req64B，resp64B，32 client（7个实验）
+
+（5）请求稀疏度：4/8/16/20/24/28 client，慢请求数量：0%，25%，50%，100%（不用测应该） / （3*6=18个实验）
+
+（6）CXL延迟：+100/200/300ns，req64B，resp64B，32 client（3个实验）
+
+（7）DMA：1/2/4/8/16/32个client对应一个独立的lane，req1530B，resp315B，裸RPC（6个实验）
+
+技术分析（不需要对比shared和dedicated）：
+
+（1）w/o doorbell：也就是shared情况
+
+req64B，resp64B，1/2/4/8/16/32 client （6个实验）
+
+（2）w/o DMA：resp8B/64B/256B/1KB/4KB/8KB
+
+req64B，32 client （6个实验）
+
+（3）w/o prefetch：两方面prefetch，通知和请求数据。1/2/4/8/16/32 client（2*6=12个实验）
+
+四、Application performance （对比同参数的shared和dedicated情况）
+
+集成个很简单的内存KV系统
+
+// 固定client：32
+
+// MICA
+
+// YCSB (zipfian. A-B-C-D-E-F?)，可以预先把key生成
+
+// 先把KV存进mica，然后进行RPC，client进行get/put
+
+// key-value
+
+**1) YCSB的size （1KB）**
+
+**2)  27.1B / 126.7B**
+
+**(UDB, https://www.usenix.org/system/files/fast20-cao_zhichao.pdf的read only)**

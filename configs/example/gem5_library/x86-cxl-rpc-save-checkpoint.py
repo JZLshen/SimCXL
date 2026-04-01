@@ -60,6 +60,20 @@ parser.add_argument(
           '0 means auto: max(1, num_cpus - 1).'),
 )
 parser.add_argument(
+    '--rpc_response_lane_count',
+    type=int,
+    default=0,
+    help=('Number of response DMA lanes that must exist in the checkpointed '
+          'hardware topology. 0 defaults to one lane per RPC client.'),
+)
+parser.add_argument(
+    '--rpc_metadata_entries',
+    type=int,
+    default=1024,
+    help=('Logical metadata queue depth exposed to the RPC engine. Must stay '
+          'within the public layout capacity (1024).'),
+)
+parser.add_argument(
     '--copy_engine_channels',
     type=int,
     default=0,
@@ -71,6 +85,12 @@ parser.add_argument(
     type=str,
     default='4KiB',
     help='Per-CopyEngine maximum transfer size advertised through XFERCAP.',
+)
+parser.add_argument(
+    '--cxl_extra_latency_ns',
+    type=int,
+    default=0,
+    help='Additional CXL media latency in nanoseconds on top of the board baseline.',
 )
 parser.add_argument('--is_asic', type=str, choices=['True', 'False'],
                     default='True', help='ASIC or FPGA device.')
@@ -98,6 +118,12 @@ args = parser.parse_args()
 
 if args.rpc_client_count < 0:
     parser.error('--rpc_client_count must be >= 0')
+if args.rpc_response_lane_count < 0:
+    parser.error('--rpc_response_lane_count must be >= 0')
+if args.rpc_metadata_entries < 1 or args.rpc_metadata_entries > 1024:
+    parser.error('--rpc_metadata_entries must be in [1, 1024]')
+if args.cxl_extra_latency_ns < 0:
+    parser.error('--cxl_extra_latency_ns must be >= 0')
 if not os.access('/dev/kvm', os.R_OK | os.W_OK):
     parser.error(
         'x86-cxl-rpc-save-checkpoint.py requires read/write access to '
@@ -144,8 +170,13 @@ def derive_copyengine_topology(
 requested_rpc_clients = (
     args.rpc_client_count if args.rpc_client_count > 0 else max(1, args.num_cpus - 1)
 )
+requested_rpc_lanes = (
+    args.rpc_response_lane_count
+    if args.rpc_response_lane_count > 0
+    else requested_rpc_clients
+)
 num_copy_engines, copy_engine_channels = derive_copyengine_topology(
-    requested_rpc_clients,
+    requested_rpc_lanes,
     args.copy_engine_channels,
 )
 
@@ -183,6 +214,8 @@ board = X86Board(
     num_copy_engines=num_copy_engines,
     copy_engine_channels=copy_engine_channels,
     copy_engine_xfercap=args.copy_engine_xfercap,
+    rpc_metadata_entries=args.rpc_metadata_entries,
+    cxl_extra_latency_ns=args.cxl_extra_latency_ns,
 )
 
 # Board-level wiring already handles IDE/CXL DMA and response ports.

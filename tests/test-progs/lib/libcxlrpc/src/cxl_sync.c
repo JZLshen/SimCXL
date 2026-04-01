@@ -1,7 +1,8 @@
 /*
  * CXL RPC Head Synchronization - Implementation
  *
- * Fixed policy: sync once per N/4 processed entries.
+ * Default policy: sync once per N/4 processed entries, optionally overridden
+ * at runtime.
  * HEAD_UPDATE is sent via the same software publish path as other stores:
  * store -> clflushopt(range) -> sfence.
  */
@@ -21,6 +22,7 @@
 
 struct cxl_adaptive_sync {
     /* Fixed policy threshold: sync every N/4 processed entries. */
+    uint32_t default_threshold;
     uint32_t threshold;
     uint32_t entries_since_sync;
 
@@ -80,11 +82,27 @@ cxl_adaptive_sync_t *cxl_sync_init(const cxl_sync_config_t *config,
     uint32_t n = config->queue_size_n;
 
     /* Fixed N/4 policy, clamped to at least 1 entry. */
-    s->threshold = (n / 4) > 0 ? (n / 4) : 1;
+    s->default_threshold = (n / 4) > 0 ? (n / 4) : 1;
+    s->threshold = config->threshold > 0 ?
+        config->threshold : s->default_threshold;
 
     s->doorbell_addr = doorbell_addr;
 
     return s;
+}
+
+void cxl_sync_set_threshold(cxl_adaptive_sync_t *sync, uint32_t threshold)
+{
+    if (!sync)
+        return;
+
+    sync->threshold = threshold > 0 ? threshold : sync->default_threshold;
+    sync->entries_since_sync = 0;
+}
+
+uint32_t cxl_sync_get_threshold(const cxl_adaptive_sync_t *sync)
+{
+    return sync ? sync->threshold : 0;
 }
 
 void cxl_sync_destroy(cxl_adaptive_sync_t *sync)

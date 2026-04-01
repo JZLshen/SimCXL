@@ -170,9 +170,10 @@ Notes:
 - `cxl_send_response()` writes variable-length, cacheline-aligned entries into
   one large shared response ring.
 - Small responses publish directly by CPU copy plus `clflushopt`/`sfence`.
-- Large response entries (`header + payload > 4 KiB`) publish by one
+- Large response entries above the runtime DMA threshold publish by one
   asynchronous CopyEngine descriptor chain: response entry, then producer cursor
-  flag.
+  flag. The current public RPC runners default this threshold to `256B`, and it
+  can be overridden with `--response-dma-threshold`.
 
 ## CopyEngine Lane Binding
 
@@ -238,8 +239,6 @@ This script compiles `tests/test-progs/cxl-rpc` and injects binaries into
 It also installs helper launch scripts in the guest:
 
 - `/home/test_code/run_rpc_server_clients.sh` for the unified server+clients launcher
-- `/home/test_code/run_rpc_server_client.sh` as the single-client wrapper
-- `/home/test_code/run_rpc_server_multi_client.sh` as the multi-client wrapper
 
 ### 3. Save a reusable checkpoint
 
@@ -271,7 +270,7 @@ build/X86/gem5.opt \
   --cpu_type TIMING \
   --num_cpus 4 \
   --checkpoint output/rebuild_ckpt_4c_example/cxl_rpc_checkpoint \
-  --test_cmd "bash /home/test_code/run_rpc_server_client.sh /home/test_code/rpc_server_example /home/test_code/rpc_client_example --requests 1 --max-polls 2000000 --silent"
+  --test_cmd "CXL_RPC_CLIENT_COUNT=1 bash /home/test_code/run_rpc_server_clients.sh /home/test_code/rpc_server_example /home/test_code/rpc_client_example --requests 1 --max-polls 2000000 --silent"
 ```
 
 #### `2x1` example
@@ -285,17 +284,20 @@ build/X86/gem5.opt \
   --cpu_type TIMING \
   --num_cpus 4 \
   --checkpoint output/rebuild_ckpt_4c_example/cxl_rpc_checkpoint \
-  --test_cmd "CXL_RPC_CLIENT_COUNT=2 bash /home/test_code/run_rpc_server_multi_client.sh /home/test_code/rpc_server_example /home/test_code/rpc_client_example --requests 1 --max-polls 2000000 --silent"
+  --test_cmd "CXL_RPC_CLIENT_COUNT=2 bash /home/test_code/run_rpc_server_clients.sh /home/test_code/rpc_server_example /home/test_code/rpc_client_example --requests 1 --max-polls 2000000 --silent"
 ```
 
 The test config derives the CopyEngine topology from `rpc_client_count`.
 If `--rpc_client_count` is not passed explicitly, it infers the client count
-from `CXL_RPC_CLIENT_COUNT=...`, `--num-clients`, or the standard multi-client
-launcher name inside `--test_cmd`.
+from `CXL_RPC_CLIENT_COUNT=...` or `--num-clients` inside `--test_cmd`.
 For client counts above `29`, the public configs automatically increase the
 channel count per engine so the total number of response lanes still covers all
 clients, while keeping the board on the existing bus-0 single-function engine
 topology.
+
+`rpc_client_example` also accepts `--window N` for client-side sliding-window
+control. The default is `16`. Use `--window 1` for strict send-then-poll
+stop-and-wait behavior. `--window 0` is invalid and rejected explicitly.
 
 `rpc_client_example`, `cxl_mem_copy_cmp`, and `cpu_memmove_bw` use
 `m5_rpns()` for tick capture. Because that pseudo-instruction traps as an
@@ -305,16 +307,11 @@ is intentional fail-fast behavior for the current RPC path.
 
 ### 5. Read results
 
-The main guest console output is:
+The main extracted guest artifacts are:
 
-- `output/<run_dir>/board.pc.com_1.device`
-
-Important markers in that file:
-
-- `server_ready=1`
-- `req_<n>_start_tick=<...>`
-- `req_<n>_end_tick=<...>`
-- `TEST_CMD_EXIT_CODE=<...>`
+- `output/<run_dir>/rpc_status.txt`
+- `output/<run_dir>/rpc_server_runtime.log`
+- `output/<run_dir>/rpc_client_runtime_<n>.log`
 
 Tick conversion in this setup:
 

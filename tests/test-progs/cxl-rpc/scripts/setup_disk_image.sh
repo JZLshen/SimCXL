@@ -4,7 +4,8 @@
 # Usage:
 #   ./scripts/setup_disk_image.sh /path/to/parsec.img
 #
-# Binaries are copied to /home/test_code/ inside the image.
+# Binaries are copied to /home/test_code/ inside the image. The script updates
+# the given image in place; backup is opt-in via CXL_RPC_BACKUP_DISK_IMAGE=1.
 
 set -euo pipefail
 
@@ -18,6 +19,7 @@ MOUNT_POINT="/tmp/gem5_disk_mount_$$"
 DEST_DIR="/home/test_code"
 M5_BIN="$SIMCXL_DIR/util/m5/build/x86/out/m5"
 LOOP_DEVICE=""
+EXTRA_MAKE_TARGETS=()
 
 # Core binaries to copy (default path).
 BINARIES=(
@@ -25,6 +27,8 @@ BINARIES=(
     "cxl_mem_paper_latency"
     "rpc_client_example"
     "rpc_server_example"
+    "rpc_mica_client"
+    "rpc_mica_server"
 )
 
 # Optional utility binary for standalone memcpy-vs-copyengine experiments.
@@ -47,9 +51,21 @@ if [ "${CXL_RPC_INCLUDE_CPU_MEMMOVE_BW:-0}" != "0" ]; then
     BINARIES+=("cpu_memmove_bw")
 fi
 
+# Optional threshold microbenchmark server binary.
+if [ "${CXL_RPC_INCLUDE_THRESHOLD_SERVER:-0}" != "0" ]; then
+    BINARIES+=("rpc_server_threshold_mode")
+    EXTRA_MAKE_TARGETS+=("rpc_server_threshold_mode")
+fi
+
 # Optional hygiene mode: remove unrelated files under /home/test_code before
 # copying the current whitelist binaries.
 CLEAN_TEST_CODE_DIR="${CXL_RPC_CLEAN_TEST_CODE_DIR:-0}"
+RETIRED_BINARIES=(
+    "rpc_kv_client"
+    "rpc_kv_server"
+    "run_rpc_server_client.sh"
+    "run_rpc_server_multi_client.sh"
+)
 
 usage() {
     echo "Usage: $0 DISK_IMAGE_PATH"
@@ -59,7 +75,9 @@ usage() {
     echo "Set CXL_RPC_INCLUDE_COPY_CMP=1 to also copy cxl_mem_copy_cmp."
     echo "Set CXL_RPC_INCLUDE_CE_BW=1 to also copy cxl_copyengine_bw."
     echo "Set CXL_RPC_INCLUDE_CPU_MEMMOVE_BW=1 to also copy cpu_memmove_bw."
+    echo "Set CXL_RPC_INCLUDE_THRESHOLD_SERVER=1 to also copy rpc_server_threshold_mode."
     echo "Set CXL_RPC_CLEAN_TEST_CODE_DIR=1 to remove non-whitelist files in ${DEST_DIR}."
+    echo "Set CXL_RPC_BACKUP_DISK_IMAGE=1 to create DISK_IMAGE_PATH.bak before injection."
     echo ""
     echo "Arguments:"
     echo "  DISK_IMAGE_PATH  Path to disk image file (e.g., parsec.img)"
@@ -86,21 +104,10 @@ if [ ! -f "$DISK_IMAGE" ]; then
     exit 1
 fi
 
-# Backup disk image
-BACKUP="${DISK_IMAGE}.bak"
-if [ ! -f "$BACKUP" ]; then
-    echo "[0/4] Backing up disk image..."
-    cp "$DISK_IMAGE" "$BACKUP"
-    echo "  Backup: $BACKUP"
-else
-    echo "[0/4] Backup already exists: $BACKUP (skip)"
-fi
-echo ""
-
 # Build binaries
-echo "[1/5] Building test binaries..."
+echo "[1/4] Building test binaries..."
 make -C "$RPC_DIR" clean
-make -C "$RPC_DIR" all
+TMPDIR="${TMPDIR:-/dev/shm}" make -C "$RPC_DIR" all "${EXTRA_MAKE_TARGETS[@]}"
 
 # Build m5 utility if needed
 if [ ! -f "$M5_BIN" ]; then
@@ -110,11 +117,23 @@ fi
 echo ""
 
 # Mount disk image
-echo "[2/5] Mounting disk image..."
+if [ "${CXL_RPC_BACKUP_DISK_IMAGE:-0}" != "0" ]; then
+    BACKUP="${DISK_IMAGE}.bak"
+    if [ ! -f "$BACKUP" ]; then
+        echo "[backup] Creating disk image backup..."
+        cp "$DISK_IMAGE" "$BACKUP"
+        echo "  Backup: $BACKUP"
+    else
+        echo "[backup] Backup already exists: $BACKUP (skip)"
+    fi
+    echo ""
+fi
+
+echo "[2/4] Mounting disk image..."
 mkdir -p "$MOUNT_POINT"
 
 cleanup() {
-    echo "[5/5] Unmounting disk image..."
+    echo "[cleanup] Unmounting disk image..."
     sudo umount "$MOUNT_POINT" 2>/dev/null || true
     if [ -n "$LOOP_DEVICE" ]; then
         sudo losetup -d "$LOOP_DEVICE" 2>/dev/null || true
@@ -144,8 +163,15 @@ else
 fi
 
 # Copy binaries
-echo "[3/5] Copying test binaries to ${DEST_DIR}..."
+echo "[3/4] Copying test binaries to ${DEST_DIR}..."
 sudo mkdir -p "${MOUNT_POINT}${DEST_DIR}"
+
+for retired_bin in "${RETIRED_BINARIES[@]}"; do
+    if sudo test -f "${MOUNT_POINT}${DEST_DIR}/${retired_bin}"; then
+        sudo rm -f "${MOUNT_POINT}${DEST_DIR}/${retired_bin}"
+        echo "  Removed retired binary: ${retired_bin}"
+    fi
+done
 
 removed_non_whitelist=0
 if [ "$CLEAN_TEST_CODE_DIR" != "0" ]; then
@@ -206,8 +232,6 @@ CLIENT_LOG_PREFIX="${CXL_RPC_CLIENT_LOG_PREFIX:-${RUNTIME_DIR}/cxl_rpc_client_ru
 STATUS_FILE="${CXL_RPC_STATUS_FILE:-${RUNTIME_DIR}/cxl_rpc_status_${$}.txt}"
 SERVER_READY_MARKER="${CXL_RPC_SERVER_READY_MARKER:-server_ready=1}"
 SERVER_READY_TIMEOUT_SEC="${CXL_RPC_SERVER_READY_TIMEOUT_SEC:-0}"
-FIRST_COMPLETION_BARRIER_PATH="${CXL_RPC_FIRST_COMPLETION_BARRIER_PATH:-/tmp/cxl_rpc_first_completion_${$}_$RANDOM}"
-FIRST_COMPLETION_BARRIER_TIMEOUT_MS="${CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS:-0}"
 PIN_CORES="${CXL_RPC_PIN_CORES:-0}"
 SERVER_CORE="${CXL_RPC_SERVER_CORE:-0}"
 CLIENT_CORE_BASE="${CXL_RPC_CLIENT_CORE_BASE:-1}"
@@ -232,11 +256,6 @@ fi
 
 if ! [[ "$SERVER_READY_TIMEOUT_SEC" =~ ^[0-9]+$ ]]; then
     echo "ERROR: CXL_RPC_SERVER_READY_TIMEOUT_SEC must be a non-negative integer"
-    exit 2
-fi
-
-if ! [[ "$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS must be a non-negative integer"
     exit 2
 fi
 
@@ -312,11 +331,6 @@ wait_for_server_ready() {
 write_status_file() {
     {
         echo "TEST_CMD_EXIT_CODE=${overall_rc}"
-        echo "SERVER_RC=${SERVER_RC}"
-        echo "CLIENT_COUNT=${CLIENT_COUNT}"
-        for ((status_i = 0; status_i < CLIENT_COUNT; status_i++)); do
-            echo "CLIENT_${status_i}_RC=${CLIENT_RCS[$status_i]}"
-        done
     } > "$STATUS_FILE"
 }
 
@@ -340,8 +354,6 @@ write_guest_artifact() {
 export_guest_artifacts() {
     local export_rc=0
 
-    write_status_file || return 1
-    write_guest_artifact "$STATUS_FILE" "$HOST_STATUS_FILE" || export_rc=1
     write_guest_artifact "$SERVER_LOG" "$HOST_SERVER_FILE" || export_rc=1
 
     for ((export_i = 0; export_i < CLIENT_COUNT; export_i++)); do
@@ -412,22 +424,18 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
         client_cmd+=("--num-clients" "$CLIENT_COUNT" "--node-id" "$i")
     fi
 
-    wrapper_log "launch_client idx=${i} pin=${PIN_CORES} core=${client_core} log=${log} barrier=${FIRST_COMPLETION_BARRIER_PATH}"
+    wrapper_log "launch_client idx=${i} pin=${PIN_CORES} core=${client_core} log=${log}"
 
     if [ "$CLIENT_TIMEOUT_SEC" -gt 0 ]; then
         if [ "$PIN_CORES" != "0" ]; then
             if [ "$DEBUG_LIVE" != "0" ]; then
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     timeout --signal=TERM --kill-after=2 \
                     "${CLIENT_TIMEOUT_SEC}s" \
                     taskset -c "$client_core" "${client_cmd[@]}" \
                     > >(tee "$log") 2>&1 &
             else
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     timeout --signal=TERM --kill-after=2 \
                     "${CLIENT_TIMEOUT_SEC}s" \
                     taskset -c "$client_core" "${client_cmd[@]}" >"$log" 2>&1 &
@@ -435,15 +443,11 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
         else
             if [ "$DEBUG_LIVE" != "0" ]; then
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     timeout --signal=TERM --kill-after=2 \
                     "${CLIENT_TIMEOUT_SEC}s" \
                     "${client_cmd[@]}" > >(tee "$log") 2>&1 &
             else
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     timeout --signal=TERM --kill-after=2 \
                     "${CLIENT_TIMEOUT_SEC}s" \
                     "${client_cmd[@]}" >"$log" 2>&1 &
@@ -453,26 +457,18 @@ for ((i = 0; i < CLIENT_COUNT; i++)); do
         if [ "$PIN_CORES" != "0" ]; then
             if [ "$DEBUG_LIVE" != "0" ]; then
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     taskset -c "$client_core" "${client_cmd[@]}" \
                     > >(tee "$log") 2>&1 &
             else
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     taskset -c "$client_core" "${client_cmd[@]}" >"$log" 2>&1 &
             fi
         else
             if [ "$DEBUG_LIVE" != "0" ]; then
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     "${client_cmd[@]}" > >(tee "$log") 2>&1 &
             else
                 CXL_RPC_NUMA_NODE="$CLIENT_NUMA_NODE" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_PATH="$FIRST_COMPLETION_BARRIER_PATH" \
-                    CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS="$FIRST_COMPLETION_BARRIER_TIMEOUT_MS" \
                     "${client_cmd[@]}" >"$log" 2>&1 &
             fi
         fi
@@ -513,38 +509,23 @@ if ! export_guest_artifacts; then
     fi
 fi
 
+if ! write_status_file || ! write_guest_artifact "$STATUS_FILE" "$HOST_STATUS_FILE"; then
+    if [ "$overall_rc" -eq 0 ]; then
+        overall_rc=126
+    fi
+fi
+
 if [ "$overall_rc" -ne 0 ] || [ "$SERVER_RC" -ne 0 ]; then
     echo "rpc_test_failed rc=${overall_rc} server_rc=${SERVER_RC}" >&2
 fi
-rm -f "$FIRST_COMPLETION_BARRIER_PATH" 2>/dev/null || true
 exit "$overall_rc"
 UNIFIED_HELPER_SCRIPT
 sudo chmod +x "${MOUNT_POINT}${DEST_DIR}/run_rpc_server_clients.sh"
 echo "  Created: run_rpc_server_clients.sh (unified helper)"
 
-# Backward-compatible single-client entry.
-sudo tee "${MOUNT_POINT}${DEST_DIR}/run_rpc_server_client.sh" > /dev/null << 'SINGLE_WRAPPER_SCRIPT'
-#!/bin/bash
-set -u
-export CXL_RPC_CLIENT_COUNT="${CXL_RPC_CLIENT_COUNT:-1}"
-exec /home/test_code/run_rpc_server_clients.sh "$@"
-SINGLE_WRAPPER_SCRIPT
-sudo chmod +x "${MOUNT_POINT}${DEST_DIR}/run_rpc_server_client.sh"
-echo "  Created: run_rpc_server_client.sh (compat wrapper)"
-
-# Backward-compatible multi-client entry.
-sudo tee "${MOUNT_POINT}${DEST_DIR}/run_rpc_server_multi_client.sh" > /dev/null << 'MULTI_WRAPPER_SCRIPT'
-#!/bin/bash
-set -u
-export CXL_RPC_CLIENT_COUNT="${CXL_RPC_CLIENT_COUNT:-4}"
-exec /home/test_code/run_rpc_server_clients.sh "$@"
-MULTI_WRAPPER_SCRIPT
-sudo chmod +x "${MOUNT_POINT}${DEST_DIR}/run_rpc_server_multi_client.sh"
-echo "  Created: run_rpc_server_multi_client.sh (compat wrapper)"
-
 # Install m5 binary and gem5 one-shot readfile bootstrap service
 echo ""
-echo "[4/5] Installing m5 binary and gem5 readfile bootstrap..."
+echo "[4/4] Installing m5 binary and gem5 readfile bootstrap..."
 
 # Install m5 binary
 if [ -f "$M5_BIN" ]; then

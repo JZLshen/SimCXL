@@ -152,16 +152,17 @@ cxl_lib_errorf(const char *fmt, ...)
     va_end(ap);
 }
 
-/* MQ policy is fixed: keep prefetch + invalidate policies always on. */
-#define CXL_MQ_PREFETCH_LINES 16u
-#define CXL_MQ_INVALIDATE_CONSUMED 1
-#define CXL_MQ_INVALIDATE_PREFETCHED 1
+/* MQ notify prefetch policy is one bundled on/off choice. */
+#define CXL_MQ_NOTIFY_PREFETCH_LINES 16u
+#define CXL_MQ_NOTIFY_INVALIDATE_CONSUMED 1
+#define CXL_MQ_NOTIFY_INVALIDATE_PREFETCHED 1
 #define CXL_MQ_ENTRIES_PER_LINE (64u / CXL_METADATA_ENTRY_SIZE)
 #define CXL_BOOTSTRAP_LEN_MAGIC 0xFFFF0000u
 #define CXL_BOOTSTRAP_OP_REGISTER_DOORBELL 0x0001u
 #define CXL_BOOTSTRAP_OP_REGISTER_DOORBELL_PAGE_BASE 0x0200u
 #define CXL_BOOTSTRAP_OP_REGISTER_METADATA_PAGE_BASE 0x0100u
-#define CXL_RESPONSE_DMA_THRESHOLD 4096u
+#define CXL_RESPONSE_DMA_PAYLOAD_THRESHOLD \
+    CXL_RESPONSE_DMA_PAYLOAD_THRESHOLD_DEFAULT
 
 static inline size_t
 cxl_response_publish_bytes(size_t payload_len)
@@ -177,9 +178,15 @@ cxl_response_entry_size(size_t payload_len)
 }
 
 static inline int
-cxl_response_publish_uses_dma(size_t publish_bytes)
+cxl_response_publish_uses_dma(const cxl_connection_t *conn,
+                              size_t payload_len)
 {
-    if (publish_bytes > (size_t)CXL_RESPONSE_DMA_THRESHOLD)
+    size_t threshold =
+        (conn && conn->response_dma_payload_threshold > 0) ?
+        conn->response_dma_payload_threshold :
+        (size_t)CXL_RESPONSE_DMA_PAYLOAD_THRESHOLD;
+
+    if (payload_len >= threshold)
         return 1;
 #if defined(CXL_RPC_TEST_FORCE_COPYENGINE)
     if (cxl_test_force_response_dma_enabled())
@@ -225,8 +232,7 @@ cxl_invalidate_load_barrier(void)
      * Read-side invalidate paths must not let the subsequent load observe a
      * stale cacheline before the invalidate has completed. clflushopt becomes
      * globally visible only after an sfence-class ordering point, and the
-     * response RX path immediately issues demand loads/prefetches on those
-     * same lines.
+     * response RX path immediately issues demand loads on those same lines.
      */
     __asm__ __volatile__("sfence" ::: "memory");
 }
@@ -772,7 +778,8 @@ cxl_prepare_future_payloads_same_line(cxl_connection_t *conn,
     uint32_t current_slot = 0;
     uint32_t start_slot = 0;
 
-    if (!conn || !conn->metadata_queue) {
+    if (!conn || !conn->metadata_queue ||
+        !conn->request_data_prefetch_enabled) {
         return;
     }
 
@@ -1315,6 +1322,68 @@ const cxl_connection_addrs_t *cxl_connection_get_addrs(
     return conn ? &conn->addrs : NULL;
 }
 
+int cxl_connection_set_response_dma_threshold(cxl_connection_t *conn,
+                                              size_t threshold)
+{
+    if (!cxl_connection_require_cap(conn, CXL_CONN_CAP_RESPONSE_TX,
+                                    "cxl_connection_set_response_dma_threshold")) {
+        return -1;
+    }
+
+    conn->response_dma_payload_threshold =
+        (threshold > 0) ? threshold :
+        (size_t)CXL_RESPONSE_DMA_PAYLOAD_THRESHOLD;
+    return 0;
+}
+
+int cxl_connection_set_head_sync_threshold(cxl_connection_t *conn,
+                                           uint32_t threshold)
+{
+    if (!cxl_connection_require_cap(conn, CXL_CONN_CAP_HEAD_SYNC,
+                                    "cxl_connection_set_head_sync_threshold")) {
+        return -1;
+    }
+    if (!conn->sync)
+        return -1;
+
+    cxl_sync_set_threshold(conn->sync, threshold);
+    return 0;
+}
+
+int cxl_connection_set_request_rx_prefetch_mode(
+    cxl_connection_t *conn,
+    cxl_request_rx_prefetch_mode_t mode)
+{
+    if (!cxl_connection_require_cap(conn, CXL_CONN_CAP_REQUEST_RX,
+                                    "cxl_connection_set_request_rx_prefetch_mode")) {
+        return -1;
+    }
+
+    switch (mode) {
+    case CXL_REQUEST_RX_PREFETCH_FULL:
+        conn->request_data_prefetch_enabled = 1;
+        conn->notify_prefetch_enabled = 1;
+        break;
+    case CXL_REQUEST_RX_PREFETCH_NO_REQUEST:
+        conn->request_data_prefetch_enabled = 0;
+        conn->notify_prefetch_enabled = 1;
+        break;
+    case CXL_REQUEST_RX_PREFETCH_NONE:
+        conn->request_data_prefetch_enabled = 0;
+        conn->notify_prefetch_enabled = 0;
+        break;
+    default:
+        return -1;
+    }
+
+    conn->mq_prefetch_start_line = 0;
+    conn->mq_prefetch_nr_lines = 0;
+    conn->mq_prefetch_window_valid = 0;
+    conn->mq_payload_prepared_mask = 0;
+    conn->mq_payload_next_probe_slot = 1;
+    return 0;
+}
+
 static int
 cxl_prepare_response_tx_copyengine_pages_if_bound(cxl_connection_t *conn)
 {
@@ -1484,8 +1553,6 @@ cxl_prepare_response_payload_lines(volatile uint8_t *resp,
             : "memory");
     }
     cxl_invalidate_load_barrier();
-    cxl_prefetch_range_ro((const volatile uint8_t *)(entry_line_start + 64u),
-                          entry_size - 64u);
 }
 
 static int
@@ -1843,17 +1910,26 @@ int cxl_consume_next_response(cxl_connection_t *conn,
  * Server API
  * ================================================================ */
 
-int cxl_poll_request_timed(cxl_connection_t *conn,
-                           uint16_t *node_id,
-                           uint16_t *rpc_id,
-                           const void **out_data_view,
-                           size_t *out_len,
-                           cxl_request_poll_timing_t *out_timing)
+static int
+cxl_poll_request_internal(cxl_connection_t *conn,
+                          uint16_t *node_id,
+                          uint16_t *rpc_id,
+                          const void **out_data_view,
+                          size_t *out_len,
+                          cxl_request_poll_timing_t *out_timing,
+                          int enable_timing)
 {
     int ret = -1;
-    const int mq_invalidate_consumed = CXL_MQ_INVALIDATE_CONSUMED;
-    const int mq_invalidate_prefetched = CXL_MQ_INVALIDATE_PREFETCHED;
-    const uint32_t mq_prefetch_lines = CXL_MQ_PREFETCH_LINES;
+    const int request_data_prefetch_enabled =
+        (conn && conn->request_data_prefetch_enabled) ? 1 : 0;
+    const int notify_prefetch_enabled =
+        (conn && conn->notify_prefetch_enabled) ? 1 : 0;
+    const int mq_invalidate_consumed =
+        notify_prefetch_enabled ? CXL_MQ_NOTIFY_INVALIDATE_CONSUMED : 0;
+    const int mq_invalidate_prefetched =
+        notify_prefetch_enabled ? CXL_MQ_NOTIFY_INVALIDATE_PREFETCHED : 0;
+    const uint32_t mq_prefetch_lines =
+        notify_prefetch_enabled ? CXL_MQ_NOTIFY_PREFETCH_LINES : 0u;
     const uint32_t mq_total_lines = conn ? conn->mq_total_lines : 0;
     uint64_t notify_ready_tick = 0;
     uint64_t req_data_ready_tick = 0;
@@ -1995,14 +2071,16 @@ int cxl_poll_request_timed(cxl_connection_t *conn,
         goto out;
     }
 
-    notify_ready_tick = cxl_trace_tick();
+    if (enable_timing)
+        notify_ready_tick = cxl_trace_tick();
 
     if (mq_inline) {
         /* Inline: payload view is in bytes 8-15. */
         size_t msg_len = mq_len <= 8 ? (size_t)mq_len : 8;
         *out_data_view = (const void *)(entry + 8);
         *out_len = msg_len;
-        req_data_ready_tick = notify_ready_tick;
+        if (enable_timing)
+            req_data_ready_tick = notify_ready_tick;
     } else {
         /* Non-inline: bytes 8-15 contain an absolute logical payload address. */
         uint64_t data_addr = meta_hi;
@@ -2018,14 +2096,20 @@ int cxl_poll_request_timed(cxl_connection_t *conn,
 
         volatile uint8_t *data_ptr =
             cxl_request_payload_ptr_trusted(conn, data_addr);
-        if ((conn->mq_payload_prepared_mask & prepared_bit) == 0)
-            cxl_prepare_payload_for_direct_read(data_ptr, msg_len);
+        if ((conn->mq_payload_prepared_mask & prepared_bit) == 0) {
+            cxl_invalidate_range_for_load(data_ptr, msg_len);
+            if (request_data_prefetch_enabled)
+                cxl_prefetch_range_ro(data_ptr, msg_len);
+        }
         *out_data_view = (const void *)data_ptr;
         *out_len = msg_len;
-        req_data_ready_tick =
-            ((conn->mq_payload_prepared_mask & prepared_bit) != 0) ?
-            notify_ready_tick :
-            cxl_trace_tick();
+        if (enable_timing) {
+            req_data_ready_tick =
+                (request_data_prefetch_enabled &&
+                 ((conn->mq_payload_prepared_mask & prepared_bit) != 0)) ?
+                notify_ready_tick :
+                cxl_trace_tick();
+        }
     }
 
     cxl_prepare_future_payloads_same_line(conn, head_idx, head_line_idx,
@@ -2035,9 +2119,10 @@ int cxl_poll_request_timed(cxl_connection_t *conn,
     cxl_advance_mq_head_with_policy(conn, head_idx, head_line_idx,
                                     mq_invalidate_consumed);
     cxl_mq_payload_prepare_after_advance(conn, head_idx);
-    poll_done_tick = cxl_trace_tick();
+    if (enable_timing)
+        poll_done_tick = cxl_trace_tick();
 
-    if (out_timing) {
+    if (out_timing && enable_timing) {
         out_timing->notify_ready_tick = notify_ready_tick;
         out_timing->req_data_ready_tick = req_data_ready_tick;
         out_timing->poll_done_tick = poll_done_tick;
@@ -2048,18 +2133,35 @@ out:
     return ret;
 }
 
+int cxl_poll_request_timed(cxl_connection_t *conn,
+                           uint16_t *node_id,
+                           uint16_t *rpc_id,
+                           const void **out_data_view,
+                           size_t *out_len,
+                           cxl_request_poll_timing_t *out_timing)
+{
+    return cxl_poll_request_internal(conn,
+                                     node_id,
+                                     rpc_id,
+                                     out_data_view,
+                                     out_len,
+                                     out_timing,
+                                     1);
+}
+
 int cxl_poll_request(cxl_connection_t *conn,
                      uint16_t *node_id,
                      uint16_t *rpc_id,
                      const void **out_data_view,
                      size_t *out_len)
 {
-    return cxl_poll_request_timed(conn,
-                                  node_id,
-                                  rpc_id,
-                                  out_data_view,
-                                  out_len,
-                                  NULL);
+    return cxl_poll_request_internal(conn,
+                                     node_id,
+                                     rpc_id,
+                                     out_data_view,
+                                     out_len,
+                                     NULL,
+                                     0);
 }
 
 /* ================================================================
@@ -2325,7 +2427,6 @@ int cxl_send_response(cxl_connection_t *conn,
     int publish_via_dma = 0;
     int response_via_dma = 0;
     size_t entry_size = 0;
-    size_t publish_bytes = 0;
     size_t offset = 0;
     size_t gap_offset = 0;
     size_t gap_size = 0;
@@ -2349,8 +2450,7 @@ int cxl_send_response(cxl_connection_t *conn,
                    conn->ce_lane_bind_valid,
                    conn->ce_lane_assigned,
                    (unsigned long long)conn->peer_resp_write_cursor);
-    publish_bytes = cxl_response_publish_bytes(len);
-    response_via_dma = cxl_response_publish_uses_dma(publish_bytes);
+    response_via_dma = cxl_response_publish_uses_dma(conn, len);
 
     if (!response_via_dma) {
         publish_via_dma = cxl_response_publish_needs_dma_serialize(conn);

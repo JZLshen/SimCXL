@@ -50,7 +50,7 @@ parser.add_argument(
     "--test_cmd",
     type=str,
     default=(
-        "/home/test_code/run_rpc_server_client.sh "
+        "/home/test_code/run_rpc_server_clients.sh "
         "/home/test_code/rpc_server_example /home/test_code/rpc_client_example "
         "--requests 50 --max-polls 2000000 --silent"
     ),
@@ -73,6 +73,24 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--rpc_response_lane_count",
+    type=int,
+    default=0,
+    help=(
+        "Number of response DMA lanes that must be provisioned in hardware. "
+        "0 defaults to one lane per RPC client."
+    ),
+)
+parser.add_argument(
+    "--rpc_metadata_entries",
+    type=int,
+    default=1024,
+    help=(
+        "Logical metadata queue depth exposed to the RPC engine. "
+        "Must be within the public layout capacity (1024)."
+    ),
+)
+parser.add_argument(
     "--copy_engine_channels",
     type=int,
     default=0,
@@ -86,6 +104,12 @@ parser.add_argument(
     type=str,
     default="4KiB",
     help="Per-CopyEngine maximum transfer size advertised through XFERCAP.",
+)
+parser.add_argument(
+    "--cxl_extra_latency_ns",
+    type=int,
+    default=0,
+    help="Additional CXL media latency in nanoseconds on top of the board baseline.",
 )
 parser.add_argument(
     "--cpu_type",
@@ -123,17 +147,24 @@ args = parser.parse_args()
 
 if args.rpc_client_count < 0:
     parser.error("--rpc_client_count must be >= 0")
+if args.rpc_response_lane_count < 0:
+    parser.error("--rpc_response_lane_count must be >= 0")
+if args.rpc_metadata_entries < 1 or args.rpc_metadata_entries > 1024:
+    parser.error("--rpc_metadata_entries must be in [1, 1024]")
+if args.cxl_extra_latency_ns < 0:
+    parser.error("--cxl_extra_latency_ns must be >= 0")
 
 KVM_UNSUPPORTED_M5_RPNS_BINS = {
     "rpc_client_example",
+    "rpc_mica_client",
+    "rpc_mica_server",
     "cxl_mem_copy_cmp",
     "cpu_memmove_bw",
 }
 
 
 def _validate_test_mode(test_cmd: str) -> None:
-    if ("run_rpc_server_client.sh" in test_cmd or
-            "run_rpc_server_multi_client.sh" in test_cmd):
+    if "run_rpc_server_clients.sh" in test_cmd:
         return
 
     client_only_bins = (
@@ -143,7 +174,7 @@ def _validate_test_mode(test_cmd: str) -> None:
 
     if any(bin_name in test_cmd for bin_name in client_only_bins):
         print("ERROR: CPU-to-CPU mode requires a server-client command.")
-        print("  Recommended: run_rpc_server_client.sh <server> <client> [args]")
+        print("  Recommended: run_rpc_server_clients.sh <server> <client> [args]")
         print(f"  Current test_cmd: {test_cmd}")
         raise SystemExit(2)
 
@@ -206,9 +237,6 @@ def _infer_rpc_num_clients(test_cmd: str) -> int:
             value = _parse_positive_int(tokens[idx + 1])
             if value is not None:
                 return value
-
-    if any(token.endswith("run_rpc_server_multi_client.sh") for token in tokens):
-        return 4
 
     return 1
 
@@ -332,6 +360,11 @@ requested_rpc_clients = (
     if args.rpc_client_count > 0
     else _infer_rpc_num_clients(args.test_cmd)
 )
+requested_rpc_lanes = (
+    args.rpc_response_lane_count
+    if args.rpc_response_lane_count > 0
+    else requested_rpc_clients
+)
 
 if checkpoint_topology is not None:
     num_copy_engines, copy_engine_channels = checkpoint_topology
@@ -343,18 +376,18 @@ if checkpoint_topology is not None:
             f"topology: requested {args.copy_engine_channels}, "
             f"checkpoint has {copy_engine_channels}"
         )
-    if requested_rpc_clients > available_lanes:
+    if requested_rpc_lanes > available_lanes:
         parser.error(
-            "checkpoint CopyEngine topology is smaller than rpc_client_count: "
-            f"{requested_rpc_clients} client(s) need at least "
-            f"{requested_rpc_clients} lane(s), checkpoint has "
+            "checkpoint CopyEngine topology is smaller than the requested "
+            "response-lane count: "
+            f"need {requested_rpc_lanes} lane(s), checkpoint has "
             f"{available_lanes} lane(s) "
             f"({num_copy_engines} engine(s) x {copy_engine_channels} "
             "channel(s))"
         )
 else:
     num_copy_engines, copy_engine_channels = _derive_copyengine_topology(
-        requested_rpc_clients,
+        requested_rpc_lanes,
         args.copy_engine_channels,
     )
 
@@ -382,6 +415,8 @@ board = X86Board(
     num_copy_engines=num_copy_engines,
     copy_engine_channels=copy_engine_channels,
     copy_engine_xfercap=args.copy_engine_xfercap,
+    rpc_metadata_entries=args.rpc_metadata_entries,
+    cxl_extra_latency_ns=args.cxl_extra_latency_ns,
 )
 
 pre_switch_settle_sec = max(0, args.pre_switch_settle_sec)

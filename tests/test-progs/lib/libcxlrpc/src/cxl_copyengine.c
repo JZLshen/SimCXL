@@ -13,6 +13,7 @@
 
 /* CopyEngine (IOAT-like) MMIO register constants. */
 #define CXL_CE_GEN_CHANCOUNT  0x00u
+#define CXL_CE_GEN_XFERCAP    0x01u
 #define CXL_CE_CHAN_BASE      0x80u
 #define CXL_CE_CHAN_STRIDE    0x80u
 #define CXL_CE_CHAN_STATUS    0x04u
@@ -43,6 +44,7 @@
  */
 #define CXL_CE_FLAG_SRC_BYTES   64u
 #define CXL_CE_FIXED_DRAIN_SPINS (1u << 22)
+#define CXL_CE_EAGER_RESP_PREP_PAGES 120u
 /* Smallest BAR window covering MMIO offsets we actually access. */
 #define CXL_CE_MMIO_REQUIRED_BYTES \
     (CXL_CE_CHAN_BASE + CXL_CE_CHAN_COMMAND + sizeof(uint8_t))
@@ -83,6 +85,7 @@ typedef struct cxl_ce_engine_state {
     void *bar_map_base;
     size_t bar_map_len;
     uint32_t chan_count;
+    size_t xfer_cap_bytes;
     char resource0_path[PATH_MAX];
 } cxl_ce_engine_state_t;
 
@@ -107,7 +110,7 @@ typedef struct cxl_ce_submission_state {
 
 typedef struct cxl_ce_channel_state {
     cxl_ce_engine_state_t *engine;
-    cxl_connection_t *owner_conn;
+    size_t bound_conn_count;
     size_t engine_index;
     size_t channel_index;
     uint32_t chan_id;
@@ -131,6 +134,38 @@ cxl_copyengine_error_log_permitted(void)
 
     g_cxl_ce.warned = 1;
     return 1;
+}
+
+static int
+cxl_copyengine_debug_enabled(void)
+{
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        const char *env = getenv("CXL_RPC_DEBUG_COPYENGINE");
+        enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static void
+cxl_copyengine_debug_dump_bytes(const char *label,
+                                const uint8_t *ptr,
+                                size_t bytes)
+{
+    if (!label)
+        label = "bytes";
+
+    fprintf(stderr, "[libcxlrpc][CE] %s=", label);
+    if (!ptr || bytes == 0) {
+        fputc('\n', stderr);
+        return;
+    }
+
+    for (size_t i = 0; i < bytes; ++i)
+        fprintf(stderr, "%02x", (unsigned)ptr[i]);
+    fputc('\n', stderr);
 }
 
 static int
@@ -171,7 +206,24 @@ cxl_ce_mmio_read64(volatile uint8_t *bar0, uint32_t off)
     return *(volatile uint64_t *)(bar0 + off);
 }
 
-static int cxl_copyengine_wait_idle(cxl_connection_t *conn);
+static inline void
+cxl_copyengine_flush_cpu_range(volatile uint8_t *ptr, size_t size)
+{
+    if (!ptr || size == 0)
+        return;
+
+    uintptr_t line_start = ((uintptr_t)ptr) & ~((uintptr_t)63);
+    uintptr_t line_end = (((uintptr_t)ptr + size) + 63u) & ~((uintptr_t)63);
+    for (uintptr_t line = line_start; line < line_end; line += 64u) {
+        __asm__ __volatile__(
+            "clflushopt (%0)"
+            :
+            : "r"((void *)line)
+            : "memory");
+    }
+    __asm__ __volatile__("sfence" ::: "memory");
+}
+
 static int cxl_copyengine_channel_wait_idle(cxl_connection_t *conn,
                                             cxl_ce_channel_state_t *chan);
 
@@ -183,10 +235,7 @@ cxl_copyengine_get_assigned_channel(const cxl_connection_t *conn)
     if (conn->ce_channel_index >= g_cxl_ce.channel_count)
         return NULL;
 
-    cxl_ce_channel_state_t *chan = &g_cxl_ce.channels[conn->ce_channel_index];
-    if (chan->owner_conn != conn)
-        return NULL;
-    return chan;
+    return &g_cxl_ce.channels[conn->ce_channel_index];
 }
 
 int
@@ -338,6 +387,16 @@ cxl_copyengine_clear_conn_state(cxl_connection_t *conn)
     conn->ce_channel_index = 0;
     conn->ce_hw_channel_id = 0;
     cxl_copyengine_clear_peer_phys_cache(conn);
+}
+
+static int
+cxl_copyengine_conn_matches_channel(const cxl_connection_t *conn,
+                                    const cxl_ce_channel_state_t *chan)
+{
+    if (!conn || !chan || !conn->ce_lane_assigned)
+        return 0;
+
+    return conn->ce_channel_index == chan->channel_index;
 }
 
 static void
@@ -714,17 +773,27 @@ cxl_resolve_virt_page_phys(uintptr_t page_virt,
     if (!page_phys_out || page_size == 0)
         return -1;
 
-    volatile uint8_t page_touch =
-        *(const volatile uint8_t *)(uintptr_t)page_virt;
-    (void)page_touch;
     if (lock_page)
         (void)mlock((const void *)page_virt, page_size);
+
+    if (lock_page) {
+        volatile uint8_t page_touch =
+            *(const volatile uint8_t *)(uintptr_t)page_virt;
+        (void)page_touch;
+
+        /*
+         * First-touch instantiates the shared backing page so pagemap returns a
+         * stable PFN for the DMA target. This CXL path is not DMA-coherent, so
+         * immediately evict the instantiated page from CPU caches before the
+         * hardware publish can target it.
+         */
+        cxl_copyengine_flush_cpu_range((volatile uint8_t *)page_virt,
+                                       page_size);
+    }
 
     uint64_t phys = 0;
     if (cxl_virt_to_phys((const void *)page_virt, &phys) != 0)
         return -1;
-
-    /* PFN resolution only; coherent CopyEngine publish does not need a page flush. */
     *page_phys_out = phys & ~((uint64_t)page_size - 1u);
     return 0;
 }
@@ -759,11 +828,52 @@ cxl_copyengine_get_peer_response_page_phys(cxl_connection_t *conn,
     return 0;
 }
 
+static int
+cxl_copyengine_eager_prepare_peer_response_pages(uintptr_t virt_page_base,
+                                                 size_t page_size,
+                                                 size_t page_count,
+                                                 uint64_t *page_phys,
+                                                 size_t *prepared_pages_out)
+{
+    size_t prepared_pages = 0;
+
+    if (!page_phys || page_size == 0) {
+        return -1;
+    }
+
+    prepared_pages = page_count;
+    if (prepared_pages > (size_t)CXL_CE_EAGER_RESP_PREP_PAGES)
+        prepared_pages = (size_t)CXL_CE_EAGER_RESP_PREP_PAGES;
+
+    for (size_t i = 0; i < prepared_pages; ++i) {
+        const uintptr_t page_virt = virt_page_base + i * (uintptr_t)page_size;
+
+        if (cxl_resolve_virt_page_phys(page_virt, page_size, 1,
+                                       &page_phys[i]) != 0) {
+            return -1;
+        }
+    }
+
+    if (prepared_pages_out)
+        *prepared_pages_out = prepared_pages;
+    return 0;
+}
+
 int
 cxl_copyengine_update_peer_response_mapping(cxl_connection_t *conn)
 {
+    size_t eager_page_count = 0;
+
     if (!conn || !conn->peer_response_data || conn->peer_response_data_size == 0)
         return -1;
+
+    if (cxl_copyengine_debug_enabled()) {
+        fprintf(stderr,
+                "[libcxlrpc][CE] update_peer_response_mapping begin response_data=%p size=%zu logical_addr=%#llx\n",
+                (const void *)conn->peer_response_data,
+                conn->peer_response_data_size,
+                (unsigned long long)conn->peer_response_data_addr);
+    }
 
     uint64_t *page_phys = NULL;
     uintptr_t virt_page_base = 0;
@@ -776,6 +886,20 @@ cxl_copyengine_update_peer_response_mapping(cxl_connection_t *conn)
         return -1;
     }
 
+    /*
+     * Current RPC experiments consume only a bounded prefix of each peer
+     * response window. Resolve that prefix up front so response DMA does not
+     * pay per-page mlock/touch/flush/pagemap work on the measured path.
+     */
+    if (cxl_copyengine_eager_prepare_peer_response_pages(virt_page_base,
+                                                         page_size,
+                                                         page_count,
+                                                         page_phys,
+                                                         &eager_page_count) != 0) {
+        free(page_phys);
+        return -1;
+    }
+
     free(conn->ce_peer_resp_page_phys);
     conn->ce_peer_resp_page_phys = page_phys;
     conn->ce_peer_resp_logical_page_base =
@@ -784,6 +908,15 @@ cxl_copyengine_update_peer_response_mapping(cxl_connection_t *conn)
     conn->ce_peer_resp_page_size = page_size;
     conn->ce_peer_resp_page_count = page_count;
     conn->ce_peer_resp_virt_page_base = virt_page_base;
+    if (cxl_copyengine_debug_enabled()) {
+        fprintf(stderr,
+                "[libcxlrpc][CE] update_peer_response_mapping ready page_base=%#llx virt_page_base=%#llx page_size=%zu page_count=%zu eager_pages=%zu\n",
+                (unsigned long long)conn->ce_peer_resp_logical_page_base,
+                (unsigned long long)conn->ce_peer_resp_virt_page_base,
+                conn->ce_peer_resp_page_size,
+                conn->ce_peer_resp_page_count,
+                eager_page_count);
+    }
     return 0;
 }
 
@@ -799,6 +932,13 @@ cxl_copyengine_update_peer_flag_mapping(cxl_connection_t *conn)
     if (!conn->peer_flag)
         return 0;
 
+    if (cxl_copyengine_debug_enabled()) {
+        fprintf(stderr,
+                "[libcxlrpc][CE] update_peer_flag_mapping begin peer_flag=%p logical_addr=%#llx\n",
+                (const void *)conn->peer_flag,
+                (unsigned long long)conn->peer_flag_addr);
+    }
+
     long ps = sysconf(_SC_PAGESIZE);
     if (ps > 0) {
         const uintptr_t page_mask = ~((uintptr_t)ps - 1u);
@@ -812,6 +952,11 @@ cxl_copyengine_update_peer_flag_mapping(cxl_connection_t *conn)
 
     conn->ce_peer_flag_phys = flag_phys;
     conn->ce_peer_flag_phys_valid = 1;
+    if (cxl_copyengine_debug_enabled()) {
+        fprintf(stderr,
+                "[libcxlrpc][CE] update_peer_flag_mapping ready flag_phys=%#llx\n",
+                (unsigned long long)conn->ce_peer_flag_phys);
+    }
     return 0;
 }
 
@@ -821,6 +966,7 @@ cxl_copyengine_channel_init(cxl_ce_channel_state_t *chan)
     if (!chan)
         return -1;
 
+    chan->bound_conn_count = 0;
     chan->poisoned = 0;
     chan->chain_started = 0;
     chan->submit_head = NULL;
@@ -845,6 +991,8 @@ cxl_connection_init_runtime_defaults(cxl_connection_t *conn)
     conn->mq_prefetch_window_valid = 0;
     conn->mq_payload_prepared_mask = 0;
     conn->mq_payload_next_probe_slot = 1;
+    conn->request_data_prefetch_enabled = 1;
+    conn->notify_prefetch_enabled = 1;
     conn->resp_read_cursor = 0;
     conn->resp_known_producer_cursor = 0;
     conn->resp_peek_cursor = 0;
@@ -853,6 +1001,8 @@ cxl_connection_init_runtime_defaults(cxl_connection_t *conn)
     conn->resp_peek_valid = 0;
     conn->resp_peek_payload_loaded = 0;
     conn->req_write_offset = 0;
+    conn->response_dma_payload_threshold =
+        (size_t)CXL_RESPONSE_DMA_PAYLOAD_THRESHOLD_DEFAULT;
     conn->ce_lane_bind_valid = 0;
     conn->ce_bind_lane_index_valid = 0;
     conn->ce_bind_engine_index = 0;
@@ -867,27 +1017,62 @@ cxl_copyengine_disable(cxl_connection_t *conn)
 {
     cxl_ce_channel_state_t *chan = NULL;
     int wait_rc = 0;
+    int last_bound_conn = 0;
 
     if (!conn)
         return;
 
-    wait_rc = cxl_copyengine_wait_idle(conn);
-
     chan = cxl_copyengine_get_assigned_channel(conn);
     if (chan) {
-        if (wait_rc != 0)
-            chan->poisoned = 1;
-        chan->owner_conn = NULL;
-        if (g_cxl_ce.attached_conns > 0)
-            g_cxl_ce.attached_conns--;
+        if (cxl_copyengine_conn_matches_channel(conn, chan) &&
+            chan->bound_conn_count > 0) {
+            chan->bound_conn_count--;
+            if (g_cxl_ce.attached_conns > 0)
+                g_cxl_ce.attached_conns--;
+        }
+        last_bound_conn = (chan->bound_conn_count == 0);
+        if (last_bound_conn) {
+            wait_rc = cxl_copyengine_channel_wait_idle(conn, chan);
+            if (wait_rc != 0)
+                chan->poisoned = 1;
+        }
     }
     cxl_copyengine_clear_conn_state(conn);
 
     if (wait_rc != 0)
         return;
 
+    if (chan && last_bound_conn) {
+        /*
+         * Leave channel submission/free pools intact while the global
+         * CopyEngine state remains live. They are released by the final global
+         * reset after the last bound connection detaches.
+         */
+    }
+
     if (g_cxl_ce.attached_conns == 0)
         cxl_copyengine_global_reset();
+}
+
+static int
+cxl_copyengine_attach_channel(cxl_connection_t *conn,
+                              cxl_ce_channel_state_t *chan)
+{
+    if (!conn || !chan)
+        return -1;
+
+    if (conn->ce_lane_assigned) {
+        if (!cxl_copyengine_conn_matches_channel(conn, chan))
+            return -1;
+    } else {
+        chan->bound_conn_count++;
+        g_cxl_ce.attached_conns++;
+    }
+    conn->ce_lane_assigned = 1;
+    conn->ce_engine_index = chan->engine_index;
+    conn->ce_channel_index = chan->channel_index;
+    conn->ce_hw_channel_id = chan->chan_id;
+    return 0;
 }
 
 static int
@@ -917,11 +1102,32 @@ cxl_copyengine_init(cxl_connection_t *conn)
 
     g_cxl_ce.init_attempted = 1;
 
+    if (cxl_copyengine_debug_enabled()) {
+        fprintf(stderr,
+                "[libcxlrpc][CE] init begin lane_bind_valid=%d lane_index_valid=%d bind_engine=%zu bind_channel=%u bind_lane=%zu\n",
+                conn->ce_lane_bind_valid,
+                conn->ce_bind_lane_index_valid,
+                conn->ce_bind_engine_index,
+                (unsigned)conn->ce_bind_channel_id,
+                conn->ce_bind_lane_index);
+    }
+
     if (cxl_find_copyengine_resource0_paths(&resource_paths,
                                             &resource_count) != 0) {
         fail_stage = "find_copyengine_resource0_paths";
         fail_errno = errno;
         goto fail;
+    }
+
+    if (cxl_copyengine_debug_enabled()) {
+        fprintf(stderr,
+                "[libcxlrpc][CE] init discovered_resources count=%zu\n",
+                resource_count);
+        for (size_t i = 0; i < resource_count; ++i) {
+            fprintf(stderr,
+                    "[libcxlrpc][CE] init resource[%zu]=%s\n",
+                    i, resource_paths[i]);
+        }
     }
 
     long page_size_l = sysconf(_SC_PAGESIZE);
@@ -948,7 +1154,14 @@ cxl_copyengine_init(cxl_connection_t *conn)
         struct stat st;
         size_t resource_len = 0;
         uint32_t chan_count = 0;
+        uint8_t xfer_cap_log2 = 0;
         resource = resource_paths[i];
+
+        if (cxl_copyengine_debug_enabled()) {
+            fprintf(stderr,
+                    "[libcxlrpc][CE] init resource_begin index=%zu path=%s\n",
+                    i, resource);
+        }
 
         engine->bar_fd = -1;
         if ((size_t)snprintf(engine->resource0_path, sizeof(engine->resource0_path),
@@ -968,6 +1181,12 @@ cxl_copyengine_init(cxl_connection_t *conn)
             fail_stage = "read_resource0_page_off";
             fail_errno = errno;
             goto fail;
+        }
+
+        if (cxl_copyengine_debug_enabled()) {
+            fprintf(stderr,
+                    "[libcxlrpc][CE] init resource_page_off path=%s page_off=%zu\n",
+                    resource, bar_page_off);
         }
 
         engine->bar_fd = open(resource, O_RDWR | O_SYNC | O_CLOEXEC);
@@ -1006,8 +1225,23 @@ cxl_copyengine_init(cxl_connection_t *conn)
         engine->bar_map_len = map_len;
         chan_count = (uint32_t)cxl_ce_mmio_read8(engine->bar0,
                                                  CXL_CE_GEN_CHANCOUNT);
+        xfer_cap_log2 = cxl_ce_mmio_read8(engine->bar0, CXL_CE_GEN_XFERCAP);
+
+        if (cxl_copyengine_debug_enabled()) {
+            fprintf(stderr,
+                    "[libcxlrpc][CE] init resource_mmio_ready path=%s map_len=%zu chan_count=%u xfer_cap_log2=%u\n",
+                    resource,
+                    map_len,
+                    chan_count,
+                    (unsigned)xfer_cap_log2);
+        }
         if (chan_count == 0) {
             fail_stage = "read_channel_count";
+            fail_errno = EINVAL;
+            goto fail;
+        }
+        if (xfer_cap_log2 >= 63u) {
+            fail_stage = "read_xfer_cap";
             fail_errno = EINVAL;
             goto fail;
         }
@@ -1026,6 +1260,7 @@ cxl_copyengine_init(cxl_connection_t *conn)
             chan_count = (uint32_t)max_channels;
 
         engine->chan_count = chan_count;
+        engine->xfer_cap_bytes = (size_t)(1ULL << xfer_cap_log2);
         total_channels += chan_count;
     }
 
@@ -1050,7 +1285,6 @@ cxl_copyengine_init(cxl_connection_t *conn)
         for (uint32_t chan_id = 0; chan_id < engine->chan_count; chan_id++) {
             cxl_ce_channel_state_t *chan = &g_cxl_ce.channels[channel_index];
             chan->engine = engine;
-            chan->owner_conn = NULL;
             chan->engine_index = i;
             chan->channel_index = channel_index;
             chan->chan_id = chan_id;
@@ -1067,6 +1301,12 @@ cxl_copyengine_init(cxl_connection_t *conn)
 
     g_cxl_ce.ready = 1;
     g_cxl_ce.attached_conns = 0;
+    if (cxl_copyengine_debug_enabled()) {
+        fprintf(stderr,
+                "[libcxlrpc][CE] init ready engines=%zu channels=%zu\n",
+                g_cxl_ce.engine_count,
+                g_cxl_ce.channel_count);
+    }
     cxl_free_copyengine_paths(resource_paths, resource_count);
     return 1;
 
@@ -1147,27 +1387,7 @@ cxl_copyengine_prepare(cxl_connection_t *conn)
             return -1;
         }
 
-        if (chan->owner_conn && chan->owner_conn != conn) {
-            if (cxl_copyengine_error_log_permitted()) {
-                fprintf(stderr,
-                        "cxl_rpc: ERROR: requested CopyEngine lane index already in use"
-                        " lane=%zu engine=%zu channel=%u\n",
-                        conn->ce_bind_lane_index,
-                        chan->engine_index,
-                        chan->chan_id);
-            }
-            return -1;
-        }
-
-        if (!chan->owner_conn) {
-            chan->owner_conn = conn;
-            g_cxl_ce.attached_conns++;
-        }
-        conn->ce_lane_assigned = 1;
-        conn->ce_engine_index = chan->engine_index;
-        conn->ce_channel_index = chan->channel_index;
-        conn->ce_hw_channel_id = chan->chan_id;
-        return 0;
+        return cxl_copyengine_attach_channel(conn, chan);
     }
 
     for (size_t i = 0; i < g_cxl_ce.channel_count; i++) {
@@ -1187,26 +1407,7 @@ cxl_copyengine_prepare(cxl_connection_t *conn)
             return -1;
         }
 
-        if (chan->owner_conn && chan->owner_conn != conn) {
-            if (cxl_copyengine_error_log_permitted()) {
-                fprintf(stderr,
-                        "cxl_rpc: ERROR: requested CopyEngine lane already in use"
-                        " engine=%zu channel=%u\n",
-                        conn->ce_bind_engine_index,
-                        conn->ce_bind_channel_id);
-            }
-            return -1;
-        }
-
-        if (!chan->owner_conn) {
-            chan->owner_conn = conn;
-            g_cxl_ce.attached_conns++;
-        }
-        conn->ce_lane_assigned = 1;
-        conn->ce_engine_index = chan->engine_index;
-        conn->ce_channel_index = chan->channel_index;
-        conn->ce_hw_channel_id = chan->chan_id;
-        return 0;
+        return cxl_copyengine_attach_channel(conn, chan);
     }
 
     if (cxl_copyengine_error_log_permitted()) {
@@ -1312,20 +1513,6 @@ cxl_copyengine_channel_wait_idle(cxl_connection_t *conn,
             chan->chain_started);
     chan->poisoned = 1;
     return -1;
-}
-
-static int
-cxl_copyengine_wait_idle(cxl_connection_t *conn)
-{
-    cxl_ce_channel_state_t *chan = NULL;
-
-    if (!conn || !g_cxl_ce.ready)
-        return 0;
-
-    chan = cxl_copyengine_get_assigned_channel(conn);
-    if (!chan)
-        return 0;
-    return cxl_copyengine_channel_wait_idle(conn, chan);
 }
 
 int
@@ -1697,6 +1884,9 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
     size_t desc_capacity = 0;
     size_t src_pages_touched = 0;
     size_t src_page_size = 0;
+    size_t xfer_cap_bytes = 0;
+    size_t xfer_desc_limit = 0;
+    size_t xfer_chunks = 0;
 
     chan = cxl_copyengine_get_assigned_channel(conn);
     if (!chan || chan->poisoned || !chan->engine || !chan->engine->bar0)
@@ -1752,11 +1942,20 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
         dst_pages_touched = 1;
     if (cxl_copyengine_page_size(&src_page_size) != 0)
         return -1;
+    xfer_cap_bytes = chan->engine->xfer_cap_bytes;
+    if (xfer_cap_bytes == 0)
+        return -1;
+    xfer_desc_limit = xfer_cap_bytes;
+    if (xfer_desc_limit > (size_t)UINT32_MAX)
+        xfer_desc_limit = (size_t)UINT32_MAX;
     src_pages_touched =
         (resp_publish_bytes + src_page_size - 1u) / src_page_size;
     if (src_pages_touched == 0)
         src_pages_touched = 1;
-    desc_capacity = src_pages_touched + dst_pages_touched + 1u;
+    xfer_chunks = (resp_publish_bytes + xfer_desc_limit - 1u) / xfer_desc_limit;
+    if (xfer_chunks == 0)
+        xfer_chunks = 1;
+    desc_capacity = src_pages_touched + dst_pages_touched + xfer_chunks + 1u;
 
     /*
      * One response submission owns its staging entry, flag source, and
@@ -1773,6 +1972,32 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
     if (len > 0)
         memcpy(sub->entry_src + sizeof(header), data, len);
     memcpy(sub->flag_src, &producer_cursor, CXL_FLAG_PUBLISH_LEN);
+
+    if (cxl_copyengine_debug_enabled()) {
+        const size_t first_dump = resp_publish_bytes < 32u ?
+            resp_publish_bytes : 32u;
+        size_t tail_off = 0;
+        size_t tail_dump = 0;
+
+        if (resp_publish_bytes > 32u) {
+            tail_dump = 32u;
+            tail_off = resp_publish_bytes - tail_dump;
+        }
+
+        cxl_copyengine_debug_dump_bytes("entry_src_first32",
+                                        sub->entry_src,
+                                        first_dump);
+        if (resp_publish_bytes > 64u) {
+            cxl_copyengine_debug_dump_bytes("entry_src_line64_32",
+                                            sub->entry_src + 64u,
+                                            32u);
+        }
+        if (tail_dump > 0) {
+            cxl_copyengine_debug_dump_bytes("entry_src_tail32",
+                                            sub->entry_src + tail_off,
+                                            tail_dump);
+        }
+    }
 
     logical_copy_addr = logical_resp_addr;
     copy_remaining = resp_publish_bytes;
@@ -1821,14 +2046,18 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
             chunk = src_page_rem;
         if (chunk > dst_page_rem)
             chunk = dst_page_rem;
+        if (chunk > xfer_desc_limit)
+            chunk = xfer_desc_limit;
 
         chunk_src_phys = src_page_phys + (uint64_t)src_page_off;
         chunk_dst_phys = dst_copy_page_phys + (uint64_t)dst_page_off;
 
         if (desc_idx > 0) {
             cxl_ce_desc_t *prev_desc = &sub->desc_pool[desc_idx - 1u];
+            size_t merged_len = (size_t)prev_desc->len + chunk;
             if (prev_desc->src + (uint64_t)prev_desc->len == chunk_src_phys &&
-                prev_desc->dest + (uint64_t)prev_desc->len == chunk_dst_phys) {
+                prev_desc->dest + (uint64_t)prev_desc->len == chunk_dst_phys &&
+                merged_len <= xfer_desc_limit) {
                 if (chunk > (size_t)UINT32_MAX - (size_t)prev_desc->len) {
                     cxl_copyengine_channel_recycle_submission(chan, sub);
                     return -1;
@@ -1874,12 +2103,40 @@ cxl_copyengine_submit_response_async(cxl_connection_t *conn,
     sub->desc_pool[desc_count - 1u].next = 0;
     sub->tail_desc = &sub->desc_pool[desc_count - 1u];
 
+    if (cxl_copyengine_debug_enabled()) {
+        fprintf(stderr,
+                "[libcxlrpc][CE] response_submit engine=%zu channel=%u rpc_id=%u payload_len=%zu publish_bytes=%zu dst_resp_offset=%zu producer_cursor=%llu desc_count=%zu xfer_cap=%zu\n",
+                chan->engine_index,
+                chan->chan_id,
+                (unsigned)rpc_id,
+                len,
+                resp_publish_bytes,
+                dst_resp_offset,
+                (unsigned long long)producer_cursor,
+                desc_count,
+                xfer_cap_bytes);
+        for (size_t i = 0; i < desc_count; ++i) {
+            fprintf(stderr,
+                    "[libcxlrpc][CE] desc[%zu] len=%u src=%#llx dst=%#llx next=%#llx\n",
+                    i,
+                    (unsigned)sub->desc_pool[i].len,
+                    (unsigned long long)sub->desc_pool[i].src,
+                    (unsigned long long)sub->desc_pool[i].dest,
+                    (unsigned long long)sub->desc_pool[i].next);
+        }
+    }
+
     /*
-     * Keep the response payload, publish flag, and descriptor cachelines
-     * resident for this experiment; only preserve store ordering before the
-     * MMIO start command.
+     * CopyEngine fetches descriptors and DMA-reads staging pages from memory
+     * backing, so source-side cachelines must be published before the channel
+     * start/append MMIO write.
      */
-    __asm__ __volatile__("sfence" ::: "memory");
+    cxl_copyengine_flush_cpu_range((volatile uint8_t *)sub->entry_src,
+                                   resp_publish_bytes);
+    cxl_copyengine_flush_cpu_range((volatile uint8_t *)sub->flag_src,
+                                   CXL_FLAG_PUBLISH_LEN);
+    cxl_copyengine_flush_cpu_range((volatile uint8_t *)sub->desc_pool,
+                                   desc_count * sizeof(cxl_ce_desc_t));
 
     if (cxl_copyengine_enqueue_submission(chan, sub) != 0) {
         cxl_copyengine_channel_recycle_submission(chan, sub);
@@ -1916,11 +2173,10 @@ cxl_copyengine_submit_flag_async(cxl_connection_t *conn,
     sub->desc_pool[0].next = 0;
     sub->tail_desc = &sub->desc_pool[0];
 
-    /*
-     * The flag staging cacheline sits on the coherent path; preserve only
-     * store ordering before the channel start/append MMIO write.
-     */
-    __asm__ __volatile__("sfence" ::: "memory");
+    cxl_copyengine_flush_cpu_range((volatile uint8_t *)sub->flag_src,
+                                   CXL_FLAG_PUBLISH_LEN);
+    cxl_copyengine_flush_cpu_range((volatile uint8_t *)sub->desc_pool,
+                                   sizeof(cxl_ce_desc_t));
 
     if (cxl_copyengine_enqueue_submission(chan, sub) != 0) {
         cxl_copyengine_channel_recycle_submission(chan, sub);

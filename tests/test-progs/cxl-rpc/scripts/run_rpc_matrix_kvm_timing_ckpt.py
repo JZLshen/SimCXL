@@ -3,19 +3,26 @@
 Run CXL RPC matrix experiments with:
   - KVM boot + TIMING CPU test phase
   - inject guest binaries once per batch
-  - reuse one checkpoint per client-count topology
+  - reuse one checkpoint per hardware topology
   - automatic result extraction from guest writefile artifacts
-    (fallback to board.pc.com_1.device for older runs)
 
-Default experiment matrix (deduplicated):
-  A) client sweep:
-     req_size=64B, resp_size=64B, clients in [1,2,4,8,16,32], reqs=30
-  B) request-size sweep:
-     req_size in [8B,64B,256B,1KB,4KB,8KB], resp_size=64B,
-     clients=16, reqs=30
-  C) response-size sweep:
-     req_size=64B, resp_size in [8B,64B,256B,1KB,4KB,8KB],
-     clients=16, reqs=30
+Default experiment matrix follows the current bare-RPC scope from exp.txt:
+  - overall:
+    fixed (64,64), google-rpc distribution (~1530/315 nominal),
+    twitter-twemcache distribution (~38/230 nominal),
+    each with clients [1,2,4,8,16,32]
+  - sensitivity:
+    request-size sweep at 32 clients
+    response-size sweep at 32 clients
+    metadata-queue entries sweep at 32 clients
+    head-sync threshold sweep at 32 clients
+    request-sparsity sweep with slow-client mixes
+    extra CXL latency sweep at 32 clients
+    DMA lane-sharing sweep at 32 clients
+  - technical analysis:
+    w/o DMA response-size sweep at 32 clients
+    w/o prefetch request-only-off client sweep
+    w/o prefetch request+notify-off client sweep
 """
 
 from __future__ import annotations
@@ -36,12 +43,30 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-BASE_REQUEST_SIZE = 64
-BASE_RESPONSE_SIZE = 64
-SIZE_SWEEP_CLIENTS = 16
+DEFAULT_MQ_ENTRIES = 1024
+DEFAULT_RESPONSE_DMA_THRESHOLD = 256
+DEFAULT_PREFETCH_MODE = "full"
+DEFAULT_REQUEST_SPARSITY_SLOW_CLIENT_SEND_PAUSE_ITERS = 16384
+MESSAGE_PROFILE_FIXED = "fixed"
+MESSAGE_PROFILE_GOOGLE_RPC = "google-rpc"
+MESSAGE_PROFILE_TWITTER_TWEMCACHE = "twitter-twemcache"
+SENSITIVITY_CLIENTS = 32
+CLIENT_SWEEP_COUNTS = [1, 2, 4, 8, 16, 32]
+OVERALL_WORKLOADS = [
+    (64, 64, MESSAGE_PROFILE_FIXED),
+    (1530, 315, MESSAGE_PROFILE_GOOGLE_RPC),
+    (38, 230, MESSAGE_PROFILE_TWITTER_TWEMCACHE),
+]
 REQ_SWEEP_SIZES = [8, 64, 256, 1024, 4096, 8192]
 RESP_SWEEP_SIZES = [8, 64, 256, 1024, 4096, 8192]
-CLIENT_SWEEP_COUNTS = [1, 2, 4, 8, 16, 32]
+MQ_ENTRY_SWEEP = [16, 32, 64, 128, 256, 512, 1024]
+HEAD_SYNC_SWEEP = [8, 16, 32, 64, 128, 256, 512]
+REQUEST_SPARSITY_CLIENTS = [4, 8, 16, 20, 24, 28]
+REQUEST_SPARSITY_SLOW_CLIENT_PERCENTAGES = [0, 25, 50]
+CXL_EXTRA_LATENCY_SWEEP_NS = [100, 200, 300]
+DMA_CLIENTS_PER_LANE_SWEEP = [1, 2, 4, 8, 16, 32]
+TECH_WO_PREFETCH_CLIENTS = [1, 2, 4, 8, 16, 32]
+TECH_WO_DMA_CPU_ONLY_THRESHOLD = max(RESP_SWEEP_SIZES) + 1
 
 
 @dataclass(frozen=True)
@@ -50,6 +75,16 @@ class ExperimentKey:
     response_size: int
     clients: int
     requests_per_client: int
+    mq_entries: int = DEFAULT_MQ_ENTRIES
+    head_sync_threshold: int = 0
+    cxl_extra_latency_ns: int = 0
+    response_lane_count: int = 0
+    clients_per_dma_lane: int = 1
+    response_dma_threshold: int = DEFAULT_RESPONSE_DMA_THRESHOLD
+    prefetch_mode: str = DEFAULT_PREFETCH_MODE
+    message_profile: str = MESSAGE_PROFILE_FIXED
+    slow_client_count: int = 0
+    slow_client_send_pause_iters: int = 0
 
 
 @dataclass
@@ -70,9 +105,48 @@ def resolve_repo_root(cli_repo_root: Optional[str]) -> Path:
     return Path(__file__).resolve().parents[4]
 
 
+def ceil_div(numer: int, denom: int) -> int:
+    return (numer + denom - 1) // denom
+
+
+def default_head_sync_threshold(mq_entries: int) -> int:
+    return mq_entries // 4
+
+
+def format_exp_id(key: ExperimentKey) -> str:
+    parts = [
+        f"req{key.request_size}",
+        f"resp{key.response_size}",
+        f"c{key.clients}",
+        f"r{key.requests_per_client}",
+    ]
+    if key.mq_entries != DEFAULT_MQ_ENTRIES:
+        parts.append(f"mq{key.mq_entries}")
+    if key.head_sync_threshold != default_head_sync_threshold(key.mq_entries):
+        parts.append(f"hs{key.head_sync_threshold}")
+    if key.cxl_extra_latency_ns > 0:
+        parts.append(f"cxlp{key.cxl_extra_latency_ns}ns")
+    if key.clients_per_dma_lane != 1:
+        parts.append(f"cpl{key.clients_per_dma_lane}")
+    if key.response_dma_threshold != DEFAULT_RESPONSE_DMA_THRESHOLD:
+        parts.append(f"dmath{key.response_dma_threshold}")
+    if key.prefetch_mode != DEFAULT_PREFETCH_MODE:
+        parts.append(f"pf{key.prefetch_mode.replace('-', '_')}")
+    if key.message_profile != MESSAGE_PROFILE_FIXED:
+        parts.append(f"mprof{key.message_profile.replace('-', '_')}")
+    if key.slow_client_count > 0:
+        parts.append(f"slow{key.slow_client_count}")
+        if key.slow_client_send_pause_iters > 0:
+            parts.append(f"sp{key.slow_client_send_pause_iters}")
+    return "_".join(parts)
+
+
 def build_matrix(requests_per_client: int,
-                 baseline_response_size: int) -> List[Experiment]:
+                 response_dma_threshold: int,
+                 prefetch_mode: str,
+                 request_sparsity_slow_client_send_pause_iters: int) -> List[Experiment]:
     dedup: Dict[ExperimentKey, Experiment] = {}
+    default_hs = default_head_sync_threshold(DEFAULT_MQ_ENTRIES)
 
     def add_experiment(key: ExperimentKey, source: str) -> None:
         existing = dedup.get(key)
@@ -84,54 +158,189 @@ def build_matrix(requests_per_client: int,
 
         dedup[key] = Experiment(
             key=key,
-            exp_id=(
-                f"req{key.request_size}_resp{key.response_size}"
-                f"_c{key.clients}_r{key.requests_per_client}"
-            ),
+            exp_id=format_exp_id(key),
             source=source,
         )
 
-    for clients in CLIENT_SWEEP_COUNTS:
-        add_experiment(
-            ExperimentKey(
-                request_size=BASE_REQUEST_SIZE,
-                response_size=baseline_response_size,
-                clients=clients,
-                requests_per_client=requests_per_client,
-            ),
-            "client_sweep",
-        )
+    for request_size, response_size, message_profile in OVERALL_WORKLOADS:
+        for clients in CLIENT_SWEEP_COUNTS:
+            add_experiment(
+                ExperimentKey(
+                    request_size=request_size,
+                    response_size=response_size,
+                    clients=clients,
+                    requests_per_client=requests_per_client,
+                    head_sync_threshold=default_hs,
+                    response_lane_count=clients,
+                    response_dma_threshold=response_dma_threshold,
+                    prefetch_mode=prefetch_mode,
+                    message_profile=message_profile,
+                ),
+                "overall",
+            )
 
     for request_size in REQ_SWEEP_SIZES:
         add_experiment(
             ExperimentKey(
                 request_size=request_size,
-                response_size=baseline_response_size,
-                clients=SIZE_SWEEP_CLIENTS,
+                response_size=64,
+                clients=SENSITIVITY_CLIENTS,
                 requests_per_client=requests_per_client,
+                head_sync_threshold=default_hs,
+                response_lane_count=SENSITIVITY_CLIENTS,
+                response_dma_threshold=response_dma_threshold,
+                prefetch_mode=prefetch_mode,
             ),
-            "request_size_sweep",
+            "sensitivity_request_size",
         )
 
     for response_size in RESP_SWEEP_SIZES:
         add_experiment(
             ExperimentKey(
-                request_size=BASE_REQUEST_SIZE,
+                request_size=64,
                 response_size=response_size,
-                clients=SIZE_SWEEP_CLIENTS,
+                clients=SENSITIVITY_CLIENTS,
                 requests_per_client=requests_per_client,
+                head_sync_threshold=default_hs,
+                response_lane_count=SENSITIVITY_CLIENTS,
+                response_dma_threshold=response_dma_threshold,
+                prefetch_mode=prefetch_mode,
             ),
-            "response_size_sweep",
+            "sensitivity_response_size",
         )
 
-    return sorted(
-        dedup.values(),
-        key=lambda x: (
-            x.key.clients,
-            x.key.request_size,
-            x.key.response_size,
-        ),
-    )
+    for mq_entries in MQ_ENTRY_SWEEP:
+        add_experiment(
+            ExperimentKey(
+                request_size=64,
+                response_size=64,
+                clients=SENSITIVITY_CLIENTS,
+                requests_per_client=requests_per_client,
+                mq_entries=mq_entries,
+                head_sync_threshold=default_head_sync_threshold(mq_entries),
+                response_lane_count=SENSITIVITY_CLIENTS,
+                response_dma_threshold=response_dma_threshold,
+                prefetch_mode=prefetch_mode,
+            ),
+            "sensitivity_mq_entries",
+        )
+
+    for head_sync_threshold in HEAD_SYNC_SWEEP:
+        add_experiment(
+            ExperimentKey(
+                request_size=64,
+                response_size=64,
+                clients=SENSITIVITY_CLIENTS,
+                requests_per_client=requests_per_client,
+                mq_entries=DEFAULT_MQ_ENTRIES,
+                head_sync_threshold=head_sync_threshold,
+                response_lane_count=SENSITIVITY_CLIENTS,
+                response_dma_threshold=response_dma_threshold,
+                prefetch_mode=prefetch_mode,
+            ),
+            "sensitivity_head_sync",
+        )
+
+    for clients in REQUEST_SPARSITY_CLIENTS:
+        for slow_client_percentage in REQUEST_SPARSITY_SLOW_CLIENT_PERCENTAGES:
+            slow_client_count = (clients * slow_client_percentage) // 100
+            add_experiment(
+                ExperimentKey(
+                    request_size=64,
+                    response_size=64,
+                    clients=clients,
+                    requests_per_client=requests_per_client,
+                    head_sync_threshold=default_hs,
+                    response_lane_count=clients,
+                    response_dma_threshold=response_dma_threshold,
+                    prefetch_mode=prefetch_mode,
+                    slow_client_count=slow_client_count,
+                    slow_client_send_pause_iters=(
+                        request_sparsity_slow_client_send_pause_iters
+                        if slow_client_count > 0 else 0
+                    ),
+                ),
+                "sensitivity_request_sparsity",
+            )
+
+    for cxl_extra_latency_ns in CXL_EXTRA_LATENCY_SWEEP_NS:
+        add_experiment(
+            ExperimentKey(
+                request_size=64,
+                response_size=64,
+                clients=SENSITIVITY_CLIENTS,
+                requests_per_client=requests_per_client,
+                head_sync_threshold=default_hs,
+                cxl_extra_latency_ns=cxl_extra_latency_ns,
+                response_lane_count=SENSITIVITY_CLIENTS,
+                response_dma_threshold=response_dma_threshold,
+                prefetch_mode=prefetch_mode,
+            ),
+            "sensitivity_cxl_latency",
+        )
+
+    for clients_per_dma_lane in DMA_CLIENTS_PER_LANE_SWEEP:
+        add_experiment(
+            ExperimentKey(
+                request_size=1530,
+                response_size=315,
+                clients=SENSITIVITY_CLIENTS,
+                requests_per_client=requests_per_client,
+                head_sync_threshold=default_hs,
+                response_lane_count=ceil_div(SENSITIVITY_CLIENTS,
+                                             clients_per_dma_lane),
+                clients_per_dma_lane=clients_per_dma_lane,
+                response_dma_threshold=response_dma_threshold,
+                prefetch_mode=prefetch_mode,
+                message_profile=MESSAGE_PROFILE_GOOGLE_RPC,
+            ),
+            "sensitivity_dma_lanes",
+        )
+
+    for response_size in RESP_SWEEP_SIZES:
+        add_experiment(
+            ExperimentKey(
+                request_size=64,
+                response_size=response_size,
+                clients=SENSITIVITY_CLIENTS,
+                requests_per_client=requests_per_client,
+                head_sync_threshold=default_hs,
+                response_lane_count=SENSITIVITY_CLIENTS,
+                response_dma_threshold=TECH_WO_DMA_CPU_ONLY_THRESHOLD,
+                prefetch_mode=prefetch_mode,
+            ),
+            "technical_wo_dma",
+        )
+
+    for clients in TECH_WO_PREFETCH_CLIENTS:
+        add_experiment(
+            ExperimentKey(
+                request_size=64,
+                response_size=64,
+                clients=clients,
+                requests_per_client=requests_per_client,
+                head_sync_threshold=default_hs,
+                response_lane_count=clients,
+                response_dma_threshold=response_dma_threshold,
+                prefetch_mode="no-request",
+            ),
+            "technical_wo_prefetch_request",
+        )
+        add_experiment(
+            ExperimentKey(
+                request_size=64,
+                response_size=64,
+                clients=clients,
+                requests_per_client=requests_per_client,
+                head_sync_threshold=default_hs,
+                response_lane_count=clients,
+                response_dma_threshold=response_dma_threshold,
+                prefetch_mode="none",
+            ),
+            "technical_wo_prefetch_all",
+        )
+
+    return list(dedup.values())
 
 
 def _signal_name(sig: signal.Signals) -> str:
@@ -320,18 +529,11 @@ def resolve_checkpoint_dir(path: Path) -> Optional[Path]:
     return None
 
 
-CLIENT_MULTI_RE = re.compile(
-    r"^\[CLIENT\[(\d+)\]\]\s+req_(\d+)_(start|end|delta)_tick=(\d+)\s*$"
-)
-CLIENT_SINGLE_RE = re.compile(
-    r"^\[CLIENT\]\s+req_(\d+)_(start|end|delta)_tick=(\d+)\s*$"
-)
 CLIENT_BARE_RE = re.compile(
-    r"^req_(\d+)_(start|end|delta)_tick=(\d+)\s*$"
+    r"^req_(\d+)_(start|end)_tick=(\d+)\s*$"
 )
 SERVER_LINE_RE = re.compile(
-    r"^server_req_(\d+)_(node_id|rpc_id|poll_tick|poll_notify_tick|"
-    r"poll_req_data_tick|poll_tail_tick|exec_tick|resp_submit_tick)=(\d+)\s*$"
+    r"^server_req_(\d+)_(poll_tick|execute_tick|response_tick)=(\d+)\s*$"
 )
 CLIENT_HOST_LOG_RE = re.compile(r"^rpc_client_runtime_(\d+)\.log$")
 
@@ -376,68 +578,19 @@ def build_server_rows(
     server_rows: List[Dict[str, int]] = []
 
     for req_index, vals in sorted(server_fields.items()):
-        required = ("node_id", "exec_tick", "resp_submit_tick")
+        required = ("poll_tick", "execute_tick", "response_tick")
         if not all(name in vals for name in required):
             continue
         server_rows.append(
             {
                 "server_req_index": req_index,
-                "node_id": vals["node_id"],
-                "poll_notify_tick": vals.get("poll_notify_tick", vals.get("poll_tick", 0)),
-                "poll_req_data_tick": vals.get("poll_req_data_tick", 0),
-                "exec_tick": vals["exec_tick"],
-                "resp_submit_tick": vals["resp_submit_tick"],
+                "poll_tick": vals["poll_tick"],
+                "execute_tick": vals["execute_tick"],
+                "response_tick": vals["response_tick"],
             }
         )
 
     return server_rows
-
-
-def parse_board_results(
-    board_path: Path,
-) -> Tuple[Optional[int], List[Dict[str, int]], List[Dict[str, int]]]:
-    if not board_path.exists():
-        return None, [], []
-
-    lines = board_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-    test_rc = parse_test_rc_lines(lines)
-    client_fields: Dict[Tuple[int, int], Dict[str, int]] = {}
-    server_fields: Dict[int, Dict[str, int]] = {}
-
-    for line in lines:
-        m = CLIENT_MULTI_RE.match(line)
-        if m:
-            node_id = int(m.group(1))
-            ridx = int(m.group(2))
-            kind = m.group(3)
-            val = int(m.group(4))
-            client_fields.setdefault((node_id, ridx), {})[kind] = val
-            continue
-
-        m = CLIENT_SINGLE_RE.match(line)
-        if m:
-            ridx = int(m.group(1))
-            kind = m.group(2)
-            val = int(m.group(3))
-            client_fields.setdefault((0, ridx), {})[kind] = val
-            continue
-
-        m = CLIENT_BARE_RE.match(line)
-        if m:
-            ridx = int(m.group(1))
-            kind = m.group(2)
-            val = int(m.group(3))
-            client_fields.setdefault((0, ridx), {})[kind] = val
-            continue
-
-        m = SERVER_LINE_RE.match(line)
-        if m:
-            req_index = int(m.group(1))
-            kind = m.group(2)
-            val = int(m.group(3))
-            server_fields.setdefault(req_index, {})[kind] = val
-
-    return test_rc, build_client_rows(client_fields), build_server_rows(server_fields)
 
 
 def parse_status_file(status_path: Path) -> Optional[int]:
@@ -499,11 +652,6 @@ def parse_writefile_results(
             continue
         client_rows.extend(parse_client_log(client_log, int(m.group(1))))
 
-    if not client_logs:
-        single_client_log = run_outdir / "rpc_client_runtime.log"
-        if single_client_log.exists():
-            client_rows.extend(parse_client_log(single_client_log, 0))
-
     server_rows = parse_server_log(server_log_path) if server_log_path.exists() else []
     test_rc = parse_status_file(status_path)
     return test_rc, client_rows, server_rows
@@ -512,11 +660,7 @@ def parse_writefile_results(
 def parse_run_results(
     run_outdir: Path,
 ) -> Tuple[Optional[int], List[Dict[str, int]], List[Dict[str, int]]]:
-    test_rc, client_rows, server_rows = parse_writefile_results(run_outdir)
-    if test_rc is not None or client_rows or server_rows:
-        return test_rc, client_rows, server_rows
-
-    return parse_board_results(run_outdir / "board.pc.com_1.device")
+    return parse_writefile_results(run_outdir)
 
 
 def read_success_exp_ids(csv_path: Path) -> set[str]:
@@ -543,6 +687,25 @@ def append_row(csv_path: Path, row: dict, fieldnames: List[str]) -> None:
         writer.writerow(row)
 
 
+def experiment_metadata_row(key: ExperimentKey) -> Dict[str, object]:
+    return {
+        "request_size": key.request_size,
+        "response_size": key.response_size,
+        "clients": key.clients,
+        "requests_per_client": key.requests_per_client,
+        "mq_entries": key.mq_entries,
+        "head_sync_threshold": key.head_sync_threshold,
+        "slow_client_count": key.slow_client_count,
+        "slow_client_send_pause_iters": key.slow_client_send_pause_iters,
+        "cxl_extra_latency_ns": key.cxl_extra_latency_ns,
+        "response_lane_count": key.response_lane_count,
+        "clients_per_dma_lane": key.clients_per_dma_lane,
+        "response_dma_threshold": key.response_dma_threshold,
+        "prefetch_mode": key.prefetch_mode,
+        "message_profile": key.message_profile,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run CXL RPC matrix (KVM+TIMING+checkpoint) and extract ticks"
@@ -550,17 +713,34 @@ def main() -> int:
     parser.add_argument("--repo-root", type=str, default=None)
     parser.add_argument("--output-base", type=str, default="output")
     parser.add_argument("--batch-name", type=str, default="")
+    parser.add_argument(
+        "--disk",
+        type=str,
+        default="",
+        help="Path to guest disk image. Empty uses repo_root/files/parsec.img.",
+    )
     parser.add_argument("--requests", type=int, default=30)
     parser.add_argument(
-        "--response-size",
+        "--response-dma-threshold",
         type=int,
-        default=BASE_RESPONSE_SIZE,
+        default=DEFAULT_RESPONSE_DMA_THRESHOLD,
+        help="Response payload size threshold for switching to DMA publish.",
+    )
+    parser.add_argument(
+        "--prefetch-mode",
+        type=str,
+        default=DEFAULT_PREFETCH_MODE,
+        help="Server request-RX prefetch mode: full|no-request|none.",
+    )
+    parser.add_argument(
+        "--request-sparsity-slow-client-send-pause-iters",
+        type=int,
+        default=DEFAULT_REQUEST_SPARSITY_SLOW_CLIENT_SEND_PAUSE_ITERS,
         help=(
-            "Baseline response size for client/request-size sweeps. "
-            "Response-size sweep still uses the built-in set."
+            "Extra pause iterations inserted before each send from slow clients "
+            "in the request-sparsity sweep."
         ),
     )
-    parser.add_argument("--max-polls", type=int, default=2000000)
     parser.add_argument(
         "--only-exp-id",
         type=str,
@@ -633,6 +813,15 @@ def main() -> int:
     if args.copy_engine_channels < 0:
         print("[fatal] --copy-engine-channels must be >= 0")
         return 2
+    if args.response_dma_threshold < 1:
+        print("[fatal] --response-dma-threshold must be >= 1")
+        return 2
+    if args.prefetch_mode not in {"full", "no-request", "none"}:
+        print("[fatal] --prefetch-mode must be one of: full, no-request, none")
+        return 2
+    if args.request_sparsity_slow_client_send_pause_iters < 0:
+        print("[fatal] --request-sparsity-slow-client-send-pause-iters must be >= 0")
+        return 2
     if args.checkpoint_handoff_deadline_sim_seconds < 0:
         print("[fatal] --checkpoint-handoff-deadline-sim-seconds must be >= 0")
         return 2
@@ -643,9 +832,19 @@ def main() -> int:
         repo_root / "configs/example/gem5_library/x86-cxl-rpc-save-checkpoint.py"
     )
     inject_script = repo_root / "tests/test-progs/cxl-rpc/scripts/setup_disk_image.sh"
-    disk_img = repo_root / "files/parsec.img"
+    summary_script = (
+        repo_root / "tests/test-progs/cxl-rpc/scripts/summarize_rpc_matrix_results.py"
+    )
+    disk_img = (
+        Path(args.disk).resolve()
+        if args.disk else
+        (repo_root / "files" / "parsec.img").resolve()
+    )
 
-    experiments = build_matrix(args.requests, args.response_size)
+    experiments = build_matrix(args.requests,
+                               args.response_dma_threshold,
+                               args.prefetch_mode,
+                               args.request_sparsity_slow_client_send_pause_iters)
     if args.only_exp_id:
         experiments = [exp for exp in experiments if exp.exp_id == args.only_exp_id]
         if not experiments:
@@ -665,6 +864,16 @@ def main() -> int:
                 "response_size",
                 "clients",
                 "requests_per_client",
+                "mq_entries",
+                "head_sync_threshold",
+                "slow_client_count",
+                "slow_client_send_pause_iters",
+                "cxl_extra_latency_ns",
+                "response_lane_count",
+                "clients_per_dma_lane",
+                "response_dma_threshold",
+                "prefetch_mode",
+                "message_profile",
             ],
         )
         writer.writeheader()
@@ -677,6 +886,18 @@ def main() -> int:
                     "response_size": exp.key.response_size,
                     "clients": exp.key.clients,
                     "requests_per_client": exp.key.requests_per_client,
+                    "mq_entries": exp.key.mq_entries,
+                    "head_sync_threshold": exp.key.head_sync_threshold,
+                    "slow_client_count": exp.key.slow_client_count,
+                    "slow_client_send_pause_iters": (
+                        exp.key.slow_client_send_pause_iters
+                    ),
+                    "cxl_extra_latency_ns": exp.key.cxl_extra_latency_ns,
+                    "response_lane_count": exp.key.response_lane_count,
+                    "clients_per_dma_lane": exp.key.clients_per_dma_lane,
+                    "response_dma_threshold": exp.key.response_dma_threshold,
+                    "prefetch_mode": exp.key.prefetch_mode,
+                    "message_profile": exp.key.message_profile,
                 }
             )
 
@@ -703,6 +924,16 @@ def main() -> int:
         "response_size",
         "clients",
         "requests_per_client",
+        "mq_entries",
+        "head_sync_threshold",
+        "slow_client_count",
+        "slow_client_send_pause_iters",
+        "cxl_extra_latency_ns",
+        "response_lane_count",
+        "clients_per_dma_lane",
+        "response_dma_threshold",
+        "prefetch_mode",
+        "message_profile",
         "checkpoint_dir",
         "num_cpus",
         "output_dir",
@@ -723,6 +954,16 @@ def main() -> int:
         "response_size",
         "clients",
         "requests_per_client",
+        "mq_entries",
+        "head_sync_threshold",
+        "slow_client_count",
+        "slow_client_send_pause_iters",
+        "cxl_extra_latency_ns",
+        "response_lane_count",
+        "clients_per_dma_lane",
+        "response_dma_threshold",
+        "prefetch_mode",
+        "message_profile",
         "node_id",
         "req_index",
         "start_tick",
@@ -735,19 +976,28 @@ def main() -> int:
         "response_size",
         "clients",
         "requests_per_client",
+        "mq_entries",
+        "head_sync_threshold",
+        "slow_client_count",
+        "slow_client_send_pause_iters",
+        "cxl_extra_latency_ns",
+        "response_lane_count",
+        "clients_per_dma_lane",
+        "response_dma_threshold",
+        "prefetch_mode",
+        "message_profile",
         "server_req_index",
-        "node_id",
-        "poll_notify_tick",
-        "poll_req_data_tick",
-        "exec_tick",
-        "resp_submit_tick",
+        "poll_tick",
+        "execute_tick",
+        "response_tick",
         "output_dir",
     ]
     started_experiments = 0
     direct_kvm_access = os.access("/dev/kvm", os.R_OK | os.W_OK)
     sudo_n_available = sudo_nopass_available()
     kvm_cmd_prefix: List[str] = []
-    checkpoint_cache: Dict[int, Path] = {}
+    checkpoint_cache: Dict[Tuple[int, int, int, int], Path] = {}
+    checkpoint_failure_cache: Dict[Tuple[int, int, int, int], Tuple[str, int]] = {}
     kvm_signal_prefix: Optional[List[str]] = None
     lock_fp = None
 
@@ -823,19 +1073,63 @@ def main() -> int:
             run_outdir.mkdir(parents=True, exist_ok=True)
             run_log = run_outdir / "gem5_run.log"
             required_cpus = key.clients + 1
-            checkpoint_dir = checkpoint_cache.get(key.clients)
-            checkpoint_label = f"clients_{key.clients}"
+            checkpoint_key = (
+                key.clients,
+                key.response_lane_count,
+                key.mq_entries,
+                key.cxl_extra_latency_ns,
+            )
+            checkpoint_dir = checkpoint_cache.get(checkpoint_key)
+            checkpoint_failure = checkpoint_failure_cache.get(checkpoint_key)
+            checkpoint_label = (
+                f"clients_{key.clients}"
+                f"_lanes_{key.response_lane_count}"
+                f"_mq_{key.mq_entries}"
+                f"_cxlp_{key.cxl_extra_latency_ns}ns"
+            )
             ckpt_outdir = (
                 batch_dir / "checkpoints" / checkpoint_label / "cxl_rpc_checkpoint"
             )
 
             if checkpoint_dir is None:
+                if checkpoint_failure is not None:
+                    failed_status, failed_rc = checkpoint_failure
+                    cached_status = f"{failed_status}_cached"
+                    append_row(
+                        experiments_csv,
+                        {
+                            "exp_id": exp.exp_id,
+                            "source": exp.source,
+                            **experiment_metadata_row(key),
+                            "checkpoint_dir": str(ckpt_outdir),
+                            "num_cpus": required_cpus,
+                            "output_dir": str(run_outdir),
+                            "start_time": "",
+                            "end_time": "",
+                            "elapsed_sec": "0.000",
+                            "gem5_rc": failed_rc,
+                            "test_cmd_exit": "",
+                            "tick_rows": 0,
+                            "expected_rows": key.clients * key.requests_per_client,
+                            "server_tick_rows": 0,
+                            "expected_server_rows": key.clients * key.requests_per_client,
+                            "status": cached_status,
+                        },
+                        exp_fields,
+                    )
+                    print(
+                        f"[done] {exp.exp_id} status={cached_status} "
+                        f"gem5_rc={failed_rc} test_rc=None ticks=0/"
+                        f"{key.clients * key.requests_per_client} elapsed=0.0s"
+                    )
+                    continue
+
                 resolved = None if args.dry_run else resolve_checkpoint_dir(ckpt_outdir)
                 if resolved is not None:
                     checkpoint_dir = resolved
-                    checkpoint_cache[key.clients] = checkpoint_dir
+                    checkpoint_cache[checkpoint_key] = checkpoint_dir
                     print(
-                        f"[matrix] reuse checkpoint for {key.clients} client(s): "
+                        f"[matrix] reuse checkpoint for {checkpoint_label}: "
                         f"{checkpoint_dir}"
                     )
                 else:
@@ -844,10 +1138,18 @@ def main() -> int:
                         "-d",
                         str(ckpt_outdir),
                         str(save_ckpt_cfg),
+                        "--disk",
+                        str(disk_img),
                         "--num_cpus",
                         str(required_cpus),
                         "--rpc_client_count",
                         str(key.clients),
+                        "--rpc_response_lane_count",
+                        str(key.response_lane_count),
+                        "--rpc_metadata_entries",
+                        str(key.mq_entries),
+                        "--cxl_extra_latency_ns",
+                        str(key.cxl_extra_latency_ns),
                     ]
                     if args.copy_engine_channels > 0:
                         ckpt_cmd.extend(
@@ -885,15 +1187,16 @@ def main() -> int:
                             print(f"[fatal] {exc}")
                             return 2
                         if ckpt_rc != 0:
+                            checkpoint_failure_cache[checkpoint_key] = (
+                                "checkpoint_failed",
+                                ckpt_rc,
+                            )
                             append_row(
                                 experiments_csv,
                                 {
                                     "exp_id": exp.exp_id,
                                     "source": exp.source,
-                                    "request_size": key.request_size,
-                                    "response_size": key.response_size,
-                                    "clients": key.clients,
-                                    "requests_per_client": key.requests_per_client,
+                                    **experiment_metadata_row(key),
                                     "checkpoint_dir": str(ckpt_outdir),
                                     "num_cpus": required_cpus,
                                     "output_dir": str(run_outdir),
@@ -918,15 +1221,16 @@ def main() -> int:
                             continue
                         resolved = resolve_checkpoint_dir(ckpt_outdir)
                         if resolved is None:
+                            checkpoint_failure_cache[checkpoint_key] = (
+                                "checkpoint_missing",
+                                2,
+                            )
                             append_row(
                                 experiments_csv,
                                 {
                                     "exp_id": exp.exp_id,
                                     "source": exp.source,
-                                    "request_size": key.request_size,
-                                    "response_size": key.response_size,
-                                    "clients": key.clients,
-                                    "requests_per_client": key.requests_per_client,
+                                    **experiment_metadata_row(key),
                                     "checkpoint_dir": str(ckpt_outdir),
                                     "num_cpus": required_cpus,
                                     "output_dir": str(run_outdir),
@@ -951,38 +1255,61 @@ def main() -> int:
                             continue
                         checkpoint_dir = resolved
 
-                    checkpoint_cache[key.clients] = checkpoint_dir
+                    checkpoint_cache[checkpoint_key] = checkpoint_dir
 
-            server_args = f"--silent --response-size {key.response_size}"
+            server_args_parts = [
+                "--silent",
+                f"--response-size {key.response_size}",
+                f"--mq-entries {key.mq_entries}",
+                f"--head-sync-threshold {key.head_sync_threshold}",
+                f"--response-dma-threshold {key.response_dma_threshold}",
+                f"--clients-per-dma-lane {key.clients_per_dma_lane}",
+                f"--prefetch-mode {key.prefetch_mode}",
+                f"--message-profile {key.message_profile}",
+            ]
+            server_args = " ".join(server_args_parts)
             test_cmd = (
                 f"CXL_RPC_CLIENT_COUNT={key.clients} "
                 f"CXL_RPC_CLIENT_TIMEOUT_SEC=0 "
                 f"CXL_RPC_SERVER_READY_TIMEOUT_SEC=0 "
-                f"CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS=0 "
                 f"CXL_RPC_PIN_CORES=1 "
                 f"CXL_RPC_SERVER_CORE=0 "
                 f"CXL_RPC_CLIENT_CORE_BASE=1 "
                 f"CXL_RPC_SERVER_ARGS={shlex.quote(server_args)} "
-                f"bash /home/test_code/run_rpc_server_multi_client.sh "
+                f"bash /home/test_code/run_rpc_server_clients.sh "
                 f"/home/test_code/rpc_server_example /home/test_code/rpc_client_example "
                 f"--requests {key.requests_per_client} "
-                f"--max-polls {args.max_polls} "
                 f"--request-size {key.request_size} "
                 f"--response-size {key.response_size} "
+                f"--message-profile {key.message_profile} "
                 f"--silent"
             )
+            if key.slow_client_count > 0:
+                test_cmd += (
+                    f" --slow-client-count {key.slow_client_count} "
+                    f"--slow-client-send-pause-iters "
+                    f"{key.slow_client_send_pause_iters}"
+                )
 
             gem5_cmd = kvm_cmd_prefix + [
                 str(gem5_bin),
                 "-d",
                 str(run_outdir),
                 str(test_cfg),
+                "--disk",
+                str(disk_img),
                 "--cpu_type",
                 "TIMING",
                 "--num_cpus",
                 str(required_cpus),
                 "--rpc_client_count",
                 str(key.clients),
+                "--rpc_response_lane_count",
+                str(key.response_lane_count),
+                "--rpc_metadata_entries",
+                str(key.mq_entries),
+                "--cxl_extra_latency_ns",
+                str(key.cxl_extra_latency_ns),
                 "--checkpoint",
                 str(checkpoint_dir),
                 "--test_cmd",
@@ -1002,6 +1329,12 @@ def main() -> int:
                 f"[run {idx}/{len(experiments)}] {exp.exp_id} "
                 f"(req={key.request_size}, resp={key.response_size}, "
                 f"clients={key.clients}, reqs/client={key.requests_per_client}, "
+                f"mq={key.mq_entries}, hs={key.head_sync_threshold}, "
+                f"slow={key.slow_client_count}, "
+                f"slow_pause={key.slow_client_send_pause_iters}, "
+                f"cxl+={key.cxl_extra_latency_ns}ns, lanes={key.response_lane_count}, "
+                f"cpl={key.clients_per_dma_lane}, dmath={key.response_dma_threshold}, "
+                f"pf={key.prefetch_mode}, profile={key.message_profile}, "
                 f"cpus={required_cpus})"
             )
 
@@ -1050,10 +1383,7 @@ def main() -> int:
                 {
                     "exp_id": exp.exp_id,
                     "source": exp.source,
-                    "request_size": key.request_size,
-                    "response_size": key.response_size,
-                    "clients": key.clients,
-                    "requests_per_client": key.requests_per_client,
+                    **experiment_metadata_row(key),
                     "checkpoint_dir": str(checkpoint_dir),
                     "num_cpus": required_cpus,
                     "output_dir": str(run_outdir),
@@ -1076,10 +1406,7 @@ def main() -> int:
                     ticks_csv,
                     {
                         "exp_id": exp.exp_id,
-                        "request_size": key.request_size,
-                        "response_size": key.response_size,
-                        "clients": key.clients,
-                        "requests_per_client": key.requests_per_client,
+                        **experiment_metadata_row(key),
                         "node_id": row["node_id"],
                         "req_index": row["req_index"],
                         "start_tick": row["start_tick"],
@@ -1094,16 +1421,11 @@ def main() -> int:
                     server_ticks_csv,
                     {
                         "exp_id": exp.exp_id,
-                        "request_size": key.request_size,
-                        "response_size": key.response_size,
-                        "clients": key.clients,
-                        "requests_per_client": key.requests_per_client,
+                        **experiment_metadata_row(key),
                         "server_req_index": row["server_req_index"],
-                        "node_id": row["node_id"],
-                        "poll_notify_tick": row["poll_notify_tick"],
-                        "poll_req_data_tick": row["poll_req_data_tick"],
-                        "exec_tick": row["exec_tick"],
-                        "resp_submit_tick": row["resp_submit_tick"],
+                        "poll_tick": row["poll_tick"],
+                        "execute_tick": row["execute_tick"],
+                        "response_tick": row["response_tick"],
                         "output_dir": str(run_outdir),
                     },
                     server_tick_fields,
@@ -1119,11 +1441,28 @@ def main() -> int:
     finally:
         release_matrix_lock(lock_fp)
 
+    if not args.dry_run:
+        summary_cmd = [
+            sys.executable,
+            str(summary_script),
+            "--batch-dir",
+            str(batch_dir),
+        ]
+        print("+", " ".join(shlex.quote(c) for c in summary_cmd), flush=True)
+        summary_proc = subprocess.run(summary_cmd, check=False)
+        if summary_proc.returncode != 0:
+            print(f"[fatal] summary generation failed rc={summary_proc.returncode}")
+            return summary_proc.returncode
+
     print("\n[matrix] finished")
     print(f"[matrix] plan: {plan_csv}")
     print(f"[matrix] experiments: {experiments_csv}")
     print(f"[matrix] ticks: {ticks_csv}")
     print(f"[matrix] server ticks: {server_ticks_csv}")
+    if not args.dry_run:
+        print(f"[matrix] client summary: {batch_dir / 'summary_client_latency.csv'}")
+        print(f"[matrix] server summary: {batch_dir / 'summary_server_breakdown.csv'}")
+        print(f"[matrix] throughput summary: {batch_dir / 'summary_throughput.csv'}")
     return 0
 
 

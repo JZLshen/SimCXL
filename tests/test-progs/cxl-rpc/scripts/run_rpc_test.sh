@@ -211,7 +211,7 @@ case "$SCENARIO" in
             cpus=2
         fi
         run_gem5 "server_client" \
-            "bash /home/test_code/run_rpc_server_client.sh /home/test_code/rpc_server_example /home/test_code/rpc_client_example --requests 2 --max-polls 2000000 --silent" \
+            "CXL_RPC_CLIENT_COUNT=1 bash /home/test_code/run_rpc_server_clients.sh /home/test_code/rpc_server_example /home/test_code/rpc_client_example --requests 2 --max-polls 2000000 --silent" \
             "$cpus"
         ;;
 
@@ -221,7 +221,7 @@ case "$SCENARIO" in
             cpus=2
         fi
         run_gem5 "benchmark" \
-            "bash /home/test_code/run_rpc_server_client.sh /home/test_code/rpc_server_example /home/test_code/rpc_client_example --requests 500 --max-polls 2000000 --silent" \
+            "CXL_RPC_CLIENT_COUNT=1 bash /home/test_code/run_rpc_server_clients.sh /home/test_code/rpc_server_example /home/test_code/rpc_client_example --requests 500 --max-polls 2000000 --silent" \
             "$cpus"
         ;;
 

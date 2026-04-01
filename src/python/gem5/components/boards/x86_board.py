@@ -171,6 +171,8 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         num_copy_engines: int = 1,
         copy_engine_channels: int = 1,
         copy_engine_xfercap: str = "4KiB",
+        rpc_metadata_entries: int = _CXL_RPC_METADATA_Q_ENTRIES,
+        cxl_extra_latency_ns: int = 0,
     ) -> None:
         if num_copy_engines < 1:
             raise ValueError("X86Board requires at least one CopyEngine.")
@@ -188,12 +190,23 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
                 f"{len(_COPY_ENGINE_PCI_DEVS)} single-function CopyEngines "
                 "on PCI bus 0."
             )
+        if rpc_metadata_entries < 1:
+            raise ValueError("X86Board RPC metadata entries must be >= 1.")
+        if rpc_metadata_entries > _CXL_RPC_METADATA_Q_ENTRIES:
+            raise ValueError(
+                "X86Board RPC metadata entries cannot exceed the public "
+                f"layout capacity {_CXL_RPC_METADATA_Q_ENTRIES}."
+            )
+        if cxl_extra_latency_ns < 0:
+            raise ValueError("X86Board extra CXL latency must be >= 0ns.")
 
         self._cxl_memory_ptr = cxl_memory
         self._is_asic = is_asic
         self._num_copy_engines = num_copy_engines
         self._copy_engine_channels = copy_engine_channels
         self._copy_engine_xfercap = copy_engine_xfercap
+        self._rpc_metadata_entries = rpc_metadata_entries
+        self._cxl_extra_latency_ns = cxl_extra_latency_ns
 
         super().__init__(
             clk_freq=clk_freq,
@@ -290,9 +303,11 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
         self.memories.extend(cxl_abstract_mems)
 
         if self._is_asic:
-            cxl_mem_ctrl.configCXL(Latency("15ns"), 48)
+            cxl_latency_ns = 15 + self._cxl_extra_latency_ns
+            cxl_mem_ctrl.configCXL(Latency(f"{cxl_latency_ns}ns"), 48)
         else:
-            cxl_mem_ctrl.configCXL(Latency("60ns"), 36)
+            cxl_latency_ns = 60 + self._cxl_extra_latency_ns
+            cxl_mem_ctrl.configCXL(Latency(f"{cxl_latency_ns}ns"), 36)
 
         rpc_layout = _CXL_RPC_PUBLIC_LAYOUT
         rpc_base = _CXL_RPC_BASE_ADDR
@@ -314,9 +329,9 @@ class X86Board(AbstractSystemBoard, KernelDiskWorkload):
             rpc_base + rpc_layout["doorbell_offset"]
         )
         self.rpc_engine.default_metadata_queue_addr = metadata_addr
-        self.rpc_engine.default_metadata_queue_entries = rpc_layout[
-            "metadata_entries"
-        ]
+        self.rpc_engine.default_metadata_queue_entries = (
+            self._rpc_metadata_entries
+        )
         self.rpc_engine.default_request_data_addr = (
             rpc_base + rpc_layout["request_data_offset"]
         )

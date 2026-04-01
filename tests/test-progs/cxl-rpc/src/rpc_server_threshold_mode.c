@@ -1,11 +1,12 @@
 /*
- * Minimal CXL RPC server example.
+ * Threshold microbenchmark server:
+ *   - preserves the default request polling / execution path
+ *   - exposes explicit response publish policy selection:
+ *       --response-mode cpu
+ *       --response-mode dma
  *
- * Keeps only request -> response handling.
- * Output contract (only):
- *   server_req_<i>_poll_tick=<u64>
- *   server_req_<i>_execute_tick=<u64>
- *   server_req_<i>_response_tick=<u64>
+ * This file is intentionally isolated from the default RPC server binary so
+ * the main RPC experiment path stays unchanged.
  */
 
 #define _GNU_SOURCE
@@ -32,14 +33,12 @@
 #endif
 
 #include "cxl_rpc.h"
+#include "cxl_rpc_internal.h"
 #include "cxl_rpc_layout.h"
-#include "rpc_message_profile.h"
 
 #define DEFAULT_MAX_REQUESTS 0
 #define DEFAULT_IDLE_PAUSE_ITERS 0
 #define DEFAULT_RESPONSE_SIZE 16
-#define DEFAULT_MQ_ENTRIES METADATA_Q_ENTRIES
-#define DEFAULT_CLIENTS_PER_DMA_LANE 1
 #define MIN_RESPONSE_SIZE 8
 #define MAX_RESPONSE_SIZE (RESPONSE_DATA_BYTES - 8ULL)
 
@@ -53,25 +52,17 @@ typedef struct __attribute__((packed)) {
 } add_response_t;
 
 typedef struct {
-    uint64_t poll_tick;
-    uint64_t execute_tick;
-    uint64_t response_tick;
+    uint16_t node_id;
+    uint64_t poll_notify_tick;
+    uint64_t poll_req_data_tick;
+    uint64_t exec_tick;
+    uint64_t resp_submit_tick;
 } server_request_timing_t;
 
-static const char *
-request_rx_prefetch_mode_name(cxl_request_rx_prefetch_mode_t mode)
-{
-    switch (mode) {
-    case CXL_REQUEST_RX_PREFETCH_FULL:
-        return "full";
-    case CXL_REQUEST_RX_PREFETCH_NO_REQUEST:
-        return "no-request";
-    case CXL_REQUEST_RX_PREFETCH_NONE:
-        return "none";
-    default:
-        return "unknown";
-    }
-}
+typedef enum {
+    RESPONSE_MODE_CPU = 0,
+    RESPONSE_MODE_DMA = 1,
+} response_mode_t;
 
 static volatile int keep_running = 1;
 
@@ -113,16 +104,6 @@ rpc_markerf(const char *phase, const char *fmt, ...)
         va_end(ap);
     }
     fputc('\n', stderr);
-}
-
-static int
-has_flag(int argc, char **argv, const char *flag)
-{
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], flag) == 0)
-            return 1;
-    }
-    return 0;
 }
 
 static int
@@ -216,49 +197,39 @@ parse_size_arg(int argc, char **argv, const char *flag, size_t default_val,
     return 0;
 }
 
+static const char *
+response_mode_name(response_mode_t mode)
+{
+    return (mode == RESPONSE_MODE_DMA) ? "dma" : "cpu";
+}
+
 static int
-parse_prefetch_mode_arg(int argc, char **argv,
-                        cxl_request_rx_prefetch_mode_t *out_mode)
+parse_response_mode_arg(int argc, char **argv, response_mode_t *out_mode)
 {
     if (!out_mode)
         return -1;
 
-    *out_mode = CXL_REQUEST_RX_PREFETCH_FULL;
+    *out_mode = RESPONSE_MODE_CPU;
     for (int i = 1; i < argc - 1; i++) {
-        if (strcmp(argv[i], "--prefetch-mode") != 0)
-            continue;
+        const char *value = argv[i + 1];
 
-        if (strcmp(argv[i + 1], "full") == 0) {
-            *out_mode = CXL_REQUEST_RX_PREFETCH_FULL;
+        if (strcmp(argv[i], "--response-mode") != 0)
+            continue;
+        if (!value)
+            return -1;
+        if (strcmp(value, "cpu") == 0 || strcmp(value, "cpu-only") == 0 ||
+            strcmp(value, "cpu_only") == 0) {
+            *out_mode = RESPONSE_MODE_CPU;
             return 0;
         }
-        if (strcmp(argv[i + 1], "no-request") == 0) {
-            *out_mode = CXL_REQUEST_RX_PREFETCH_NO_REQUEST;
-            return 0;
-        }
-        if (strcmp(argv[i + 1], "none") == 0) {
-            *out_mode = CXL_REQUEST_RX_PREFETCH_NONE;
+        if (strcmp(value, "dma") == 0 || strcmp(value, "dma-only") == 0 ||
+            strcmp(value, "dma_only") == 0) {
+            *out_mode = RESPONSE_MODE_DMA;
             return 0;
         }
         return -1;
     }
 
-    return 0;
-}
-
-static int
-parse_message_profile_arg(int argc, char **argv,
-                          rpc_message_profile_t *out_profile)
-{
-    if (!out_profile)
-        return -1;
-
-    *out_profile = RPC_MESSAGE_PROFILE_FIXED;
-    for (int i = 1; i < argc - 1; i++) {
-        if (strcmp(argv[i], "--message-profile") != 0)
-            continue;
-        return rpc_message_profile_parse(argv[i + 1], out_profile);
-    }
     return 0;
 }
 
@@ -274,6 +245,228 @@ signal_handler(int sig)
 {
     (void)sig;
     keep_running = 0;
+}
+
+static inline size_t
+response_publish_bytes(size_t payload_len)
+{
+    return CXL_RESP_HEADER_LEN + payload_len;
+}
+
+static inline size_t
+response_entry_size(size_t payload_len)
+{
+    const size_t total_size = response_publish_bytes(payload_len);
+    return ((total_size + 63u) / 64u) * 64u;
+}
+
+static inline int
+response_payload_len_valid(size_t payload_len)
+{
+    if (payload_len > (size_t)UINT32_MAX)
+        return 0;
+    if (payload_len > SIZE_MAX - CXL_RESP_HEADER_LEN)
+        return 0;
+    if ((payload_len + CXL_RESP_HEADER_LEN) > SIZE_MAX - 63u)
+        return 0;
+    return 1;
+}
+
+static void
+flush_range(volatile uint8_t *ptr, size_t size)
+{
+    if (!ptr || size == 0)
+        return;
+
+    uintptr_t line_start = ((uintptr_t)ptr) & ~((uintptr_t)63u);
+    uintptr_t line_end = (((uintptr_t)ptr + size) + 63u) & ~((uintptr_t)63u);
+
+    for (uintptr_t line = line_start; line < line_end; line += 64u) {
+        __asm__ __volatile__(
+            "clflushopt (%0)"
+            :
+            : "r"((void *)line)
+            : "memory");
+    }
+    __asm__ __volatile__("sfence" ::: "memory");
+}
+
+static int
+write_response_entry_cpu(cxl_connection_t *conn,
+                         uint16_t rpc_id,
+                         const void *data,
+                         size_t len,
+                         size_t dst_resp_offset)
+{
+    volatile uint8_t *dst_resp = NULL;
+    const uint64_t header = cxl_pack_response_header((uint32_t)len, rpc_id);
+
+    if (!conn || !conn->peer_response_data)
+        return -1;
+
+    dst_resp = conn->peer_response_data + dst_resp_offset;
+    memcpy((void *)dst_resp, &header, sizeof(header));
+    if (len > 0)
+        memcpy((void *)(dst_resp + sizeof(header)), data, len);
+    flush_range(dst_resp, sizeof(header) + len);
+    return 0;
+}
+
+static int
+publish_response_cursor_cpu(cxl_connection_t *conn, uint64_t producer_cursor)
+{
+    if (!conn || !conn->peer_flag)
+        return -1;
+
+    memcpy((void *)conn->peer_flag, &producer_cursor, CXL_FLAG_PUBLISH_LEN);
+    flush_range(conn->peer_flag, CXL_FLAG_PUBLISH_LEN);
+    return 0;
+}
+
+static int
+prepare_response_tx_copyengine_flag(cxl_connection_t *conn)
+{
+    if (!conn || !conn->ce_lane_bind_valid)
+        return -1;
+    if (cxl_copyengine_prepare(conn) != 0)
+        return -1;
+    if (!conn->ce_peer_flag_phys_valid) {
+        if (cxl_copyengine_update_peer_flag_mapping(conn) != 0)
+            return -1;
+    }
+    if (!conn->ce_peer_flag_phys_valid || conn->ce_peer_flag_phys == 0)
+        return -1;
+    return 0;
+}
+
+static int
+prepare_response_tx_copyengine_response(cxl_connection_t *conn)
+{
+    if (prepare_response_tx_copyengine_flag(conn) != 0)
+        return -1;
+    if (!conn->ce_peer_resp_page_phys || conn->ce_peer_resp_page_count == 0) {
+        if (cxl_copyengine_update_peer_response_mapping(conn) != 0)
+            return -1;
+    }
+    if (cxl_copyengine_validate_submit_invariants(conn) != 0)
+        return -1;
+    return 0;
+}
+
+static int
+publish_response_wrap_sentinel(cxl_connection_t *conn,
+                               size_t gap_offset,
+                               size_t gap_size)
+{
+    uint64_t zero_header = 0;
+
+    if (!conn || !conn->peer_response_data || gap_size == 0)
+        return 0;
+    if (gap_size < CXL_RESP_HEADER_LEN)
+        return -1;
+
+    memcpy((void *)(conn->peer_response_data + gap_offset),
+           &zero_header, CXL_RESP_HEADER_LEN);
+    flush_range(conn->peer_response_data + gap_offset, CXL_RESP_HEADER_LEN);
+    return 0;
+}
+
+static int
+reserve_peer_response_window(const cxl_connection_t *conn,
+                             size_t entry_size,
+                             size_t *out_offset,
+                             uint64_t *out_next_cursor,
+                             size_t *out_gap_offset,
+                             size_t *out_gap_size)
+{
+    uint64_t write_cursor = 0;
+    size_t offset = 0;
+    size_t gap_size = 0;
+
+    if (out_offset)
+        *out_offset = 0;
+    if (out_next_cursor)
+        *out_next_cursor = 0;
+    if (out_gap_offset)
+        *out_gap_offset = 0;
+    if (out_gap_size)
+        *out_gap_size = 0;
+
+    if (!conn || !out_offset || !out_next_cursor || entry_size == 0)
+        return -1;
+    if (entry_size > conn->peer_response_data_size)
+        return -1;
+
+    write_cursor = conn->peer_resp_write_cursor;
+    offset = (size_t)(write_cursor % (uint64_t)conn->peer_response_data_size);
+    if (offset + entry_size > conn->peer_response_data_size) {
+        gap_size = conn->peer_response_data_size - offset;
+        if (gap_size < CXL_RESP_HEADER_LEN)
+            return -1;
+        if (write_cursor > UINT64_MAX - (uint64_t)gap_size)
+            return -1;
+        if (out_gap_offset)
+            *out_gap_offset = offset;
+        if (out_gap_size)
+            *out_gap_size = gap_size;
+        write_cursor += (uint64_t)gap_size;
+        offset = 0;
+    }
+    if (write_cursor > UINT64_MAX - (uint64_t)entry_size)
+        return -1;
+
+    *out_offset = offset;
+    *out_next_cursor = write_cursor + (uint64_t)entry_size;
+    return 0;
+}
+
+static int
+send_response_fixed_mode(cxl_connection_t *conn,
+                         response_mode_t mode,
+                         uint16_t rpc_id,
+                         const void *data,
+                         size_t len)
+{
+    size_t entry_size = 0;
+    size_t offset = 0;
+    size_t gap_offset = 0;
+    size_t gap_size = 0;
+    uint64_t next_cursor = 0;
+
+    if (!conn || !conn->resp_tx_ready)
+        return -1;
+    if (len > 0 && !data)
+        return -1;
+    if (rpc_id == 0 || rpc_id > CXL_RPC_ID_MASK)
+        return -1;
+    if (!response_payload_len_valid(len))
+        return -1;
+
+    entry_size = response_entry_size(len);
+    if (reserve_peer_response_window(conn, entry_size,
+                                     &offset, &next_cursor,
+                                     &gap_offset, &gap_size) != 0) {
+        return -1;
+    }
+    if (publish_response_wrap_sentinel(conn, gap_offset, gap_size) != 0)
+        return -1;
+
+    if (mode == RESPONSE_MODE_DMA) {
+        if (prepare_response_tx_copyengine_response(conn) != 0)
+            return -1;
+        if (cxl_copyengine_submit_response_async(conn, rpc_id, data, len,
+                                                 next_cursor, offset) != 0) {
+            return -1;
+        }
+    } else {
+        if (write_response_entry_cpu(conn, rpc_id, data, len, offset) != 0)
+            return -1;
+        if (publish_response_cursor_cpu(conn, next_cursor) != 0)
+            return -1;
+    }
+
+    conn->peer_resp_write_cursor = next_cursor;
+    return 0;
 }
 
 int
@@ -296,66 +489,22 @@ main(int argc, char **argv)
                                          DEFAULT_IDLE_PAUSE_ITERS);
     int num_clients = parse_int_arg_range(argc, argv, "--num-clients", 1,
                                           1, MAX_CLIENTS);
-    int mq_entries = parse_int_arg_range(argc, argv, "--mq-entries",
-                                         DEFAULT_MQ_ENTRIES,
-                                         1, (int)METADATA_Q_ENTRIES);
-    int head_sync_threshold_default = mq_entries / 4;
-    int head_sync_threshold =
-        has_flag(argc, argv, "--head-sync-threshold")
-            ? parse_int_arg_range(argc, argv, "--head-sync-threshold",
-                                  head_sync_threshold_default,
-                                  0, mq_entries)
-            : head_sync_threshold_default;
-    int clients_per_dma_lane = parse_int_arg_range(argc, argv,
-                                                   "--clients-per-dma-lane",
-                                                   DEFAULT_CLIENTS_PER_DMA_LANE,
-                                                   1, MAX_CLIENTS);
-    cxl_request_rx_prefetch_mode_t prefetch_mode =
-        CXL_REQUEST_RX_PREFETCH_FULL;
-    rpc_message_profile_t message_profile = RPC_MESSAGE_PROFILE_FIXED;
     size_t response_size = DEFAULT_RESPONSE_SIZE;
-    size_t max_runtime_response_size = DEFAULT_RESPONSE_SIZE;
-    size_t response_dma_threshold =
-        (size_t)CXL_RESPONSE_DMA_PAYLOAD_THRESHOLD_DEFAULT;
+    response_mode_t response_mode = RESPONSE_MODE_CPU;
+
     if (parse_size_arg(argc, argv, "--response-size", DEFAULT_RESPONSE_SIZE,
                        MIN_RESPONSE_SIZE, MAX_RESPONSE_SIZE,
                        &response_size) != 0) {
         fprintf(stderr,
-                "server: invalid --response-size (range %uB..%zuB)\n",
+                "server-threshold: invalid --response-size (range %uB..%zuB)\n",
                 MIN_RESPONSE_SIZE, (size_t)MAX_RESPONSE_SIZE);
         return 1;
     }
-    if (parse_size_arg(argc, argv, "--response-dma-threshold",
-                       (size_t)CXL_RESPONSE_DMA_PAYLOAD_THRESHOLD_DEFAULT,
-                       1, (size_t)MAX_RESPONSE_SIZE,
-                       &response_dma_threshold) != 0) {
+    if (parse_response_mode_arg(argc, argv, &response_mode) != 0) {
         fprintf(stderr,
-                "server: invalid --response-dma-threshold (range 1B..%zuB)\n",
-                (size_t)MAX_RESPONSE_SIZE);
+                "server-threshold: invalid --response-mode "
+                "(use cpu|dma)\n");
         return 1;
-    }
-    if (parse_prefetch_mode_arg(argc, argv, &prefetch_mode) != 0) {
-        fprintf(stderr,
-                "server: invalid --prefetch-mode "
-                "(use full|no-request|none)\n");
-        return 1;
-    }
-    if (parse_message_profile_arg(argc, argv, &message_profile) != 0) {
-        fprintf(stderr,
-                "server: invalid --message-profile "
-                "(use fixed|google-rpc|twitter-twemcache)\n");
-        return 1;
-    }
-    if (rpc_message_profile_is_distribution(message_profile)) {
-        max_runtime_response_size =
-            rpc_message_profile_max_response_size(message_profile);
-        if (max_runtime_response_size < sizeof(add_response_t) ||
-            max_runtime_response_size > MAX_RESPONSE_SIZE) {
-            fprintf(stderr, "server: invalid profiled response capacity\n");
-            return 1;
-        }
-    } else {
-        max_runtime_response_size = response_size;
     }
 
     signal(SIGINT, signal_handler);
@@ -363,21 +512,18 @@ main(int argc, char **argv)
     setlinebuf(stdout);
     setvbuf(stderr, NULL, _IONBF, 0);
     rpc_markerf("init_begin",
-                "num_clients=%d,max_requests=%d,response_size=%zu,max_runtime_response_size=%zu,mq_entries=%d,head_sync_threshold=%d,response_dma_threshold=%zu,clients_per_dma_lane=%d,prefetch_mode=%s,message_profile=%s",
+                "num_clients=%d,max_requests=%d,response_size=%zu,response_mode=%s",
                 num_clients, max_requests, response_size,
-                max_runtime_response_size, mq_entries,
-                head_sync_threshold, response_dma_threshold,
-                clients_per_dma_lane,
-                request_rx_prefetch_mode_name(prefetch_mode),
-                rpc_message_profile_name(message_profile));
+                response_mode_name(response_mode));
 
     ctx = cxl_rpc_init(CXL_BASE, CXL_SIZE);
     if (!ctx) {
-        fprintf(stderr, "server: cxl_rpc_init failed\n");
+        fprintf(stderr, "server-threshold: cxl_rpc_init failed\n");
         rc = 1;
         goto cleanup;
     }
-    rpc_markerf("ctx_ready", "num_clients=%d", num_clients);
+    rpc_markerf("ctx_ready", "num_clients=%d,response_mode=%s",
+                num_clients, response_mode_name(response_mode));
 
     uint64_t server_base = SERVER_REGION_BASE;
     cxl_connection_addrs_t addrs = {
@@ -392,50 +538,30 @@ main(int argc, char **argv)
         .node_id = 0,
     };
 
-    rpc_markerf("poll_conn_begin", "mq_entries=%d", mq_entries);
-    poll_conn = cxl_connection_create_server_poll_owner(ctx, &addrs,
-                                                        (uint32_t)mq_entries);
+    rpc_markerf("poll_conn_begin", "mq_entries=%u", METADATA_Q_ENTRIES);
+    poll_conn = cxl_connection_create_server_poll_owner(ctx, &addrs, 1024);
     if (!poll_conn) {
-        fprintf(stderr, "server: connection_create_server_poll_owner failed\n");
+        fprintf(stderr,
+                "server-threshold: connection_create_server_poll_owner failed\n");
         rc = 1;
         goto cleanup;
     }
-    if (cxl_connection_set_head_sync_threshold(poll_conn,
-                                               (uint32_t)head_sync_threshold) < 0) {
-        fprintf(stderr, "server: set head sync threshold failed\n");
-        rc = 1;
-        goto cleanup;
-    }
-    if (cxl_connection_set_request_rx_prefetch_mode(poll_conn,
-                                                    prefetch_mode) < 0) {
-        fprintf(stderr, "server: set request-rx prefetch mode failed\n");
-        rc = 1;
-        goto cleanup;
-    }
-    rpc_markerf("poll_conn_ready",
-                "mq_entries=%d,head_sync_threshold=%d,prefetch_mode=%s",
-                mq_entries, head_sync_threshold,
-                request_rx_prefetch_mode_name(prefetch_mode));
+    rpc_markerf("poll_conn_ready", "mq_entries=%u", METADATA_Q_ENTRIES);
 
     for (int i = 0; i < num_clients; i++) {
         resp_conns[i] = cxl_connection_create_response_tx(ctx);
         if (!resp_conns[i]) {
-            fprintf(stderr, "server: create response-tx connection failed\n");
+            fprintf(stderr,
+                    "server-threshold: create response-tx connection failed\n");
             rc = 1;
             goto cleanup;
         }
 
-        if (cxl_connection_set_response_dma_threshold(resp_conns[i],
-                                                      response_dma_threshold) < 0) {
-            fprintf(stderr, "server: set response DMA threshold failed\n");
-            rc = 1;
-            goto cleanup;
-        }
-
-        if (max_runtime_response_size >= response_dma_threshold &&
+        if (response_mode == RESPONSE_MODE_DMA &&
             cxl_connection_bind_copyengine_lane_index(resp_conns[i],
-                                                      (size_t)(i / clients_per_dma_lane)) < 0) {
-            fprintf(stderr, "server: bind CopyEngine lane failed\n");
+                                                      (size_t)i) < 0) {
+            fprintf(stderr,
+                    "server-threshold: bind dedicated CopyEngine lane failed\n");
             rc = 1;
             goto cleanup;
         }
@@ -446,7 +572,8 @@ main(int argc, char **argv)
                                                   node_region_base(i) +
                                                       RESPONSE_DATA_OFFSET,
                                                   RESPONSE_DATA_BYTES) < 0) {
-            fprintf(stderr, "server: set peer response range failed\n");
+            fprintf(stderr,
+                    "server-threshold: set peer response range failed\n");
             rc = 1;
             goto cleanup;
         }
@@ -456,36 +583,37 @@ main(int argc, char **argv)
         if (cxl_connection_set_peer_response_flag_addr(resp_conns[i],
                                                        node_region_base(i) +
                                                            FLAG_OFFSET) < 0) {
-            fprintf(stderr, "server: set peer flag failed\n");
+            fprintf(stderr, "server-threshold: set peer flag failed\n");
             rc = 1;
             goto cleanup;
         }
         rpc_markerf("peer_flag_ready", "node=%d", i);
-
     }
 
     if (max_requests > 0) {
         timings = (server_request_timing_t *)calloc((size_t)max_requests,
                                                     sizeof(*timings));
         if (!timings) {
-            fprintf(stderr, "server: allocate timing buffer failed\n");
+            fprintf(stderr,
+                    "server-threshold: allocate timing buffer failed\n");
             rc = 1;
             goto cleanup;
         }
     }
 
-    if (max_runtime_response_size != sizeof(add_response_t)) {
-        resp_payload = (uint8_t *)calloc(1, max_runtime_response_size);
+    if (response_size != sizeof(add_response_t)) {
+        resp_payload = (uint8_t *)calloc(1, response_size);
         if (!resp_payload) {
-            fprintf(stderr, "server: allocate response buffer failed\n");
+            fprintf(stderr,
+                    "server-threshold: allocate response buffer failed\n");
             rc = 1;
             goto cleanup;
         }
     }
 
     printf("server_ready=1\n");
-    rpc_markerf("server_ready", "num_clients=%d,prefetch_mode=%s",
-                num_clients, request_rx_prefetch_mode_name(prefetch_mode));
+    rpc_markerf("server_ready", "num_clients=%d,response_mode=%s",
+                num_clients, response_mode_name(response_mode));
     poll_phase_start_tick = current_tick();
 
     while (keep_running) {
@@ -515,90 +643,58 @@ main(int argc, char **argv)
                 first_poll_marker_emitted = 1;
             }
             if (node_id >= (uint16_t)num_clients) {
-                fprintf(stderr, "server: invalid node_id=%u\n", node_id);
+                fprintf(stderr, "server-threshold: invalid node_id=%u\n", node_id);
                 rc = 1;
                 break;
             }
 
             if (req_len < sizeof(add_request_t) || !req_data_view) {
-                fprintf(stderr, "server: invalid request payload\n");
+                fprintf(stderr, "server-threshold: invalid request payload\n");
                 rc = 1;
                 break;
             }
 
-            uint32_t lhs = 0;
-            uint32_t rhs = 0;
-            size_t current_response_size = response_size;
-            if (rpc_message_profile_is_distribution(message_profile)) {
-                const volatile rpc_profiled_request_t *req_view =
-                    (const volatile rpc_profiled_request_t *)req_data_view;
-                size_t expected_req_size = 0;
-                if (req_len < sizeof(*req_view)) {
-                    fprintf(stderr,
-                            "server: profiled request shorter than header\n");
-                    rc = 1;
-                    break;
-                }
-                if (rpc_message_profile_sample_sizes(message_profile,
-                                                     node_id,
-                                                     req_view->op_index,
-                                                     &expected_req_size,
-                                                     &current_response_size) != 0) {
-                    fprintf(stderr, "server: sample request profile failed\n");
-                    rc = 1;
-                    break;
-                }
-                if (req_len != expected_req_size) {
-                    fprintf(stderr,
-                            "server: profiled request size mismatch expect=%zu got=%zu node=%u op=%u\n",
-                            expected_req_size, req_len,
-                            (unsigned)node_id, (unsigned)req_view->op_index);
-                    rc = 1;
-                    break;
-                }
-                lhs = req_view->lhs;
-                rhs = req_view->rhs;
-            } else {
-                const volatile add_request_t *req_view =
-                    (const volatile add_request_t *)req_data_view;
-                lhs = req_view->lhs;
-                rhs = req_view->rhs;
-            }
+            const volatile add_request_t *req_view =
+                (const volatile add_request_t *)req_data_view;
             add_response_t add_resp = {
-                .sum = (uint64_t)lhs + (uint64_t)rhs,
+                .sum = (uint64_t)req_view->lhs + (uint64_t)req_view->rhs,
             };
             const void *resp_data = (const void *)&add_resp;
-            if (current_response_size > sizeof(add_response_t)) {
+            if (resp_payload) {
                 memcpy(resp_payload, &add_resp, sizeof(add_resp));
                 resp_data = (const void *)resp_payload;
             }
             exec_end_tick = current_tick();
 
-            if (cxl_send_response(resp_conns[node_id], rpc_id,
-                                  resp_data, current_response_size) < 0) {
-                fprintf(stderr, "server: send response failed\n");
+            if (send_response_fixed_mode(resp_conns[node_id], response_mode,
+                                         rpc_id, resp_data, response_size) < 0) {
+                fprintf(stderr, "server-threshold: send response failed\n");
                 rc = 1;
                 break;
             }
             resp_end_tick = current_tick();
             if (!first_resp_marker_emitted) {
                 rpc_markerf("first_response_submitted",
-                            "node=%u,rpc_id=%u,response_size=%zu",
-                            (unsigned)node_id, (unsigned)rpc_id,
-                            current_response_size);
+                            "node=%u,rpc_id=%u,response_size=%zu,response_mode=%s",
+                            (unsigned)node_id, (unsigned)rpc_id, response_size,
+                            response_mode_name(response_mode));
                 first_resp_marker_emitted = 1;
             }
             if (timings &&
                 requests_processed < (uint64_t)max_requests) {
                 server_request_timing_t *record =
                     &timings[requests_processed];
-                record->poll_tick =
-                    (poll_done_tick >= poll_phase_start_tick) ?
-                    (poll_done_tick - poll_phase_start_tick) : 0;
-                record->execute_tick =
+                record->node_id = node_id;
+                record->poll_notify_tick =
+                    (poll_timing.notify_ready_tick >= poll_phase_start_tick) ?
+                    (poll_timing.notify_ready_tick - poll_phase_start_tick) : 0;
+                record->poll_req_data_tick =
+                    (poll_done_tick >= poll_timing.notify_ready_tick) ?
+                    (poll_done_tick - poll_timing.notify_ready_tick) : 0;
+                record->exec_tick =
                     (exec_end_tick >= poll_done_tick) ?
                     (exec_end_tick - poll_done_tick) : 0;
-                record->response_tick =
+                record->resp_submit_tick =
                     (resp_end_tick >= exec_end_tick) ?
                     (resp_end_tick - exec_end_tick) : 0;
             }
@@ -612,7 +708,7 @@ main(int argc, char **argv)
             for (int i = 0; i < idle_pause_iters && keep_running; i++)
                 __asm__ __volatile__("pause" ::: "memory");
         } else {
-            fprintf(stderr, "server: poll request failed\n");
+            fprintf(stderr, "server-threshold: poll request failed\n");
             rc = 1;
             break;
         }
@@ -624,12 +720,16 @@ cleanup:
              i < requests_processed && i < (uint64_t)max_requests;
              i++) {
             const server_request_timing_t *record = &timings[i];
-            printf("server_req_%lu_poll_tick=%lu\n",
-                   (unsigned long)i, record->poll_tick);
-            printf("server_req_%lu_execute_tick=%lu\n",
-                   (unsigned long)i, record->execute_tick);
-            printf("server_req_%lu_response_tick=%lu\n",
-                   (unsigned long)i, record->response_tick);
+            printf("server_req_%lu_node_id=%u\n",
+                   (unsigned long)i, (unsigned)record->node_id);
+            printf("server_req_%lu_poll_notify_tick=%lu\n",
+                   (unsigned long)i, record->poll_notify_tick);
+            printf("server_req_%lu_poll_req_data_tick=%lu\n",
+                   (unsigned long)i, record->poll_req_data_tick);
+            printf("server_req_%lu_exec_tick=%lu\n",
+                   (unsigned long)i, record->exec_tick);
+            printf("server_req_%lu_resp_submit_tick=%lu\n",
+                   (unsigned long)i, record->resp_submit_tick);
         }
     }
     fflush(stdout);

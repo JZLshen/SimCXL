@@ -3,7 +3,8 @@
  *
  * Server-side fixed policy for syncing metadata queue head to the
  * CXLRPCEngine controller via HEAD_UPDATE doorbell writes.
- * Current policy: sync every N/4 processed entries.
+ * Default policy: sync every N/4 processed entries, with an optional runtime
+ * threshold override.
  */
 
 #ifndef CXL_SYNC_H
@@ -18,6 +19,7 @@ extern "C" {
 /* Sync configuration */
 typedef struct {
     uint32_t queue_size_n;          /* N: metadata queue size in entries */
+    uint32_t threshold;             /* 0 uses the default N/4 policy */
 } cxl_sync_config_t;
 
 /* Opaque sync state */
@@ -32,6 +34,19 @@ typedef struct cxl_adaptive_sync cxl_adaptive_sync_t;
  */
 cxl_adaptive_sync_t *cxl_sync_init(const cxl_sync_config_t *config,
                                     volatile void *doorbell_addr);
+
+/**
+ * Override the current HEAD_UPDATE threshold.
+ *
+ * `threshold = 0` resets the policy back to the default `N/4` value derived
+ * from `queue_size_n`.
+ */
+void cxl_sync_set_threshold(cxl_adaptive_sync_t *sync, uint32_t threshold);
+
+/**
+ * Read the current HEAD_UPDATE threshold.
+ */
+uint32_t cxl_sync_get_threshold(const cxl_adaptive_sync_t *sync);
 
 /**
  * Destroy adaptive sync tracker and free memory.

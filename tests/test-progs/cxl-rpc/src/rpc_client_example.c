@@ -9,16 +9,13 @@
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/file.h>
-#include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
 
 #if defined(__has_include)
@@ -37,36 +34,27 @@
 
 #include "cxl_rpc.h"
 #include "cxl_rpc_layout.h"
+#include "rpc_message_profile.h"
 
 #define DEFAULT_NUM_REQUESTS 20
 #define DEFAULT_MAX_POLLS 1000000
 #define DEFAULT_POLL_PAUSE_ITERS 0
 #define DEFAULT_REQUEST_SIZE 64
 #define DEFAULT_RESPONSE_SIZE 16
-#define DEFAULT_FIRST_COMPLETION_BARRIER_TIMEOUT_MS 0
 #define MIN_REQUEST_SIZE 8
 #define MIN_RESPONSE_SIZE 8
 #define MAX_REQUEST_SIZE (256u * 1024u)
 #define MAX_RESPONSE_SIZE (RESPONSE_DATA_BYTES - 8ULL)
 #define CLIENT_RPC_ID_MAX 32767u
 #define CLIENT_RPC_ID_SPACE (CLIENT_RPC_ID_MAX + 1u)
-#define FIXED_SLIDING_WINDOW 16
+#define DEFAULT_SLIDING_WINDOW 16
+#define DEFAULT_SLOW_CLIENT_COUNT 0
+#define DEFAULT_SLOW_CLIENT_SEND_PAUSE_ITERS 0
 
 typedef struct __attribute__((packed)) {
     uint32_t lhs;
     uint32_t rhs;
 } add_request_t;
-
-#define FIRST_COMPLETION_BARRIER_MAGIC 0x46434231u
-#define FIRST_COMPLETION_BARRIER_WORDS (((MAX_CLIENTS) + 63) / 64)
-
-typedef struct {
-    uint32_t magic;
-    uint32_t num_clients;
-    uint32_t bitmap_words;
-    uint32_t reserved0;
-    uint64_t arrived_bitmap[FIRST_COMPLETION_BARRIER_WORDS];
-} first_completion_barrier_state_t;
 
 static volatile int keep_running = 1;
 
@@ -108,81 +96,6 @@ rpc_markerf(const char *phase, const char *fmt, ...)
         va_end(ap);
     }
     fputc('\n', stderr);
-}
-
-static inline size_t
-first_completion_barrier_active_words(int num_clients)
-{
-    return (size_t)((num_clients + 63) / 64);
-}
-
-static inline uint64_t
-first_completion_barrier_full_mask_for_word(int num_clients, size_t word_index)
-{
-    int remaining = num_clients - (int)(word_index * 64u);
-    if (remaining >= 64)
-        return UINT64_MAX;
-    if (remaining <= 0)
-        return 0;
-    return (1ULL << remaining) - 1ULL;
-}
-
-static void
-first_completion_barrier_reset(first_completion_barrier_state_t *state,
-                               int num_clients)
-{
-    if (!state)
-        return;
-
-    state->magic = FIRST_COMPLETION_BARRIER_MAGIC;
-    state->num_clients = (uint32_t)num_clients;
-    state->bitmap_words = (uint32_t)FIRST_COMPLETION_BARRIER_WORDS;
-    state->reserved0 = 0;
-    memset(state->arrived_bitmap, 0, sizeof(state->arrived_bitmap));
-}
-
-static int
-first_completion_barrier_is_complete(
-    const first_completion_barrier_state_t *state,
-    int num_clients)
-{
-    size_t words = first_completion_barrier_active_words(num_clients);
-
-    if (!state)
-        return 0;
-
-    for (size_t i = 0; i < words; i++) {
-        uint64_t full_mask =
-            first_completion_barrier_full_mask_for_word(num_clients, i);
-        uint64_t arrived =
-            __atomic_load_n(&state->arrived_bitmap[i], __ATOMIC_ACQUIRE);
-        if ((arrived & full_mask) != full_mask)
-            return 0;
-    }
-
-    return 1;
-}
-
-static size_t
-first_completion_barrier_count_arrived(
-    const first_completion_barrier_state_t *state,
-    int num_clients)
-{
-    size_t words = first_completion_barrier_active_words(num_clients);
-    size_t arrived_count = 0;
-
-    if (!state)
-        return 0;
-
-    for (size_t i = 0; i < words; i++) {
-        uint64_t full_mask =
-            first_completion_barrier_full_mask_for_word(num_clients, i);
-        uint64_t arrived =
-            __atomic_load_n(&state->arrived_bitmap[i], __ATOMIC_ACQUIRE);
-        arrived_count += (size_t)__builtin_popcountll(arrived & full_mask);
-    }
-
-    return arrived_count;
 }
 
 static inline uint32_t
@@ -235,6 +148,30 @@ parse_int_arg_range(int argc, char **argv, const char *flag, int default_val,
         }
     }
     return default_val;
+}
+
+static int
+parse_required_int_arg_range(int argc, char **argv, const char *flag,
+                             int default_val, int min_val, int max_val,
+                             int *out)
+{
+    if (!out)
+        return -1;
+
+    *out = default_val;
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], flag) == 0) {
+            char *end = NULL;
+            long v = strtol(argv[i + 1], &end, 0);
+            if (end && *end == '\0' && v >= min_val && v <= max_val) {
+                *out = (int)v;
+                return 0;
+            }
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
 static int
@@ -300,6 +237,22 @@ parse_size_arg(int argc, char **argv, const char *flag, size_t default_val,
     return 0;
 }
 
+static int
+parse_message_profile_arg(int argc, char **argv,
+                          rpc_message_profile_t *out_profile)
+{
+    if (!out_profile)
+        return -1;
+
+    *out_profile = RPC_MESSAGE_PROFILE_FIXED;
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "--message-profile") != 0)
+            continue;
+        return rpc_message_profile_parse(argv[i + 1], out_profile);
+    }
+    return 0;
+}
+
 static inline uint64_t
 node_region_base(int node_id)
 {
@@ -314,179 +267,64 @@ spin_pause_iters(int poll_pause_iters)
         __asm__ __volatile__("pause" ::: "memory");
 }
 
-static uint64_t
-monotonic_time_ms(void)
-{
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-        return 0;
-    return (uint64_t)ts.tv_sec * 1000ULL +
-           (uint64_t)ts.tv_nsec / 1000000ULL;
-}
-
-static uint64_t
-parse_env_u64_or_default(const char *name, uint64_t default_val)
-{
-    const char *val = getenv(name);
-    if (!val || *val == '\0')
-        return default_val;
-
-    char *end = NULL;
-    unsigned long long parsed = strtoull(val, &end, 10);
-    if (!end || *end != '\0')
-        return default_val;
-
-    return (uint64_t)parsed;
-}
-
-static int
-build_first_completion_barrier_path(char *buf, size_t buf_len, int num_clients)
-{
-    if (!buf || buf_len == 0)
-        return -1;
-
-    const char *env_path = getenv("CXL_RPC_FIRST_COMPLETION_BARRIER_PATH");
-    if (env_path && *env_path != '\0') {
-        int n = snprintf(buf, buf_len, "%s", env_path);
-        return (n > 0 && (size_t)n < buf_len) ? 0 : -1;
-    }
-
-    pid_t sid = getsid(0);
-    if (sid < 0)
-        sid = 0;
-
-    int n = snprintf(buf, buf_len,
-                     "/tmp/cxl_rpc_first_completion_barrier_s%ld_c%d",
-                     (long)sid, num_clients);
-    return (n > 0 && (size_t)n < buf_len) ? 0 : -1;
-}
-
-static int
-wait_all_clients_first_completion(int num_clients, int node_id)
-{
-    if (num_clients <= 1)
-        return 0;
-    if (num_clients > MAX_CLIENTS || node_id < 0 || node_id >= num_clients) {
-        fprintf(stderr, "client: invalid first-completion barrier arguments\n");
-        return -1;
-    }
-
-    char barrier_path[256];
-    if (build_first_completion_barrier_path(barrier_path, sizeof(barrier_path),
-                                            num_clients) != 0) {
-        fprintf(stderr, "client: build first-completion barrier path failed\n");
-        return -1;
-    }
-
-    int fd = open(barrier_path, O_RDWR | O_CREAT, 0666);
-    if (fd < 0) {
-        fprintf(stderr,
-                "client: open first-completion barrier failed path=%s errno=%d\n",
-                barrier_path, errno);
-        return -1;
-    }
-
-    if (ftruncate(fd, (off_t)sizeof(first_completion_barrier_state_t)) != 0) {
-        fprintf(stderr, "client: ftruncate first-completion barrier failed\n");
-        close(fd);
-        return -1;
-    }
-
-    first_completion_barrier_state_t *state =
-        (first_completion_barrier_state_t *)mmap(
-            NULL,
-            sizeof(first_completion_barrier_state_t),
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED, fd, 0);
-    if (state == MAP_FAILED) {
-        fprintf(stderr, "client: mmap first-completion barrier failed\n");
-        close(fd);
-        return -1;
-    }
-
-    size_t my_word_index = (size_t)node_id / 64u;
-    uint64_t my_bit = 1ULL << (node_id % 64);
-
-    if (flock(fd, LOCK_EX) != 0) {
-        fprintf(stderr, "client: flock first-completion barrier failed\n");
-        munmap(state, sizeof(first_completion_barrier_state_t));
-        close(fd);
-        return -1;
-    }
-
-    if (state->magic != FIRST_COMPLETION_BARRIER_MAGIC ||
-        state->num_clients != (uint32_t)num_clients ||
-        state->bitmap_words != (uint32_t)FIRST_COMPLETION_BARRIER_WORDS ||
-        first_completion_barrier_is_complete(state, num_clients)) {
-        first_completion_barrier_reset(state, num_clients);
-    }
-
-    state->arrived_bitmap[my_word_index] |= my_bit;
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-
-    if (flock(fd, LOCK_UN) != 0) {
-        fprintf(stderr, "client: unlock first-completion barrier failed\n");
-        munmap(state, sizeof(first_completion_barrier_state_t));
-        close(fd);
-        return -1;
-    }
-
-    uint64_t timeout_ms = parse_env_u64_or_default(
-        "CXL_RPC_FIRST_COMPLETION_BARRIER_TIMEOUT_MS",
-        DEFAULT_FIRST_COMPLETION_BARRIER_TIMEOUT_MS);
-    uint64_t start_ms = monotonic_time_ms();
-
-    while (keep_running) {
-        if (first_completion_barrier_is_complete(state, num_clients))
-            break;
-
-        if (timeout_ms > 0) {
-            uint64_t now_ms = monotonic_time_ms();
-            if (now_ms >= start_ms && (now_ms - start_ms) >= timeout_ms) {
-                size_t arrived_clients =
-                    first_completion_barrier_count_arrived(state, num_clients);
-                fprintf(stderr,
-                        "client: first-completion barrier timeout path=%s "
-                        "arrived=%zu/%d\n",
-                        barrier_path, arrived_clients, num_clients);
-                munmap(state, sizeof(first_completion_barrier_state_t));
-                close(fd);
-                return -1;
-            }
-        }
-        spin_pause_iters(64);
-    }
-
-    munmap(state, sizeof(first_completion_barrier_state_t));
-    close(fd);
-    return keep_running ? 0 : -1;
-}
-
 static int
 send_one_request(cxl_connection_t *conn,
+                 int node_id,
                  uint8_t *req_payload,
-                 size_t request_size,
+                 size_t fixed_request_size,
+                 size_t fixed_response_size,
+                 rpc_message_profile_t message_profile,
                  uint32_t *rng_state,
                  int *rpc_id_to_request_index,
+                 size_t *request_expected_response_sizes,
                  uint64_t *request_start_ticks,
                  int sent_requests)
 {
     if (!conn || !req_payload || !rng_state ||
-        !rpc_id_to_request_index || !request_start_ticks ||
+        !rpc_id_to_request_index || !request_expected_response_sizes ||
+        !request_start_ticks ||
         sent_requests < 0) {
         return -1;
     }
 
-    add_request_t add_req = {
-        .lhs = next_random_u32(rng_state),
-        .rhs = next_random_u32(rng_state),
-    };
+    size_t request_size = fixed_request_size;
+    size_t expected_response_size = fixed_response_size;
+    const uint32_t lhs = next_random_u32(rng_state);
+    const uint32_t rhs = next_random_u32(rng_state);
+
+    if (rpc_message_profile_is_distribution(message_profile)) {
+        rpc_profiled_request_t profiled_req = {
+            .lhs = lhs,
+            .rhs = rhs,
+            .op_index = (uint32_t)sent_requests,
+        };
+        if (rpc_message_profile_sample_sizes(message_profile,
+                                             (uint16_t)node_id,
+                                             (uint32_t)sent_requests,
+                                             &request_size,
+                                             &expected_response_size) != 0) {
+            fprintf(stderr, "client: sample request profile failed\n");
+            return -1;
+        }
+        if (request_size < sizeof(profiled_req)) {
+            fprintf(stderr,
+                    "client: profiled request size too small size=%zu hdr=%zu\n",
+                    request_size, sizeof(profiled_req));
+            return -1;
+        }
+        memcpy(req_payload, &profiled_req, sizeof(profiled_req));
+    } else {
+        add_request_t add_req = {
+            .lhs = lhs,
+            .rhs = rhs,
+        };
+        memcpy(req_payload, &add_req, sizeof(add_req));
+    }
     /*
      * Only the semantic request header is refreshed per send. The rest of the
      * buffer stays zero-initialized so transport/copy length still matches the
      * configured request size without adding synthetic padding work here.
      */
-    memcpy(req_payload, &add_req, sizeof(add_req));
 
     uint64_t start_tick = current_tick();
     int rpc_id = cxl_send_request(conn, req_payload, request_size);
@@ -501,6 +339,7 @@ send_one_request(cxl_connection_t *conn,
     }
 
     rpc_id_to_request_index[rpc_id] = sent_requests;
+    request_expected_response_sizes[sent_requests] = expected_response_size;
     request_start_ticks[sent_requests] = start_tick;
     return rpc_id;
 }
@@ -508,14 +347,14 @@ send_one_request(cxl_connection_t *conn,
 static int
 drain_completed_responses(cxl_connection_t *conn,
                           int node_id,
-                          size_t expected_response_size,
                           int *rpc_id_to_request_index,
+                          size_t *request_expected_response_sizes,
                           uint64_t *request_end_ticks,
                           int *completed_requests,
                           int *first_response_marker_emitted)
 {
-    if (!conn || expected_response_size == 0 ||
-        !rpc_id_to_request_index ||
+    if (!conn || !rpc_id_to_request_index ||
+        !request_expected_response_sizes ||
         !request_end_ticks || !completed_requests) {
         return -1;
     }
@@ -538,6 +377,21 @@ drain_completed_responses(cxl_connection_t *conn,
             break;
         }
 
+        if ((unsigned int)consumed_rpc_id > CLIENT_RPC_ID_MAX) {
+            fprintf(stderr, "client: invalid consumed rpc_id=%u\n",
+                    (unsigned)consumed_rpc_id);
+            return -1;
+        }
+
+        int idx = rpc_id_to_request_index[consumed_rpc_id];
+        if (idx < 0 || request_end_ticks[idx] != UINT64_MAX) {
+            fprintf(stderr, "client: unmatched or duplicate response rpc_id=%u\n",
+                    (unsigned)consumed_rpc_id);
+            return -1;
+        }
+
+        size_t expected_response_size = request_expected_response_sizes[idx];
+
         if (response_len != expected_response_size) {
             fprintf(stderr,
                     "client: response size mismatch expect=%zu got=%zu\n",
@@ -558,19 +412,6 @@ drain_completed_responses(cxl_connection_t *conn,
                                       consumed_rpc_id,
                                       response_len) != 1) {
             fprintf(stderr, "client: cxl_advance_response_head failed\n");
-            return -1;
-        }
-
-        if ((unsigned int)consumed_rpc_id > CLIENT_RPC_ID_MAX) {
-            fprintf(stderr, "client: invalid consumed rpc_id=%u\n",
-                    (unsigned)consumed_rpc_id);
-            return -1;
-        }
-
-        int idx = rpc_id_to_request_index[consumed_rpc_id];
-        if (idx < 0 || request_end_ticks[idx] != UINT64_MAX) {
-            fprintf(stderr, "client: unmatched or duplicate response rpc_id=%u\n",
-                    (unsigned)consumed_rpc_id);
             return -1;
         }
         request_end_ticks[idx] = current_tick();
@@ -610,21 +451,64 @@ main(int argc, char **argv)
     int *rpc_id_to_request_index = NULL;
     uint64_t *request_start_ticks = NULL;
     uint64_t *request_end_ticks = NULL;
+    size_t *request_expected_response_sizes = NULL;
     uint8_t *req_payload = NULL;
 
     int num_requests = parse_int_arg(argc, argv, "--requests",
                                      DEFAULT_NUM_REQUESTS);
     int poll_pause_iters = parse_nonneg_int_arg(argc, argv, "--poll-pause",
                                                 DEFAULT_POLL_PAUSE_ITERS);
+    int sliding_window = DEFAULT_SLIDING_WINDOW;
     int num_clients = parse_int_arg_range(argc, argv, "--num-clients", 1,
                                           1, MAX_CLIENTS);
     int node_id = parse_int_arg_range(argc, argv, "--node-id", 0,
                                       0, MAX_CLIENTS - 1);
+    int slow_client_count = DEFAULT_SLOW_CLIENT_COUNT;
+    int slow_client_send_pause_iters = DEFAULT_SLOW_CLIENT_SEND_PAUSE_ITERS;
+
+    if (parse_required_int_arg_range(argc, argv, "--window",
+                                     DEFAULT_SLIDING_WINDOW,
+                                     1, (int)CLIENT_RPC_ID_MAX,
+                                     &sliding_window) != 0) {
+        fprintf(stderr,
+                "client: invalid --window (range 1..%u)\n",
+                CLIENT_RPC_ID_MAX);
+        return 1;
+    }
+
+    if (parse_required_int_arg_range(argc, argv, "--slow-client-count",
+                                     DEFAULT_SLOW_CLIENT_COUNT,
+                                     0, MAX_CLIENTS,
+                                     &slow_client_count) != 0) {
+        fprintf(stderr,
+                "client: invalid --slow-client-count (range 0..%d)\n",
+                MAX_CLIENTS);
+        return 1;
+    }
+
+    if (parse_required_int_arg_range(argc, argv,
+                                     "--slow-client-send-pause-iters",
+                                     DEFAULT_SLOW_CLIENT_SEND_PAUSE_ITERS,
+                                     0, INT_MAX,
+                                     &slow_client_send_pause_iters) != 0) {
+        fprintf(stderr,
+                "client: invalid --slow-client-send-pause-iters "
+                "(range 0..%d)\n",
+                INT_MAX);
+        return 1;
+    }
 
     if (node_id >= num_clients) {
         fprintf(stderr,
                 "client: node_id=%d must be < num_clients=%d\n",
                 node_id, num_clients);
+        return 1;
+    }
+
+    if (slow_client_count > num_clients) {
+        fprintf(stderr,
+                "client: slow_client_count=%d must be <= num_clients=%d\n",
+                slow_client_count, num_clients);
         return 1;
     }
 
@@ -646,13 +530,39 @@ main(int argc, char **argv)
         return 1;
     }
 
+    rpc_message_profile_t message_profile = RPC_MESSAGE_PROFILE_FIXED;
+    if (parse_message_profile_arg(argc, argv, &message_profile) != 0) {
+        fprintf(stderr,
+                "client: invalid --message-profile "
+                "(use fixed|google-rpc|twitter-twemcache)\n");
+        return 1;
+    }
+
+    size_t request_payload_capacity = request_size;
+    if (rpc_message_profile_is_distribution(message_profile)) {
+        request_payload_capacity =
+            rpc_message_profile_max_request_size(message_profile);
+        if (request_payload_capacity < sizeof(rpc_profiled_request_t) ||
+            request_payload_capacity > MAX_REQUEST_SIZE) {
+            fprintf(stderr, "client: invalid profiled request capacity\n");
+            return 1;
+        }
+    }
+
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     setlinebuf(stdout);
     setvbuf(stderr, NULL, _IONBF, 0);
+    const int is_slow_client =
+        (slow_client_count > 0 && node_id < slow_client_count);
+    const int send_pause_iters =
+        is_slow_client ? slow_client_send_pause_iters : 0;
     rpc_markerf("init_begin",
-                "node=%d,num_clients=%d,requests=%d,request_size=%zu,response_size=%zu",
-                node_id, num_clients, num_requests, request_size, response_size);
+                "node=%d,num_clients=%d,requests=%d,request_size=%zu,response_size=%zu,request_payload_capacity=%zu,window=%d,slow_client_count=%d,is_slow_client=%d,slow_client_send_pause_iters=%d,message_profile=%s",
+                node_id, num_clients, num_requests, request_size, response_size,
+                request_payload_capacity,
+                sliding_window, slow_client_count, is_slow_client,
+                send_pause_iters, rpc_message_profile_name(message_profile));
 
     ctx = cxl_rpc_init(CXL_BASE, CXL_SIZE);
     if (!ctx) {
@@ -690,11 +600,13 @@ main(int argc, char **argv)
     size_t reserve_n = (num_requests > 0) ? (size_t)num_requests : 1;
     request_start_ticks = (uint64_t *)calloc(reserve_n, sizeof(uint64_t));
     request_end_ticks = (uint64_t *)calloc(reserve_n, sizeof(uint64_t));
+    request_expected_response_sizes =
+        (size_t *)calloc(reserve_n, sizeof(*request_expected_response_sizes));
     rpc_id_to_request_index =
         (int *)malloc((size_t)CLIENT_RPC_ID_SPACE *
                       sizeof(*rpc_id_to_request_index));
     if (!request_start_ticks || !request_end_ticks ||
-        !rpc_id_to_request_index) {
+        !request_expected_response_sizes || !rpc_id_to_request_index) {
         fprintf(stderr, "client: allocate tick buffers failed\n");
         rc = 1;
         goto cleanup;
@@ -703,7 +615,7 @@ main(int argc, char **argv)
     for (size_t i = 0; i < (size_t)CLIENT_RPC_ID_SPACE; i++)
         rpc_id_to_request_index[i] = -1;
 
-    req_payload = (uint8_t *)calloc(1, request_size);
+    req_payload = (uint8_t *)calloc(1, request_payload_capacity);
     if (!req_payload) {
         fprintf(stderr, "client: allocate request payload failed\n");
         rc = 1;
@@ -718,9 +630,14 @@ main(int argc, char **argv)
 
     if (keep_running && num_requests > 0) {
         int first_req_id = send_one_request(conn,
-                                            req_payload, request_size,
+                                            node_id,
+                                            req_payload,
+                                            request_size,
+                                            response_size,
+                                            message_profile,
                                             &rng_state,
                                             rpc_id_to_request_index,
+                                            request_expected_response_sizes,
                                             request_start_ticks,
                                             sent_requests);
         if (first_req_id <= 0) {
@@ -734,8 +651,8 @@ main(int argc, char **argv)
         for (;;) {
             int round_rc = drain_completed_responses(conn,
                                                      node_id,
-                                                     response_size,
                                                      rpc_id_to_request_index,
+                                                     request_expected_response_sizes,
                                                      request_end_ticks,
                                                      &completed_requests,
                                                      &first_response_marker_emitted);
@@ -748,27 +665,29 @@ main(int argc, char **argv)
             spin_pause_iters(poll_pause_iters);
         }
 
-        rpc_markerf("first_completion_barrier_wait", "node=%d,num_clients=%d",
-                    node_id, num_clients);
-        if (wait_all_clients_first_completion(num_clients, node_id) != 0) {
-            fprintf(stderr, "client: first-completion barrier failed\n");
-            rc = 1;
-            goto cleanup;
-        }
-        rpc_markerf("first_completion_barrier_done", "node=%d,num_clients=%d",
-                    node_id, num_clients);
     }
 
     while (keep_running && rc == 0 && completed_requests < num_requests) {
         int inflight = sent_requests - completed_requests;
         int can_send = (sent_requests < num_requests);
-        int should_poll = (inflight >= FIXED_SLIDING_WINDOW) || !can_send;
+        int should_poll = (inflight >= sliding_window) || !can_send;
 
         if (can_send && !should_poll) {
+            /*
+             * Sparse-request experiments model slower clients by inserting
+             * extra application-side think time before each subsequent send.
+             */
+            if (send_pause_iters > 0)
+                spin_pause_iters(send_pause_iters);
             int req_id = send_one_request(conn,
-                                          req_payload, request_size,
+                                          node_id,
+                                          req_payload,
+                                          request_size,
+                                          response_size,
+                                          message_profile,
                                           &rng_state,
                                           rpc_id_to_request_index,
+                                          request_expected_response_sizes,
                                           request_start_ticks,
                                           sent_requests);
             if (req_id <= 0) {
@@ -781,8 +700,8 @@ main(int argc, char **argv)
 
         int round_rc = drain_completed_responses(conn,
                                                  node_id,
-                                                 response_size,
                                                  rpc_id_to_request_index,
+                                                 request_expected_response_sizes,
                                                  request_end_ticks,
                                                  &completed_requests,
                                                  &first_response_marker_emitted);
@@ -819,6 +738,7 @@ cleanup:
 
     free(request_start_ticks);
     free(request_end_ticks);
+    free(request_expected_response_sizes);
     free(rpc_id_to_request_index);
     free(req_payload);
 

@@ -4,7 +4,7 @@ CC = gcc
 CFLAGS = -O2 -Wall -static -g -I../lib/libcxlrpc/include -I../../../include
 LIBCXLRPC = ../lib/libcxlrpc/libcxlrpc.a
 M5_LIB = ../../../util/m5/build/x86/out/libm5.a
-LIBS = -lnuma $(M5_LIB)
+LIBS = -lnuma -lm $(M5_LIB)
 # Keep libcxlrpc's own include path/flags local to its directory so top-level
 # CFLAGS overrides for this Makefile don't leak into the sub-build.
 LIBCXLRPC_CFLAGS ?= -O2 -Wall -Wextra -I./include -I../../../../include
@@ -12,11 +12,17 @@ CE_SANITY_LIBCXLRPC_CFLAGS = $(LIBCXLRPC_CFLAGS) -DCXL_RPC_TEST_FORCE_COPYENGINE
 
 TARGETS = rpc_client_example \
           rpc_server_example \
+          rpc_mica_client \
+          rpc_mica_server \
           cxl_mem_ldst_latency \
           cxl_mem_paper_latency \
           cxl_mem_copy_cmp \
           cxl_copyengine_bw \
           cpu_memmove_bw
+
+ifneq ($(CXL_RPC_INCLUDE_THRESHOLD_SERVER),)
+TARGETS += rpc_server_threshold_mode
+endif
 
 ifneq ($(CXL_RPC_INCLUDE_CE_SANITY),)
 TARGETS += cxl_copyengine_sanity
@@ -26,17 +32,24 @@ LEGACY_CLEAN_PATTERNS = cxl_rpc_benchmark \
 	                        cxl_rpc_send_poll_threads \
 	                        cxl_rpc_poll_* \
 	                        cxl_rpc_send_response_* \
-	                        cxl_rpc_store_pair
+	                        cxl_rpc_store_pair \
+	                        rpc_server_threshold_mode
 
 all: libcxlrpc $(TARGETS)
 
 libcxlrpc:
 	$(MAKE) -C ../lib/libcxlrpc all CFLAGS="$(LIBCXLRPC_CFLAGS)"
 
-rpc_client_example: src/rpc_client_example.c libcxlrpc
+rpc_client_example: src/rpc_client_example.c src/rpc_message_profile.h libcxlrpc
 	$(CC) $(CFLAGS) -o $@ $< $(LIBCXLRPC) $(LIBS)
-rpc_server_example: src/rpc_server_example.c libcxlrpc
+rpc_server_example: src/rpc_server_example.c src/rpc_message_profile.h libcxlrpc
 	$(CC) $(CFLAGS) -o $@ $< $(LIBCXLRPC) $(LIBS)
+rpc_mica_client: src/rpc_mica_client.c src/rpc_mica_common.h libcxlrpc
+	$(CC) $(CFLAGS) -o $@ src/rpc_mica_client.c $(LIBCXLRPC) $(LIBS)
+rpc_mica_server: src/rpc_mica_server.c src/rpc_mica_common.h libcxlrpc
+	$(CC) $(CFLAGS) -o $@ src/rpc_mica_server.c $(LIBCXLRPC) $(LIBS)
+rpc_server_threshold_mode: src/rpc_server_threshold_mode.c libcxlrpc
+	$(CC) $(CFLAGS) -I../lib/libcxlrpc/src -o $@ $< $(LIBCXLRPC) $(LIBS)
 
 cxl_mem_ldst_latency: src/cxl_mem_ldst_latency.c libcxlrpc
 	$(CC) $(CFLAGS) -o $@ $< $(LIBCXLRPC) $(LIBS)

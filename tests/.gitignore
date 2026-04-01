@@ -8,6 +8,10 @@ gem5/resources
 # cxl-rpc test binaries.
 test-progs/cxl-rpc/rpc_client_example
 test-progs/cxl-rpc/rpc_server_example
+test-progs/cxl-rpc/rpc_mica_client
+test-progs/cxl-rpc/rpc_mica_server
 test-progs/cxl-rpc/cxl_mem_ldst_latency
 test-progs/cxl-rpc/cxl_mem_paper_latency
 test-progs/cxl-rpc/cxl_mem_copy_cmp
+test-progs/cxl-rpc/cxl_copyengine_bw
+test-progs/cxl-rpc/cxl_copyengine_sanity

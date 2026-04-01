@@ -50,6 +50,7 @@ extern "C" {
  */
 /* Metadata queue entry size: 16B (4 entries per 64B cacheline). */
 #define CXL_METADATA_ENTRY_SIZE 16
+#define CXL_RESPONSE_DMA_PAYLOAD_THRESHOLD_DEFAULT 256u
 
 /* ================================================================
  * Context Management
@@ -107,6 +108,12 @@ typedef struct {
     uint64_t poll_done_tick;
 } cxl_request_poll_timing_t;
 
+typedef enum {
+    CXL_REQUEST_RX_PREFETCH_FULL = 0,
+    CXL_REQUEST_RX_PREFETCH_NO_REQUEST = 1,
+    CXL_REQUEST_RX_PREFETCH_NONE = 2,
+} cxl_request_rx_prefetch_mode_t;
+
 /**
  * Create a server-side metadata-queue polling connection for a fixed layout.
  *
@@ -150,6 +157,43 @@ void cxl_connection_destroy(cxl_connection_t *conn);
  */
 const cxl_connection_addrs_t *cxl_connection_get_addrs(
     const cxl_connection_t *conn);
+
+/**
+ * Override the payload-size threshold for CopyEngine response publish.
+ *
+ * Payloads at or above this threshold use the response DMA path. `threshold`
+ * is in payload bytes only and excludes the 8-byte response header.
+ *
+ * `threshold = 0` resets the connection back to the library default
+ * (`CXL_RESPONSE_DMA_PAYLOAD_THRESHOLD_DEFAULT`).
+ */
+int cxl_connection_set_response_dma_threshold(cxl_connection_t *conn,
+                                              size_t threshold);
+
+/**
+ * Override the HEAD_UPDATE synchronization threshold on a poll-owner
+ * connection.
+ *
+ * `threshold = 0` resets the policy back to the default `N/4`.
+ */
+int cxl_connection_set_head_sync_threshold(cxl_connection_t *conn,
+                                           uint32_t threshold);
+
+/**
+ * Override the server-side request receive prefetch policy on a poll-owner
+ * connection.
+ *
+ * Modes are:
+ *   - `CXL_REQUEST_RX_PREFETCH_FULL`: request-data prefetch + MQ notify
+ *     prefetch are both enabled.
+ *   - `CXL_REQUEST_RX_PREFETCH_NO_REQUEST`: disable request-data prefetch, keep
+ *     MQ notify prefetch enabled.
+ *   - `CXL_REQUEST_RX_PREFETCH_NONE`: disable both request-data prefetch and MQ
+ *     notify prefetch.
+ */
+int cxl_connection_set_request_rx_prefetch_mode(
+    cxl_connection_t *conn,
+    cxl_request_rx_prefetch_mode_t mode);
 
 /**
  * Bind one dedicated CopyEngine lane for large-response DMA publish.
@@ -329,8 +373,10 @@ int cxl_consume_next_response(cxl_connection_t *conn,
  *   - Inline request: out_data_view points to metadata entry bytes [8..15].
  *   - Non-inline request: bytes [8..15] carry an absolute logical payload
  *     address inside the shared CXL aperture. out_data_view points directly
- *     to that shared payload region after the library has invalidated and
- *     prefetched it for read-side consumption.
+ *     to that shared payload region after the library has invalidated it for
+ *     read-side consumption. When request-data prefetch is enabled, the
+ *     library can also prefetch the current payload and same-line future
+ *     payloads before returning.
  *   Callers should consume the returned view before performing the next
  *   request poll on the same connection.
  *
@@ -353,7 +399,7 @@ int cxl_poll_request(cxl_connection_t *conn,
  *   - `req_data_ready_tick`: current request payload view is ready for
  *     consumption. For inline requests or already-prepared payloads, this can
  *     equal `notify_ready_tick`.
- *   - `poll_done_tick`: the library has finished same-line prefetch/bookkeeping
+ *   - `poll_done_tick`: the library has finished request receive bookkeeping
  *     and the poll path is ready to hand control back to the caller.
  */
 int cxl_poll_request_timed(cxl_connection_t *conn,
@@ -372,19 +418,21 @@ int cxl_poll_request_timed(cxl_connection_t *conn,
  * The response ring is one large shared region. Entries are cacheline-aligned
  * but do not use any fixed per-response slot size.
  *
- * Response entries whose `(header + payload)` size is at most 4 KiB are copied
- * into peer `response_data` by CPU store plus `clflushopt`/`sfence`.
+ * Response entries whose payload size is below the current DMA threshold are
+ * copied into peer `response_data` by CPU store plus `clflushopt`/`sfence`.
  *
  * When the same connection already has an older CopyEngine response publish
  * in flight, the small-response payload still uses CPU copy, but the final
  * producer-cursor flag write is serialized onto that same CopyEngine lane so
  * the shared cursor never overtakes an older DMA response.
  *
- * Response entries whose `(header + payload)` size exceeds 4 KiB are published
- * by one asynchronous CopyEngine descriptor chain:
+ * Response entries whose payload size is at or above the current DMA
+ * threshold are published by one asynchronous CopyEngine descriptor chain:
  *   response entry -> producer cursor flag
  * This large-response path requires one dedicated CopyEngine lane to be bound
- * on the connection before send time.
+ * on the connection before send time. The default threshold is
+ * `CXL_RESPONSE_DMA_PAYLOAD_THRESHOLD_DEFAULT` payload bytes and can be
+ * overridden per connection with `cxl_connection_set_response_dma_threshold()`.
  *
  * Response headers remain 8 bytes wide for aligned 64-bit load/store, but
  * their active semantics are only `(payload_len, rpc_id)`. The upper 16 bits

@@ -62,6 +62,8 @@ struct cxl_connection {
     uint8_t mq_prefetch_window_valid;
     uint8_t mq_payload_prepared_mask;
     uint8_t mq_payload_next_probe_slot;
+    uint8_t request_data_prefetch_enabled;
+    uint8_t notify_prefetch_enabled;
 
     uint16_t rpc_id_next;
     uint64_t resp_read_cursor;
@@ -72,6 +74,7 @@ struct cxl_connection {
     uint8_t resp_peek_valid;
     uint8_t resp_peek_payload_loaded;
     size_t req_write_offset;
+    size_t response_dma_payload_threshold;
 
     cxl_adaptive_sync_t *sync;
 
