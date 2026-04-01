@@ -501,6 +501,8 @@ def run_and_tee(cmd: List[str],
 
 
 def sudo_nopass_available() -> bool:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return True
     try:
         proc = subprocess.run(
             ["sudo", "-n", "true"],
@@ -993,6 +995,7 @@ def main() -> int:
         "output_dir",
     ]
     started_experiments = 0
+    running_as_root = hasattr(os, "geteuid") and os.geteuid() == 0
     direct_kvm_access = os.access("/dev/kvm", os.R_OK | os.W_OK)
     sudo_n_available = sudo_nopass_available()
     kvm_cmd_prefix: List[str] = []
@@ -1005,12 +1008,15 @@ def main() -> int:
         print("[matrix] /dev/kvm is directly accessible by current user")
     else:
         print("[matrix] /dev/kvm is not directly accessible by current user")
-        if not sudo_n_available:
-            print("[fatal] /dev/kvm requires elevated access, but `sudo -n` is unavailable")
-            return 2
-        kvm_cmd_prefix = ["sudo", "-n"]
-        kvm_signal_prefix = kvm_cmd_prefix
-        print("[matrix] checkpoint builds will run under `sudo -n`")
+        if running_as_root:
+            print("[matrix] current user is root; continuing without `sudo -n`")
+        else:
+            if not sudo_n_available:
+                print("[fatal] /dev/kvm requires elevated access, but `sudo -n` is unavailable")
+                return 2
+            kvm_cmd_prefix = ["sudo", "-n"]
+            kvm_signal_prefix = kvm_cmd_prefix
+            print("[matrix] checkpoint builds will run under `sudo -n`")
 
     if not args.allow_concurrent_runs:
         lock_path = output_base / ".rpc_matrix.lock"

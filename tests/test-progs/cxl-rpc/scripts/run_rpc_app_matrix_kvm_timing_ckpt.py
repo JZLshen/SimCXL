@@ -585,6 +585,7 @@ def main() -> int:
     ]
 
     started_experiments = 0
+    running_as_root = hasattr(os, "geteuid") and os.geteuid() == 0
     direct_kvm_access = os.access("/dev/kvm", os.R_OK | os.W_OK)
     sudo_n_available = bare_rpc.sudo_nopass_available()
     kvm_cmd_prefix: List[str] = []
@@ -597,12 +598,15 @@ def main() -> int:
         print("[app-matrix] /dev/kvm is directly accessible by current user")
     else:
         print("[app-matrix] /dev/kvm is not directly accessible by current user")
-        if not sudo_n_available:
-            print("[fatal] /dev/kvm requires elevated access, but `sudo -n` is unavailable")
-            return 2
-        kvm_cmd_prefix = ["sudo", "-n"]
-        kvm_signal_prefix = kvm_cmd_prefix
-        print("[app-matrix] checkpoint builds will run under `sudo -n`")
+        if running_as_root:
+            print("[app-matrix] current user is root; continuing without `sudo -n`")
+        else:
+            if not sudo_n_available:
+                print("[fatal] /dev/kvm requires elevated access, but `sudo -n` is unavailable")
+                return 2
+            kvm_cmd_prefix = ["sudo", "-n"]
+            kvm_signal_prefix = kvm_cmd_prefix
+            print("[app-matrix] checkpoint builds will run under `sudo -n`")
 
     if not args.allow_concurrent_runs:
         lock_path = output_base / ".rpc_matrix.lock"

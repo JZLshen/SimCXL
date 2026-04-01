@@ -21,6 +21,15 @@ M5_BIN="$SIMCXL_DIR/util/m5/build/x86/out/m5"
 LOOP_DEVICE=""
 EXTRA_MAKE_TARGETS=()
 
+if ! command -v sudo >/dev/null 2>&1; then
+    if [ "$(id -u)" -eq 0 ]; then
+        sudo() { "$@"; }
+    else
+        echo "ERROR: sudo not found and current user is not root"
+        exit 1
+    fi
+fi
+
 # Core binaries to copy (default path).
 BINARIES=(
     "cxl_mem_ldst_latency"

@@ -192,6 +192,16 @@ LOG_PATH="$LOG_DIR/${SESSION_NAME}.log"
 BARE_BATCH="bare_${HOST_SAFE}_slot${SLOT}_${TAG_SAFE}"
 APP_BATCH="app_${HOST_SAFE}_slot${SLOT}_${TAG_SAFE}"
 
+PRIV_CMD=()
+if [[ "$(id -u)" -eq 0 ]]; then
+    echo "[launcher] running as root; skip sudo"
+else
+    command -v sudo >/dev/null 2>&1 || die "sudo is required when not running as root"
+    sudo -n true >/dev/null 2>&1 || \
+        die "sudo -n failed; configure passwordless sudo or pre-authenticate before using tmux mode"
+    PRIV_CMD=(sudo -n)
+fi
+
 if [[ "$FOREGROUND" != "1" ]]; then
     command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
     mkdir -p "$LOG_DIR"
@@ -245,11 +255,9 @@ echo "[launcher] slot=$SLOT bare=${BARE_START}-${BARE_END} app=${APP_START}-${AP
 echo "[launcher] log=$LOG_PATH"
 echo "[launcher] started_at=$(date --iso-8601=seconds)"
 
-sudo -n true >/dev/null 2>&1 || die "sudo -n failed; configure passwordless sudo or pre-authenticate before using tmux mode"
-
 if [[ "$SKIP_INJECT" != "1" ]]; then
     inject_cmd=(
-        sudo env
+        "${PRIV_CMD[@]}" env
         TMPDIR=/dev/shm
         CXL_RPC_CLEAN_TEST_CODE_DIR=1
         bash "$INJECT_SCRIPT" "$DISK"
@@ -265,7 +273,7 @@ else
 fi
 
 bare_cmd=(
-    sudo python3 "$BARE_RUNNER"
+    "${PRIV_CMD[@]}" python3 "$BARE_RUNNER"
     --repo-root "$REPO_ROOT"
     --output-base "$OUTPUT_BASE"
     --batch-name "$BARE_BATCH"
@@ -294,7 +302,7 @@ echo "+ $(quote_cmd "${bare_cmd[@]}")"
 
 if [[ "$APP_START" -gt 0 ]]; then
     app_cmd=(
-        sudo python3 "$APP_RUNNER"
+        "${PRIV_CMD[@]}" python3 "$APP_RUNNER"
         --repo-root "$REPO_ROOT"
         --output-base "$OUTPUT_BASE"
         --batch-name "$APP_BATCH"
