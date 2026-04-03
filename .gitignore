@@ -41,3 +41,10 @@ Doxygen.config
 typings
 include/cxl_benchmark/lmbench3
 /output
+/CXL-RPC-ASPLOS27/
+/CXL-RPC-MICRO'26/
+/exp/DMA/data/raw/
+/ext/mcpat/cacti/cacti
+/ext/mcpat/cacti/obj_opt/
+/files/
+/tests/test-progs/cxl-rpc/cpu_memmove_bw

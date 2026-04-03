@@ -1,0 +1,337 @@
+RPCs using CXL-mem
+
+
+1.Introduction
+
+尽管 RDMA、zero-copy 和 pass-by-reference 已经显著降低了通信开销，高性能 RPC 仍然是 NIC-centric 的：请求与响应需要沿网络数据面传输，访问大对象或被引用对象仍需经过远程传输路径。对于以内存对象访问为主的服务，这些 transport、copy 和 software-stack overhead 仍然位于关键路径上。
+
+CXL.mem 提供了不同的系统基础。借助 CXL.mem，device-attached memory 可以被映射到主机地址空间，并以 load/store 语义访问。请求载荷、响应载荷以及被引用对象因而可以直接驻留在共享 CXL memory 中，而 RPC 控制路径则收缩为请求发布、完成通知和元数据协调。HydraRPC 已经表明，CXL shared memory 可以作为 RPC 的通信底座，并展示了这一方向的可行性。
+
+然而，将 RPC 建立在 CXL shared memory 之上，并不能直接解决多客户端单服务端场景。第一个问题出现在请求接收路径。服务端需要从多个客户端发出的通知中恢复一个可顺序消费的请求流。共享服务端队列可以消除多队列轮询，但会将请求发布压力集中到同一队尾；每客户端独立队列可以避免追加竞争，却要求服务端持续轮询多个通知源。在 non-cache-coherent 的 CXL shared memory 上，请求发现本身还伴随远端访问和显式可见性管理开销。
+
+第二个问题出现在响应发布路径。RPC completion 由响应数据对客户端可见且 completion flag 已经发布来定义，而不是由服务端 handler 返回来定义。若响应发布仍由 CPU 推进，无论响应是直接写入远端 response region，还是先在本地形成再复制到 CXL memory，数据移动开销都会停留在关键路径上。随着响应规模增大，响应发布逐渐成为限制吞吐和处理器利用率的主要因素。
+
+本文提出 CXL-RPC，以 request ordering under fan-in 和 response publication overhead 为设计中心。CXL-RPC 使用目的端 controller 将来自多个客户端的 doorbell notification 串行为服务端可见的单一 message queue，并使用 DMA engine 在显式顺序约束下完成响应发布。这样，请求接收不再依赖服务端在多个通知源之间恢复顺序，响应返回也不再持续占用处理器执行数据移动。
+
+我们在 SimCXL 上实现了 CXL-RPC，并在多客户端单服务端负载下评估其行为。评测表明，该设计能够在客户端 fan-in 增加时维持稳定的稳态吞吐，并有效降低响应发布路径上的处理器参与。Section 5 给出详细结果。
+
+本文的贡献如下：
+
+(1) 识别并刻画了 CXL-mem RPC 在多客户端单服务端场景下的两个主要瓶颈：多源请求通知的顺序汇聚，以及响应发布阶段的处理器开销。
+
+(2) 提出了 controller-assisted doorbell write 机制，将多客户端请求通知的顺序恢复前移到目的端 CXL memory controller，并将服务端请求接收收敛为单一 message queue 消费。
+
+(3) 提出了 DMA-assisted response path，将响应数据发布与完成通知交由 DMA engine 执行，并给出相应的完成语义与顺序约束。
+
+(4) 在 SimCXL 上实现了 CXL-RPC 原型，并通过端到端实验和参数分析评估了该设计在多客户端单服务端场景下的性能表现。
+
+Despite advances such as RDMA, zero-copy, and pass-by-reference, high-performance RPC remains NIC-centric: requests and responses are transported through the network datapath, and accesses to large or referenced objects still go through remote transport paths. For memory-centric services, these transport, copy, and software-stack overheads remain on the critical path.
+
+CXL.mem offers a different substrate. It maps device-attached memory into the host address space and exposes it with load/store semantics. Request payloads, response payloads, and referenced objects can therefore reside directly in shared CXL memory, while the RPC control path is reduced to request publication, completion notification, and metadata coordination. Prior work such as HydraRPC demonstrates that CXL shared memory can serve as an RPC substrate and shows the feasibility of this direction.
+
+However, placing RPC on top of CXL shared memory does not directly address the multi-client single-server setting. The first challenge lies in request reception. The server must recover a request stream that can be consumed in order from notifications issued by multiple clients. A shared server queue eliminates multi-queue polling, but concentrates publication pressure on a single queue tail. Per-client queues avoid append contention, but require the server to continuously poll multiple notification sources. Under non-cache-coherent CXL shared memory, request discovery itself also incurs remote accesses and explicit visibility management.
+
+The second challenge lies in response publication. RPC completion is defined by response visibility and completion-flag publication rather than by handler return. If response publication is still driven by the CPU, data movement remains on the critical path, whether the response is written directly to a remote response region or first assembled locally and then copied back to CXL memory. As response size grows, response publication becomes a major limiter of throughput and processor utilization.
+
+This paper presents CXL-RPC, a design centered on request ordering under fan-in and response publication overhead. CXL-RPC uses a destination-side controller to serialize doorbell notifications from multiple clients into a single server-visible message queue, and uses DMA engines to carry out response publication under explicit ordering constraints. As a result, request reception no longer relies on server-side order recovery across multiple notification sources, and response return no longer keeps the processor on the data-movement path.
+
+We implement CXL-RPC in SimCXL and evaluate it under multi-client single-server workloads. The evaluation shows that CXL-RPC sustains stable steady-state throughput as client fan-in increases, while significantly reducing processor involvement in response publication. Detailed results are presented in Section 5.
+
+This paper makes four contributions:
+
+(1) It identifies and characterizes the two main bottlenecks of CXL-mem RPC in the multi-client single-server setting: request ordering across multiple notification sources and processor overhead in response publication.
+
+(2) It presents controller-assisted doorbell write, which moves multi-client request ordering to the destination-side CXL memory controller and reduces server-side request reception to single-queue consumption.
+
+(3) It presents a DMA-assisted response path that offloads response publication and completion notification to DMA engines with explicit completion semantics and ordering guarantees.
+
+(4) It implements CXL-RPC in SimCXL and evaluates the design with end-to-end experiments and sensitivity analysis.
+
+2.Background
+
+2.1 CXL-based shared mem
+介绍cxl、cxl mem、non-cache-coherent
+
+Compute Express Link (CXL) 是一种面向数据中心异构计算与资源解耦的新型开放式互连协议。与传统 PCIe 架构单纯的 I/O 交互模式不同，CXL 在物理链路层面上实现了多协议的动态复用。具体而言，该标准整合了负责设备发现与基础配置的 CXL.io 、支持设备端对主机内存进行一致性缓存的 CXL.cache，以及允许主机使用 Load/Store 指令直接寻址远端内存的 CXL.mem。基于这三种协议的差异化互操作，CXL 规范定义了三种主要的设备形态：Type 1 设备（仅包含 CXL.io 与 CXL.cache）通常为缺乏本地大容量内存的智能网卡等加速器；Type 2 设备（同时包含三种协议）代表如 GPU 等带有高带宽本地内存且需与主机维持复杂缓存一致性的重型计算单元；而 Type 3 设备（仅依赖 CXL.io 与 CXL.mem）则剥离了计算与缓存侦听逻辑，专用于内存容量的横向扩展。
+
+在上述协议族中，CXL.mem 是实现跨节点极速数据交互的基础。借助 CXL.mem，device-attached memory 可以映射到主机物理地址空间中，从而使处理器能够通过普通的 load/store 指令直接访问外部内存资源。该能力突破了单机本地 DRAM 容量的物理限制，并为内存扩展、内存池化以及内存解耦提供了硬件基础。从系统视角看，CXL.mem 的关键意义在于它将外部设备内存暴露为可按内存语义访问的资源，而不仅仅是传统 I/O 语义下的外设空间，因此被视为构建大容量内存系统的重要支撑技术。
+
+然而，基于 CXL 的共享内存并不等价于传统 SMP/NUMA 环境下完全缓存一致的共享内存。CXL.mem 所提供的一致性语义首先指向host-device coherence，即主机能够以一致性方式访问 device-attached memory，并通过普通的 load/store 指令直接对其进行读写；但这并不意味着多个主机之间天然具备透明的硬件缓存一致性。对于 CXL 2.0 而言，memory pooling 的核心目标是实现内存资源在不同主机之间的分配与复用，而非允许多个主机同时缓存并共享同一物理内存位置。进入 CXL 3.x 后，规范进一步引入了 shared FAM，并明确区分了 software-managed coherence 与 multi-host hardware coherency。尽管 CXL 3.x 在协议层面提供了更强的共享内存支持，当前公开部署仍主要集中于 Type-3 memory expansion/pooling，而多主机硬件一致性支持尚未成为主流。因此，在现实系统中，CXL-based shared memory 的跨主机可见性与同步往往仍需由软件显式管理。
+
+
+Compute Express Link (CXL) is an open interconnect standard designed for memory expansion, resource disaggregation, and accelerator integration in modern datacenters. Built on the PCIe physical layer, CXL defines three complementary protocols: CXL.io for device discovery and configuration, CXL.cache for coherent device caching of host memory, and CXL.mem for host access to device-attached memory using memory semantics. Among them, CXL.mem is the key enabler for exposing remote memory capacity beyond local DRAM and for constructing memory expansion and pooling systems.
+
+The significance of CXL.mem lies in that it allows device-attached memory to be mapped into the host physical address space and accessed through ordinary load/store instructions. In this sense, a CXL memory device is not merely an I/O peripheral with message-based interaction, but a memory resource that can participate in the processor’s memory access path. This capability makes CXL.mem an appealing substrate for systems that require low-overhead data sharing across nodes or components.
+
+However, CXL-based shared memory should not be confused with the fully cache-coherent shared memory found in conventional SMP or NUMA systems. In practical multi-host deployments, although multiple hosts may access a shared CXL memory region, the visibility and synchronization of updates are still often managed explicitly by software rather than by transparent hardware cache coherence. Therefore, data structures placed in CXL shared memory typically need software-managed synchronization and explicit handling of cache visibility, which makes the access behavior of such shared memory fundamentally different from that of local DRAM.
+
+2.2 RPCs on CXL-mem
+介绍现有基于CXL-mem的RPC（主要是hdyraRPC）
+说清楚基于CXL-mem的通信比基于IO deivce（NIC）的优势
+
+传统高性能 RPC 本质上是以 I/O 语义为基础的远程交互机制。无论底层采用 TCP/IP 还是 RDMA，请求与响应都需要沿着由 NIC 介导的报文化路径完成交付，因此远端交互的主要成本始终围绕 payload transport 展开。即使系统采用传引用的 RPC，请求中携带的也只是对象引用本身，而被引用数据通常仍然位于独立的网络或存储路径之后；也就是说，消息可以变轻，但数据访问并未因此从通信路径中消失。
+
+基于 CXL.mem 的 RPC 改变的正是这一路径。借助 CXL.mem 所提供的字节可寻址共享内存，请求与响应的实际数据以及被引用对象本身都可以直接驻留在共享的 CXL-attached memory 中，从而使解引用和数据访问能够通过同一共享内存底座完成，而不必再经过独立的 I/O 路径。以 HydraRPC 为代表的工作表明，CXL HDM 可以作为 RPC 的通信载体：控制消息仍然存在，但其职责不再是搬运完整数据载荷，而是协调对驻留于共享内存中的数据进行访问。由此，跨主机交互的重心不再是沿 I/O 路径传输 payload，而是围绕共享内存中的数据组织协调与访问。
+
+这种变化的意义是架构性的，而不仅仅是实现层面的。相较于基于 I/O 的 RPC，基于 CXL.mem 的 RPC 的关键优势并不只是控制消息更轻，而在于被引用数据本身可以放入共享内存，并通过同一底座被直接访问。大对象和复杂对象不再需要仅仅为了通信而被反复封装、复制和重构；如果对象已经驻留在共享 CXL memory 中，对其访问也不再意味着一次额外的网络获取。对于那些在内存中长期维护大规模对象或数据结构、并且请求处理本质上是对这些对象进行查找、更新或重组的服务而言，这一点尤为重要，因为系统性能不仅取决于请求交付速度，也取决于远端对象能否被高效访问。
+
+画一张图对比CXL RPC和RDMA RPC的数据通路的区别
+
+Recent work has explored using CXL shared memory as the communication substrate for remote procedure call (RPC). A representative example is HydraRPC, which organizes request and response exchange through message queues and data regions placed in CXL-attached memory. In such systems, clients and servers communicate by publishing lightweight metadata to shared queues, while the actual request/response payloads reside in shared memory regions that can be directly accessed through load/store operations. This design shows that CXL memory can serve not only as an extension of capacity, but also as the data plane foundation for RPC. 
+  
+RPC, whether implemented over TCP/IP or RDMA, is still fundamentally built on an I/O-mediated transport path in which requests and responses are delivered as messages through the network stack or the NIC datapath. By contrast, in CXL-mem-based RPC, request payloads, response payloads, and even referenced objects can be placed directly in shared memory, so that communication is no longer centered solely on transporting complete payloads across an I/O path. Instead, control messages mainly coordinate access to data that already resides in the shared memory substrate.
+
+This shift is important because it changes the role of communication in RPC execution. Under a NIC-centric design, transporting data is a first-class cost of each RPC. Under a CXL-mem-based design, data can remain in shared memory and be accessed in place, which reduces the need to repeatedly move or reconstruct large objects purely for communication purposes. As a result, CXL-mem-based RPC is particularly attractive for workloads whose request  handling revolves around accessing, updating, or reorganizing data structures that are naturally maintained in memory.
+
+
+3.Motivation
+分析现有方案的问题，每个需要一个数据图证明
+
+3.1 Polling延迟高
+和client数量成正比，在non-cc下开销更大。
+通过共享message queue会引入contention
+
+3.2 Server CPU消耗多
+写RPC reponse到CXL中，CXL性能比DRAM慢
+
+
+3. Motivation
+
+已有基于 CXL.mem 的 RPC 将共享内存作为通信平面。在多客户端单服务端场景下，性能瓶颈主要落在两个环节：请求通知汇聚，以及响应结果发布。请求通知汇聚决定服务端发现新请求的开销，响应结果发布决定结果回写阶段的 CPU 占用。本节结合初步实验结果分析这两个问题。
+
+3.1 多客户端请求通知的顺序汇聚开销
+（图，cc和non-cc各两条线，shared和dedicated两种情况，横坐标是client数量，纵坐标是带宽）
+
+在多客户端单服务端场景下，服务端需要持续感知来自不同客户端的请求到达，并恢复这些请求的可消费顺序。对于基于 CXL shared memory 的 RPC，请求通知、请求元数据和相关数据区均位于共享内存，请求发现本身也成为请求处理路径的一部分。
+
+若多个客户端共享同一个服务端 message queue，服务端只需轮询单个队列即可发现新请求；代价是多个客户端会并发追加同一队尾，请求发布压力集中在同一同步点。随着并发客户端数量增加，队尾竞争会直接限制通知路径的扩展性。
+
+若每个客户端分别维护独立的请求队列和数据区，客户端之间的发布竞争可以避免；代价转移到服务端。服务端必须在多个队列之间轮询以发现新请求，在 CXL shared memory 尤其是 non-cache-coherent 配置下，这一过程伴随更多远端访问与可见性管理开销，并随客户端数量增加而累积。
+
+初步实验结果与上述分析一致。随着客户端数量增加，服务端轮询开销近似按客户端数量线性增长；在 non-cache-coherent 共享方式下，该趋势更加明显。共享 message queue 虽然减少了多队列轮询，但会引入明显的追加竞争，并在高并发下形成另一类吞吐损失。
+
+这些结果说明，多客户端单服务端 CXL-RPC 的核心问题之一，是在不把开销留给客户端追加竞争或服务端多队列轮询的前提下，将多源请求通知整理为服务端可直接消费的顺序流。
+
+3.2 响应发布路径的 CPU 开销
+（图，CXL write和DRAM write两条线，横坐标是response size，纵坐标是带宽）
+
+在 CXL-RPC 中，一次 RPC 的完成以客户端观察到响应数据和完成通知为准。服务端即使已经结束请求处理，响应发布仍位于关键路径上。
+
+服务端可以直接从远端 CXL memory 读取请求并将响应写回同一共享区域；也可以先在本地内存中组织响应，再通过 memcpy、memmove 等软件拷贝将结果写回远端 CXL memory。两条路径实现不同，但响应数据发布都由 CPU 推进。
+
+初步实验结果表明，将 RPC response 写入 CXL memory 的性能显著低于写入本地 DRAM。无论采用直接远端写入，还是本地生成后再复制回远端，服务端 CPU 都需要在更慢的目标内存上承担数据搬运、结果写回和完成通知发布开销。随着响应规模增大，CPU 时间占比会进一步向数据发布阶段集中。
+
+这表明，响应路径中的主要压力不在响应生成，而在响应发布。若数据移动和完成通知仍完全依赖 CPU，响应规模增长会直接放大服务端 CPU 开销，并压缩系统吞吐与资源利用率。
+
+
+
+
+
+
+4.Design
+4.1 设计的overview
+整个RPC系统的框架，流程。
+1）发送路径
+2）接收路径
+
+4.2 CXL mem controller辅助的doorbell write
+
+1）mem controller的逻辑（ring的维护，监控doorbell地址， head和tail的维护）
+2）server怎么用？register一个cxl mem区域
+3）每个record的格式（支持inline，16B？）
+4）一些异常的考虑：比如ring满了，异常怎么抛出？client流控？
+
+4.3 server侧的数据移动卸载至DMA engine
+
+1）flush和copy两种卸载方式
+2）整个过程怎么不涉及cpu
+3）response buffer的生命周期
+4）不同size的reponse，有的是不是还需要server CPU处理
+
+
+4.1 Overview
+（连接：client-server建立连接、共享内存的地址分配）
+初始化时，每个client 和 server 向统一的内存分配器建立连接，并由内存分配器分配地址空间。同时每个 client 预先被分配三种地址空间，分别是请求数据区（20MB），响应数据区（20MB），flag地址（2B）。每个server预先分配两种地址空间，分别是 message queue 和 doorbell 地址段。当client断开连接时，由内存分配器统一回收相应的内存空间。
+过程（补个图）：client 将请求数据写入到CXL共享内存中，然后发起doorbell write，CXL mem controller 会拦截并edit record，最终redirect the destination and append to the message queue【参考4.2】。client采取sliding window所以在到达上限之前可以一直发送。Then, server 一直轮询the tail entry of the message queue，并根据inline bit决定是否再次将request data load回本地内存。server 处理完后，使用DMA engine将响应数据和flag写回对应client的区域【参考4.3】。client 维护一个 RPC id pending list，记录还没有收到响应的 RPC id。client 只需要轮询 flag 地址，并判断是否在 pending list。之后按顺序去response data区按依次顺序去处理响应数据，直到处理到的响应数据对应的RPC id为之前轮询到 flag 中的RPC id，也就代表最新的响应数据已经处理完了。
+
+4.2 client 发送请求路径：CXL mem controller辅助的doorbell write
+为满足multi-client 并发请求的全局定序需求，同时规避高昂的跨节点协调代价，我们提出将排序逻辑offload至靠近目的端的 CXL mem controller。该设计本质上是通过轻量级的硬件开销，彻底消除了复杂的分布式网络同步瓶颈。
+client 向server的doorbell地址发送请求通知时，CXL memory controller监控并拦截发往doorbell地址的packet，set both phase bit and inline bit，最后将packet的目的地址修改为server的message queue 的 tail 位置，这样就实现了请求的排序并 append 到 list 中。
+（4.2.1）维护 head 和 tail
+controller 向队列 append 新的 entry，同时维护tail；server 每次从队列的 head poll到 entry，同时维护head。当server每处理 N/4 个 entry 便向 CXL memory controller 延迟更新 head。延迟更新的方式是向server自己的 doorbell 地址发送packet，其中method字段设置为1，which means head_update。这样的延迟更新使得 controller 能够高效地维护队列信息。
+（4.2.2）request data store inlined with message
+对于较小的请求数据，采用 inline with message，可以减少一次远端内存的访问的延迟。我们将小于8B的数据安排在了每个 record 的8B - 15B的位置。具体的record的格式如图xx
+doorbell record格式
+（画个表格表示一下，图）
+0-7B：
+1.bit [0] method (1b）：0=request, 1=head_update
+2.bit [1] inline (1b)
+3.bit [2] phase (1b)：有效位
+4.bits [34:3] length (32b)：最大表示4GB的请求数据
+5.bits [48:35] node id (14b) 
+6.bits [63:49] RPC id (15b)
+8B-15B：
+1.若为inline模式，为请求数据
+2.若为non-inline模式，为请求数据的远端内存地址的指针
+
+4.3 DMA engine
+CXL-RPC使用DMA引擎来卸载掉响应数据和通知的拷贝。DSA是Intel的新一代DMA引擎，相较于前一代I/OAT，不仅支持memory copy的卸载，还额外支持了flush卸载。
+对于memory copy的卸载，它可以实现本地内存到CXL远端内存的拷贝，响应数据会先由cpu落到本地内存，再由DMA引擎在完成响应数据和flag的从本地内存到CXL远端内存的拷贝。由于PCIe weak ordering，无法保证他们他们到达的先后顺序。我们必须将descriptor中的Request Fence in DSA or Fnc in I/OAT 置位，以保证响应数据先于flag落到内存中。
+对于flush卸载，它可以实现异步地从cache到内存的invalidate and writeback。可是在不支持硬件缓存一致性的CXL硬件环境下，在面对跨cacheline的远端内存的写入，会引发多次预先地CXL load。而CXL load/store单次延迟约为300ns，本地内存的读写延迟在10ns量级（未测xx ns），所以使得这种方法的延迟远高于使用memory copy卸载的方法。
+
+--------------
+
+4.1 Overview
+
+CXL-RPC 面向多客户端单服务端场景。系统由客户端、服务端、CXL shared memory、目的端 CXL memory controller 和服务端侧 DMA engine 组成。对于每个 client-server 连接，客户端在共享内存中持有 request region、response region 和 completion flag，服务端暴露 doorbell 地址并维护一个供请求接收使用的 message queue。请求数据和响应数据始终驻留在共享内存中，控制路径只负责请求到达和完成状态的传播。
+
+Figure X 给出了 CXL-RPC 的端到端流程。客户端发起一次 RPC 时，先将请求内容写入 request region；若请求足够小，请求内容也可以直接随通知内嵌发布。随后客户端向服务端 doorbell 地址写入一个请求通知，其中包含 rpc_id、请求长度以及请求数据的位置或内嵌内容。该通知到达目的端后，由 CXL memory controller 转化为 message queue 中的一条请求记录；来自不同客户端的请求在这里汇聚，并按到达 controller 的自然顺序进入服务端的单一消费入口。服务端沿 message queue 顺序读取请求记录，获得请求内容或定位到对应的 request region，并执行相应的处理逻辑。请求处理完成后，服务端通过 DMA-assisted response path 将响应结果写入客户端的 response region，并在该路径完成后更新 completion flag。客户端轮询自身的 completion flag；一旦观察到新的完成通知，就沿 response region 的发布顺序提取响应条目并复制到本地缓冲，直到处理到对应 rpc_id 为止。至此，一次 RPC 完成从请求发布、服务端执行到响应消费的完整闭环。
+
+这一组织方式将端到端流程分解为两条关键路径：请求路径负责将多客户端的 doorbell 通知整理为服务端可顺序消费的单一入口，响应路径负责在满足完成语义的前提下发布结果并降低服务端 CPU 参与。Section 4.2 和 Section 4.3 分别展开这两部分设计。
+
+4.2 CXL mem controller-assisted doorbell write
+
+本节介绍请求通知如何在目的端由 doorbell write 转化为服务端可消费的 message queue。CXL-RPC 保留了软件可见的 doorbell publish 接口，但多客户端请求通知的顺序整理不再由客户端协调，也不再由服务端在多个通知源之间主动恢复。相反，所有发往服务端的 doorbell write 在目的端 CXL memory controller 汇聚，并在 controller 内部转化为 message queue 中的有序记录。对客户端而言，请求发布仍然表现为一次 doorbell write；对服务端而言，请求接收则表现为对单一 message queue 的顺序消费。
+
+4.2.1 Design overview and interface
+
+CXL-RPC 在请求路径上引入 controller-assisted doorbell write 机制。客户端在请求数据准备完成后，仍然向服务端发布一个固定格式的 doorbell 通知；服务端则不再直接轮询多个客户端的请求入口，而是从一个由 controller 维护的 message queue 中读取请求记录。这样，请求发布接口仍保持为一次内存写，而请求接收接口被收敛为单一队列消费。
+
+为了建立这一抽象，服务端在初始化阶段向 controller 注册请求接收相关状态，包括 doorbell 地址范围、message queue 的基地址与容量，以及解释请求通知所需的连接元数据。注册完成后，controller 即可将落入该地址范围的写请求识别为 RPC doorbell，并将其转化为对应连接上的 queue record。客户端只负责写入请求数据并发布 doorbell；服务端只负责顺序消费 message queue。多客户端请求通知的汇聚、排序与入队都由目的端 controller 完成。
+
+4.2.2 Doorbell interception and ordered enqueue
+
+当客户端发出请求时，请求数据首先写入共享内存中的 request region，随后客户端向服务端 doorbell 地址写入一个固定长度的请求通知。该通知携带 rpc_id、请求长度以及请求数据的位置或内嵌内容。doorbell write 到达目的端后，controller 检测其目标地址是否落在已注册的 doorbell range 内；若匹配成功，controller 将该写请求解释为一个 RPC 请求通知，而不是普通的远端内存写入。
+
+对于有效的请求通知，controller 在对应的 message queue 上分配一个新的 tail slot，并将 doorbell 中携带的请求元数据序列化为该 slot 对应的 queue record。原本面向 doorbell 地址的请求通知在目的端被转化为一次对 message queue 的追加操作。来自不同客户端的请求在此汇聚，并按照到达 controller 的自然顺序进入服务端的单一消费入口。
+
+因此，doorbell write 仍然是客户端发布请求的控制接口，但请求顺序的形成位置从客户端侧移动到了目的端。服务端看到的不是多个彼此独立的通知点，而是一条已经完成顺序整理的请求流。
+
+4.2.3 Queue record format and request access
+
+message queue 中的每条记录采用固定长度格式，同时承担两项作用：其一，它是 controller 将 doorbell write 转化为服务端可见请求的组织单位；其二，它是服务端轮询与消费请求时的基本可见单元。每条记录包含请求控制字段和请求数据字段。控制字段记录 method、inline bit、phase bit、请求长度、来源标识以及 rpc_id；数据字段则根据请求规模编码请求内容本身或请求数据的位置。
+
+对于小请求，记录可以直接以内嵌形式携带请求 payload，使服务端在读取 queue record 时即可获得全部必要信息。对于较大请求，记录中仅保留请求数据在 request region 中的位置，服务端在消费该记录后再访问对应的数据区域。两种编码方式共享统一的队列语义，只在请求数据的暴露方式上有所区别。
+
+固定长度布局使 controller 在请求到达时能够以统一方式完成记录写入，也使服务端能够以稳定的顺序访问模式轮询和解析 queue。对于小请求，inline 编码还减少了一次额外的远端数据访问。
+
+4.2.4 Ring management and head synchronization
+
+服务端可见的 message queue 采用 ring 结构。controller 作为生产者推进 tail，服务端作为消费者推进 head。每当 controller 将一个新的 doorbell write 转化为 queue record，对应的 tail 位置就被占用；每当服务端完成一条请求记录的消费，对应的 head 位置就被释放。请求通知的顺序汇聚由此落实为一个 controller-to-server 的生产者-消费者队列。
+
+由于 ring 会发生回绕，队列记录需要配合 phase bit 区分当前位置上的新旧内容。controller 在写入新记录时设置与当前 tail 状态一致的 phase，服务端在轮询 head 位置时通过比较记录中的 phase 与本地预期值判断该位置是否已经被新的请求填充。这样，服务端无需依赖额外的有效位数组，即可判断当前位置是否存在可消费请求。
+
+为了避免每消费一条请求就产生一次跨节点同步，服务端不立即将每次 head 推进都反馈给 controller，而是采用延迟同步。服务端在本地推进消费进度，并在累计处理到一定数量的请求后，通过专门的控制通知提交新的 head 值。该控制通知由 controller 在本地消费，用于更新其维护的 queue 可用空间状态，而不进入普通请求消费路径。由于服务端对 message queue 的访问具有稳定的顺序性，系统还可以对后续 queue line 进行预取，以降低连续 polling 的访问开销。
+
+4.2.5 Window management and exceptional cases
+
+由于 message queue 的容量固定，请求发布需要与服务端的消费进度保持一致。CXL-RPC 在请求路径上采用 sliding window：客户端仅在本连接可用窗口内发布新的 doorbell，窗口上界对应 controller 当前可分配的 queue space；随着服务端提交新的 head 值，被释放的 queue entry 转化为新的发送额度，窗口随之向前推进。这样，队列容量约束被前移到请求发送侧，客户端不会在 ring 已满时继续追加记录，controller 也无需在请求到达后再处理覆盖或回退。
+
+除队列满之外，controller 还需要处理无效 doorbell、非法请求元数据以及控制通知与普通请求通知的区分。对于服务端而言，message queue 中的记录必须能够被明确解释为有效请求、控制用途记录或不可消费状态；对于 controller 而言，不同类型的通知需要在统一的解析和状态维护逻辑下得到一致处理。
+
+通过这些机制，CXL-RPC 将多客户端发往服务端的 doorbell write 转化为一条有序、可控且可持续运行的请求接收链路。
+
+4.3 DMA-assisted response path
+
+响应返回阶段需要完成两项工作：使响应数据对客户端可见，并发布相应的 completion flag。在 non-cache-coherent 的 CXL shared memory 上，若继续由服务端 CPU 执行远端写入或软件拷贝，这一阶段会长期占用处理器时间，且开销随响应规模增长。CXL-RPC 因而将响应发布交由 DMA engine 完成。
+
+4.3.1 IOAT, DSA, and response publication
+
+Intel 主机侧 DMA engine 主要包括 IOAT 和 DSA。IOAT 提供异步 memory copy；DSA 在此基础上进一步支持 Cache Flush。围绕这两类原语，响应发布可组织为 staged response 和 in-place response 两种方式。前者先在服务端本地内存中形成响应，再由 DMA 将数据写入客户端的 response region，随后写入 completion flag。后者直接在客户端 response region 的服务端映射上生成响应，再由 DSA Cache Flush 将相关 cache line 写回 CXL shared memory，随后写入 completion flag。
+
+in-place response 的前提是 response region 在服务端采用 cacheable 映射。CXL.mem 将远端容量以内存语义暴露给主机地址空间，因此服务端可以通过普通 load/store 在该区域上构造响应。这里的 non-cache-coherent 表示服务端 cache hierarchy 与客户端所观察到的共享内存之间不存在硬件自动维护的缓存一致性；服务端对 response region 的写入在 flush 完成前可能仍停留于本地 cache 中，客户端尚不能观察到这些更新。若 response region 采用 uncacheable 映射，或响应首先生成在服务端本地 DRAM 中，则采用 staged response。
+
+4.3.2 Ordering semantics and implementation scope
+
+响应返回需要满足如下完成语义：客户端一旦观察到 completion flag，对应响应数据必须已经在 response region 中可读。为此，DMA 提交必须在“响应数据写入或刷新完成”与“completion flag 写入”之间建立明确的顺序约束。对 IOAT，这一约束由前序 descriptor 的 `Fnc` 位表达，即在承载响应数据的 copy descriptor 上设置 `Fnc`，使后继的 flag write 仅在前序写入完成后执行。对 DSA，若 descriptors 通过 direct submission 依次提交到同一 work queue，经同一 portal 进入仅含一个 engine 的 group，并使用相同的 destination TC，则规范保证其按接收顺序执行并保持 write ordering；在这一条件下，响应数据 descriptor 或 Cache Flush descriptor 与后继 flag descriptor 可以依赖提交顺序。若 descriptors 通过 batch 提交，则 batch 内部顺序默认不受保证，需要通过 `Fence` 建立相同的顺序约束。
+
+DMA 执行之前，设备首先读取待执行的 descriptors。因此，响应源数据、目标地址和 descriptor 字段的写入必须先于提交通知完成可见；否则，DMA engine 可能在状态尚未稳定时发起 descriptor fetch。相应地，提交路径需要在通知设备之前插入写屏障。实验平台仅提供 IOAT，因此实现与评估覆盖 staged response；基于 DSA Cache Flush 的 in-place response 保留为同一设计下的扩展路径。
+
+
+
+
+
+5.Evaluation
+
+我们在 SimCXL 上实现 CXL-RPC，并在多客户端单服务端场景下评估其端到端性能。除非特别说明，实验均运行在 non-cache-coherent 的 CXL shared memory 配置上。模拟器建模了 controller 对 doorbell 地址范围的匹配与 queue append 逻辑，以及 DMA 提交开销和数据搬运带宽。由于当前原型仅实现基于 IOAT 的 staged response，评估部分覆盖该响应路径；基于 DSA Cache Flush 的 in-place response 暂不进入实验结果。
+
+比较对象包括两类基线。第一类是 HydraRPC 风格的请求接收方式，即每个客户端维护独立请求入口，由服务端轮询多个通知源完成请求发现。第二类是共享服务端 message queue 的方案，即多个客户端直接竞争同一队尾完成请求发布。二者分别对应 Section 3 中分析的两类请求路径开销。
+
+评估围绕四个方面展开。Section 5.1 给出总体性能，比较不同并发度和消息规模下的吞吐与延迟分布。Section 5.2 分析各项机制的贡献，分别考察 controller-assisted doorbell write、queue prefetch、延迟 head 同步以及 DMA-assisted response publication 的影响。Section 5.3 进一步考察关键参数的敏感性，包括消息大小、客户端数量以及 queue 容量等因素。Section 5.4 将 CXL-RPC 集成到一个轻量级内存型 KV 服务中，考察其在端到端应用场景中的收益。
+
+We implement CXL-RPC in SimCXL and evaluate it in the multi-client single-server setting. Unless otherwise noted, all experiments use non-cache-coherent CXL shared memory. The simulator models controller-side doorbell-range matching and queue append logic, as well as DMA submission overhead and data-movement bandwidth. Since the current prototype implements only IOAT-based staged response, the evaluation covers that response path; DSA Cache Flush-based in-place response is not included in the current results.
+
+We compare against two baselines. The first follows the HydraRPC-style request reception path, where each client exposes a dedicated request entry and the server discovers requests by polling multiple notification sources. The second uses a shared server-side message queue, where all clients contend on a common publication point. These two baselines correspond to the two request-path costs discussed in Section 3.
+
+The evaluation is organized around four aspects. Section 5.1 presents overall performance, including throughput and latency distribution under different fan-in levels and message sizes. Section 5.2 quantifies the contribution of each design component, including controller-assisted doorbell write, queue prefetch, delayed head synchronization, and DMA-assisted response publication. Section 5.3 studies sensitivity to key parameters such as message size, client count, and queue capacity. Section 5.4 integrates CXL-RPC into a lightweight in-memory KV service and reports end-to-end application behavior.
+
+5.1 Overall Performance
+
+本节比较 CXL-RPC 与两类基线在常见 RPC 负载下的总体表现。我们重点观察两个方面：随着客户端数量增加，系统吞吐能否保持稳定扩展；在相同负载条件下，端到端延迟分布能否维持较低的中位数和尾部开销。除总体吞吐外，本节还报告不同消息规模和响应规模下的延迟 CDF，以观察 fan-in 与响应发布开销如何共同影响端到端性能。
+
+这一组实验主要验证本文设计是否缓解了 Section 3 中指出的两个瓶颈。若请求顺序汇聚仍主要由服务端轮询承担，吞吐会随客户端数量增加而更早饱和；若响应发布仍长期占用 CPU，较大的响应会进一步抬高尾延迟。总体性能实验因此提供全文最直接的端到端比较。
+
+This subsection compares CXL-RPC against the two baselines under representative RPC workloads. We focus on two aspects: whether throughput remains stable as the number of clients increases, and whether the end-to-end latency distribution retains low median and tail cost under the same load. In addition to aggregate throughput, we report latency CDFs under different request and response sizes to show how fan-in and response publication jointly affect end-to-end behavior.
+
+These experiments directly validate the two bottlenecks identified in Section 3. If request ordering is still recovered primarily through server-side polling, throughput should saturate earlier as client fan-in grows. If response publication still occupies the CPU, larger responses should further inflate tail latency. Overall performance therefore serves as the primary end-to-end comparison.
+
+5.2 技术分析
+
+本节拆分 CXL-RPC 的关键设计，分别量化各项机制带来的收益。对于请求路径，我们重点考察 controller-assisted doorbell write 是否降低了多源请求通知的顺序恢复开销，以及 queue prefetch 和延迟 head 同步对持续 polling 成本的影响。对于响应路径，我们比较 DMA-assisted response publication 与 CPU-driven response publication 的差异，考察响应规模增加时二者在吞吐、延迟和服务端处理器占用上的变化。
+
+这部分分析将总体性能中的收益还原到具体机制。通过逐项去除或替换设计组件，可以更清楚地说明 CXL-RPC 的性能改善分别来自请求接收侧的顺序汇聚，还是响应完成侧的数据移动卸载。
+
+This subsection isolates the main design components of CXL-RPC and quantifies their individual contribution. On the request path, we study whether controller-assisted doorbell write reduces the cost of reconstructing order across multiple notification sources, and how queue prefetch and delayed head synchronization affect sustained polling overhead. On the response path, we compare DMA-assisted response publication with CPU-driven publication to examine how throughput, latency, and server processor involvement evolve with response size.
+
+This analysis attributes the gains observed in overall performance to concrete mechanisms. By selectively removing or replacing individual components, we can separate the benefit of ordered request reception from that of offloaded response publication.
+
+5.3 敏感性分析
+
+本节进一步考察 CXL-RPC 对关键参数的敏感性。我们首先改变请求与响应的大小，以观察 small-message 和 large-response 两类负载下系统行为的变化；随后改变客户端数量，分析 fan-in 提升时吞吐与尾延迟的变化趋势；最后改变 message queue 容量与相关窗口参数，考察队列深度对请求接收路径稳定性的影响。
+
+敏感性分析的作用在于刻画设计的适用区间，而不仅是报告某组固定配置下的最优结果。对于 CXL-RPC 而言，消息规模决定 inline request 与响应发布代价的相对权重，并发客户端数量决定请求汇聚压力，而 queue 容量则影响 controller 和服务端之间的稳态节奏。这些因素共同决定系统在不同工作点上的表现。
+
+This subsection studies sensitivity to the main system parameters. We first vary request and response sizes to examine behavior under small-message and large-response workloads. We then vary the number of clients to characterize throughput and tail-latency trends as fan-in increases. Finally, we vary message-queue capacity and related window parameters to study how queue depth affects the stability of request reception.
+
+Sensitivity analysis is used to characterize the operating range of the design rather than to report a single best-case result. In CXL-RPC, message size determines the relative weight of inline request handling and response publication, client count determines fan-in pressure, and queue capacity shapes the steady-state interaction between controller and server. Together, these parameters determine system behavior across different operating points.
+
+5.4 Application performance
+
+除微基准外，我们还将 CXL-RPC 集成到一个轻量级内存型 KV 服务中，考察其在应用层上的端到端收益。该实验主要观察两点：前述请求接收与响应发布优化能否在真实服务逻辑中保留下来；当 value size 和访问并发度变化时，应用层吞吐与延迟是否呈现与微基准一致的趋势。KV 场景能够将共享内存中的对象访问、请求 fan-in 和响应返回统一到一个简单而完整的服务路径中。
+
+应用实验的作用在于补足系统论文常见的最后一层证据。若微基准中的收益能够迁移到内存型服务，说明 CXL-RPC 所优化的并不是某个孤立的数据通路，而是能够影响实际 RPC 服务执行过程中的关键开销。
+
+Beyond microbenchmarks, we integrate CXL-RPC into a lightweight in-memory KV service to evaluate end-to-end application behavior. This experiment examines whether the gains from request reception and response publication remain visible in a real service path, and whether throughput and latency under varying value sizes and client concurrency follow the same trend as the microbenchmarks. The KV setting combines shared-memory object access, client fan-in, and response return into a simple but complete service pipeline.
+
+This application study provides the final layer of evidence expected in a systems evaluation. If the benefits observed in microbenchmarks carry over to a memory-centric service, then CXL-RPC is improving not an isolated datapath, but a cost that remains relevant in practical RPC execution.
+
+
+6.Related Work
+
+6.1 关于CXL-mem的相关工作
+
+围绕 CXL.mem 的现有工作大致可分为两类。第一类将 CXL 作为内存扩展、资源解耦与池化的系统底座。DirectCXL 讨论了设备侧缓存与直接访问路径，说明 CXL-attached memory 可以以接近内存语义的方式参与主机访问路径。CXL-ANNS 进一步将 CXL memory 用于大规模近似最近邻检索，并讨论了降低远端访问代价的软硬件协同方法。Oasis 则将 CXL 扩展到资源池化场景，研究如何借助 CXL 提高解耦设备的利用率。这些工作共同表明，CXL 不仅是容量扩展接口，也可以作为共享数据和资源组织的系统基础。
+
+第二类工作将 CXL shared memory 用于实现更高层的系统抽象。CXL-SHM 面向基于 CXL 的分布式共享内存，重点讨论共享内存管理、引用跟踪和局部故障处理。HydraRPC 将 RPC 建立在 CXL-attached memory 之上，用共享内存中的队列和数据区完成请求与响应交换，展示了 CXL shared memory 作为 RPC 通信底座的可行性。
+
+CXL-RPC 与 HydraRPC 最为接近，但关注点不同。已有工作主要证明了 CXL shared memory 承载 RPC 的可行性；本文聚焦多客户端单服务端场景中的两个执行瓶颈：多源请求通知的顺序汇聚，以及响应结果向远端 CXL memory 的发布。围绕这两个问题，CXL-RPC 分别引入 controller-assisted doorbell write 和 DMA-assisted response path，相应地将设计重点放在 fan-in 场景下的请求接收与响应完成路径。
+
+Existing work around CXL.mem can be broadly divided into two categories. The first uses CXL as a substrate for memory expansion, resource disaggregation, and pooling. DirectCXL studies device-side caching and direct access to CXL-attached memory, showing that CXL memory can participate in the host access path with memory-like semantics. CXL-ANNS further places large approximate-nearest-neighbor workloads on CXL memory and explores software-hardware techniques to reduce remote-memory cost. Oasis extends CXL to resource pooling and examines how CXL can improve utilization of disaggregated devices. Together, these systems establish CXL as a practical substrate for organizing remote memory and shared resources.
+
+The second category uses CXL shared memory to realize higher-level system abstractions. CXL-SHM studies distributed shared memory over CXL, with an emphasis on memory management, reference tracking, and partial-failure handling. HydraRPC builds RPC on top of CXL-attached memory by exchanging requests and responses through shared-memory queues and data regions, demonstrating that CXL shared memory can serve as an RPC substrate.
+
+CXL-RPC is closest to HydraRPC, but addresses a different execution bottleneck. Prior work establishes the feasibility of CXL-based RPC; this paper focuses on the multi-client single-server setting, where the server must order request notifications under fan-in and publish responses efficiently to remote CXL memory. CXL-RPC therefore centers on controller-assisted request reception and DMA-assisted response publication.
+
+6.2 关于RPC的相关工作
+
+传统 RPC 框架，如 gRPC 和 Thrift，大多建立在 TCP/IP 之上，强调接口抽象、语言互操作和服务组合。请求与响应沿网络协议栈和 NIC 数据路径传输，序列化、拷贝和协议处理仍然位于关键路径上。对于大对象或复杂对象，这些开销还会随着对象封装与重建进一步放大。
+
+面向数据中心的高性能 RPC 工作则试图压缩上述路径上的软件与传输开销。FaSST 使用 two-sided RDMA datagram 构建低延迟 RPC；eRPC 表明通用 RPC 可以在 commodity datacenter network 上获得高消息率和低时延；mRPC 进一步降低了 RDMA RPC 的 CPU 开销。尽管设计选择不同，这些系统都仍以 NIC 为中心：请求与响应数据需要经过网络数据面，传输开销仍然构成 RPC 执行成本的重要部分。
+
+另一类相关工作关注 pass-by-reference。In Reference to RPC 指出，大对象和内存对象不宜一律按值传递，而应允许 RPC 直接传递引用，并将对象访问纳入接口语义。这一方向与本文的动机相近，但讨论重点在编程抽象与对象访问模型。CXL-RPC 则讨论共享 CXL memory 上的实现机制：当请求载荷、响应载荷和被引用对象位于同一内存底座时，系统需要解决的关键问题转化为多源请求通知的顺序整理，以及响应结果的发布与完成。
+
+Conventional RPC frameworks, such as gRPC and Thrift, are largely built on TCP/IP and emphasize interface abstraction, language interoperability, and service composition. Requests and responses traverse the network stack and NIC datapath, so serialization, copying, and protocol processing remain on the critical path. For large or complex objects, these costs are further amplified by object marshaling and reconstruction.
+
+High-performance RPC systems for datacenters compress this path through transport bypass and careful CPU/NIC coordination. FaSST builds low-latency RPC using two-sided RDMA datagrams. eRPC shows that general-purpose RPC can achieve low latency and high message rate on commodity datacenter networks. mRPC further reduces CPU overhead in RDMA-based RPC. Despite their differences, these systems remain NIC-centric: request and response data still move through a network datapath, and transport remains a first-class part of RPC cost.
+
+A related line of work advocates pass-by-reference semantics. In Reference to RPC argues that large or memory-resident objects should be accessed through references rather than transferred by value. This direction is related to our motivation, but focuses on the abstraction of object access. CXL-RPC instead studies the system mechanisms on top of shared CXL memory: once request payloads, response payloads, and referenced objects reside in the same memory substrate, the main design questions become request ordering and response publication.
