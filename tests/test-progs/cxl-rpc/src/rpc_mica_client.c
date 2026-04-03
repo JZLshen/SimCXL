@@ -46,6 +46,7 @@
 #define DEFAULT_SLOW_CLIENT_SEND_PAUSE_ITERS 0
 #define CLIENT_RPC_ID_MAX 32767u
 #define CLIENT_RPC_ID_SPACE (CLIENT_RPC_ID_MAX + 1u)
+#define FIXED_UNIFORM_PLAN_LEN 30u
 
 typedef struct {
     uint8_t op;
@@ -404,11 +405,114 @@ sample_zipf_key_id(const double *cdf, uint64_t record_count, uint64_t *rng_state
 }
 
 static int
+sample_uniform_key_id(uint64_t record_count, uint64_t *rng_state,
+                      uint64_t *out_key_id)
+{
+    if (!rng_state || !out_key_id || record_count == 0)
+        return -1;
+
+    *out_key_id = next_random_u64(rng_state) % record_count;
+    return 0;
+}
+
+static int
+uses_fixed_uniform_plan(const char *profile_name, rpc_app_key_dist_t key_dist)
+{
+    return key_dist == RPC_APP_KEY_DIST_UNIFORM &&
+           rpc_app_profile_has_variable_layout(profile_name);
+}
+
+static uint64_t
+fixed_uniform_plan_slot(uint64_t client_id, uint64_t req_index)
+{
+    return (req_index + (client_id % FIXED_UNIFORM_PLAN_LEN)) %
+           FIXED_UNIFORM_PLAN_LEN;
+}
+
+static void
+fixed_uniform_plan_bins(uint64_t plan_slot,
+                        size_t *out_key_bin,
+                        size_t *out_value_bin)
+{
+    size_t key_bin = (size_t)(plan_slot % RPC_APP_UDB_BIN_COUNT);
+    size_t block = (size_t)((plan_slot / RPC_APP_UDB_BIN_COUNT) % 3u);
+    size_t value_bin = (key_bin + (block * 3u)) % RPC_APP_UDB_BIN_COUNT;
+
+    if (out_key_bin)
+        *out_key_bin = key_bin;
+    if (out_value_bin)
+        *out_value_bin = value_bin;
+}
+
+static int
+fixed_uniform_key_used(const app_operation_t *ops,
+                       uint64_t used_count,
+                       uint64_t key_id)
+{
+    uint64_t idx;
+
+    if (!ops)
+        return 0;
+
+    for (idx = 0; idx < used_count; idx++) {
+        if (ops[idx].key_id == key_id)
+            return 1;
+    }
+
+    return 0;
+}
+
+static int
+find_fixed_uniform_key_id(const app_operation_t *ops,
+                          uint64_t used_count,
+                          uint64_t record_count,
+                          uint64_t client_id,
+                          uint64_t plan_slot,
+                          uint64_t dataset_seed,
+                          uint64_t *out_key_id)
+{
+    uint64_t start_key_id;
+    uint64_t step;
+    size_t target_key_bin = 0;
+    size_t target_value_bin = 0;
+
+    if (!ops || !out_key_id || record_count == 0)
+        return -1;
+
+    fixed_uniform_plan_bins(plan_slot, &target_key_bin, &target_value_bin);
+    start_key_id = rpc_app_mix64(
+        dataset_seed ^
+        ((client_id + 1u) * 0x9E3779B185EBCA87ULL) ^
+        ((plan_slot + 1u) * 0xD6E8FEB86659FD93ULL)) % record_count;
+
+    for (step = 0; step < record_count; step++) {
+        uint64_t key_id = (start_key_id + step) % record_count;
+
+        if (fixed_uniform_key_used(ops, used_count, key_id))
+            continue;
+        if (rpc_app_udb_key_bin_index(dataset_seed, key_id) != target_key_bin)
+            continue;
+        if (rpc_app_udb_value_bin_index(dataset_seed, key_id) !=
+            target_value_bin) {
+            continue;
+        }
+
+        *out_key_id = key_id;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int
 build_operations(app_operation_t *ops, uint64_t num_requests,
                  const char *profile_name,
                  uint64_t record_count, size_t key_size, size_t value_size,
+                 uint64_t client_id,
                  size_t max_key_size,
-                 double read_ratio, double update_ratio, double zipf_theta,
+                 double read_ratio, double update_ratio, double rmw_ratio,
+                 rpc_app_key_dist_t key_dist,
+                 double zipf_theta,
                  uint64_t dataset_seed, uint64_t workload_seed)
 {
     double *cdf = NULL;
@@ -420,8 +524,8 @@ build_operations(app_operation_t *ops, uint64_t num_requests,
         key_size == 0 || value_size == 0 || max_key_size == 0) {
         return -1;
     }
-    if (read_ratio < 0.0 || update_ratio < 0.0 ||
-        fabs((read_ratio + update_ratio) - 1.0) > 1e-6) {
+    if (read_ratio < 0.0 || update_ratio < 0.0 || rmw_ratio < 0.0 ||
+        fabs((read_ratio + update_ratio + rmw_ratio) - 1.0) > 1e-6) {
         return -1;
     }
 
@@ -429,7 +533,8 @@ build_operations(app_operation_t *ops, uint64_t num_requests,
     if (!key_buf)
         return -1;
 
-    if (build_zipf_cdf(zipf_theta, record_count, &cdf) != 0) {
+    if (key_dist == RPC_APP_KEY_DIST_ZIPF &&
+        build_zipf_cdf(zipf_theta, record_count, &cdf) != 0) {
         free(key_buf);
         return -1;
     }
@@ -437,9 +542,31 @@ build_operations(app_operation_t *ops, uint64_t num_requests,
     for (req_index = 0; req_index < num_requests; req_index++) {
         size_t record_key_len = 0;
         size_t record_value_len = 0;
-        uint64_t key_id = sample_zipf_key_id(cdf, record_count, &rng_state);
+        uint64_t key_id = 0;
         uint64_t key_hash;
         double selector;
+
+        if (uses_fixed_uniform_plan(profile_name, key_dist)) {
+            uint64_t plan_slot = fixed_uniform_plan_slot(client_id, req_index);
+
+            if (find_fixed_uniform_key_id(ops,
+                                          req_index,
+                                          record_count,
+                                          client_id,
+                                          plan_slot,
+                                          dataset_seed,
+                                          &key_id) != 0) {
+                free(key_buf);
+                free(cdf);
+                return -1;
+            }
+        } else if (key_dist == RPC_APP_KEY_DIST_ZIPF) {
+            key_id = sample_zipf_key_id(cdf, record_count, &rng_state);
+        } else if (sample_uniform_key_id(record_count, &rng_state, &key_id) != 0) {
+            free(key_buf);
+            free(cdf);
+            return -1;
+        }
 
         rpc_app_record_layout(profile_name, dataset_seed, key_id,
                               key_size, value_size,
@@ -455,8 +582,13 @@ build_operations(app_operation_t *ops, uint64_t num_requests,
         key_hash = rpc_app_hash_bytes(key_buf, record_key_len);
         selector = next_random_double(&rng_state);
 
-        ops[req_index].op = (selector < read_ratio) ? RPC_APP_OP_GET
-                                                    : RPC_APP_OP_PUT;
+        if (selector < read_ratio) {
+            ops[req_index].op = RPC_APP_OP_GET;
+        } else if (selector < (read_ratio + update_ratio)) {
+            ops[req_index].op = RPC_APP_OP_PUT;
+        } else {
+            ops[req_index].op = RPC_APP_OP_RMW;
+        }
         ops[req_index].key_len = (uint16_t)record_key_len;
         ops[req_index].value_len = (uint32_t)record_value_len;
         ops[req_index].key_id = key_id;
@@ -493,7 +625,9 @@ send_one_request(cxl_connection_t *conn,
     req_len = rpc_app_request_wire_size(
         op->op,
         op->key_len,
-        (op->op == RPC_APP_OP_PUT) ? op->value_len : 0u);
+        (op->op == RPC_APP_OP_PUT || op->op == RPC_APP_OP_RMW) ?
+            op->value_len :
+            0u);
     if (req_len > req_buf_size)
         return -1;
 
@@ -502,12 +636,16 @@ send_one_request(cxl_connection_t *conn,
     hdr->op = op->op;
     hdr->key_len = (uint8_t)op->key_len;
     hdr->reserved0 = 0;
-    hdr->value_len = (uint32_t)((op->op == RPC_APP_OP_PUT) ? op->value_len : 0u);
+    hdr->value_len = (uint32_t)(
+        (op->op == RPC_APP_OP_PUT || op->op == RPC_APP_OP_RMW) ?
+            op->value_len :
+            0u
+    );
     hdr->key_hash = op->key_hash;
 
     key_ptr = (uint8_t *)(hdr + 1);
     rpc_app_fill_key(key_ptr, op->key_len, dataset_seed, op->key_id);
-    if (op->op == RPC_APP_OP_PUT) {
+    if (op->op == RPC_APP_OP_PUT || op->op == RPC_APP_OP_RMW) {
         rpc_app_fill_value(key_ptr + op->key_len,
                            op->value_len, op->value_seed);
     }
@@ -608,19 +746,21 @@ drain_completed_responses(cxl_connection_t *conn,
         }
 
         if (resp_hdr->status == RPC_APP_STATUS_OK &&
-            resp_hdr->op == RPC_APP_OP_GET) {
+            (resp_hdr->op == RPC_APP_OP_GET ||
+             resp_hdr->op == RPC_APP_OP_RMW)) {
             if (resp_hdr->value_len != expected_op->value_len) {
-                fprintf(stderr, "client: GET value size mismatch\n");
+                fprintf(stderr, "client: GET/RMW value size mismatch\n");
                 return -1;
             }
             value_ptr = (const uint8_t *)(resp_hdr + 1);
             if (rpc_app_checksum_bytes(value_ptr, resp_hdr->value_len) !=
                 resp_hdr->value_checksum) {
-                fprintf(stderr, "client: GET value checksum mismatch\n");
+                fprintf(stderr, "client: GET/RMW value checksum mismatch\n");
                 return -1;
             }
         } else if (resp_hdr->value_len != 0 || resp_hdr->value_checksum != 0) {
-            fprintf(stderr, "client: unexpected response payload for non-GET\n");
+            fprintf(stderr,
+                    "client: unexpected response payload for non-GET/RMW\n");
             return -1;
         }
 
@@ -672,6 +812,8 @@ main(int argc, char **argv)
     uint64_t workload_seed = RPC_APP_DEFAULT_WORKLOAD_SEED;
     double read_ratio = 0.0;
     double update_ratio = 0.0;
+    double rmw_ratio = 0.0;
+    rpc_app_key_dist_t key_dist = RPC_APP_KEY_DIST_ZIPF;
     double zipf_theta = 0.0;
     size_t reserve_n;
     int num_requests = parse_int_arg(argc, argv, "--requests",
@@ -684,22 +826,25 @@ main(int argc, char **argv)
     int node_id = parse_int_arg_range(argc, argv, "--node-id", 0,
                                       0, MAX_CLIENTS - 1);
     int slow_client_count = DEFAULT_SLOW_CLIENT_COUNT;
+    int slow_count_per_client = 0;
     int slow_client_send_pause_iters = DEFAULT_SLOW_CLIENT_SEND_PAUSE_ITERS;
     int key_size_overridden = has_flag(argc, argv, "--key-size");
     int value_size_overridden = has_flag(argc, argv, "--value-size");
     int allow_miss = has_flag(argc, argv, "--allow-miss");
     int variable_layout = 0;
     int is_slow_client;
+    int client_request_count;
     int send_pause_iters;
 
     if (parse_profile_arg(argc, argv, RPC_APP_PROFILE_YCSB_C_1K,
                           &profile) != 0) {
         fprintf(stderr,
                 "client: invalid --profile "
-                "(use %s|%s|%s|%s; alias %s also accepted)\n",
+                "(use %s|%s|%s|%s|%s; alias %s also accepted)\n",
                 RPC_APP_PROFILE_YCSB_C_1K,
                 RPC_APP_PROFILE_YCSB_A_1K,
                 RPC_APP_PROFILE_YCSB_B_1K,
+                RPC_APP_PROFILE_YCSB_F_1K,
                 RPC_APP_PROFILE_UDB_RO,
                 RPC_APP_PROFILE_YCSB_1K_RO);
         return 1;
@@ -708,6 +853,8 @@ main(int argc, char **argv)
     value_size = profile.value_size;
     read_ratio = profile.read_ratio;
     update_ratio = profile.update_ratio;
+    rmw_ratio = profile.rmw_ratio;
+    key_dist = profile.key_dist;
     zipf_theta = profile.zipf_theta;
 
     if (parse_required_int_arg_range(argc, argv, "--window",
@@ -728,6 +875,16 @@ main(int argc, char **argv)
                 MAX_CLIENTS);
         return 1;
     }
+    if (parse_required_int_arg_range(argc, argv, "--slow-count-per-client",
+                                     0,
+                                     0, INT_MAX,
+                                     &slow_count_per_client) != 0) {
+        fprintf(stderr,
+                "client: invalid --slow-count-per-client "
+                "(range 0..%d)\n",
+                INT_MAX);
+        return 1;
+    }
     if (parse_required_int_arg_range(argc, argv,
                                      "--slow-client-send-pause-iters",
                                      DEFAULT_SLOW_CLIENT_SEND_PAUSE_ITERS,
@@ -741,6 +898,14 @@ main(int argc, char **argv)
     }
     if (node_id >= num_clients || slow_client_count > num_clients) {
         fprintf(stderr, "client: invalid num-clients / node-id / slow-client-count\n");
+        return 1;
+    }
+    if (slow_client_count > 0 &&
+        (slow_count_per_client <= 0 || slow_count_per_client > num_requests)) {
+        fprintf(stderr,
+                "client: slow_count_per_client=%d must be in range 1..%d "
+                "when slow_client_count > 0\n",
+                slow_count_per_client, num_requests);
         return 1;
     }
     if (parse_size_arg(argc, argv, "--key-size", key_size,
@@ -780,13 +945,17 @@ main(int argc, char **argv)
                          read_ratio, 0.0, 1.0, &read_ratio) != 0 ||
         parse_double_arg(argc, argv, "--update-ratio",
                          update_ratio, 0.0, 1.0, &update_ratio) != 0 ||
-        parse_double_arg(argc, argv, "--zipf-theta",
-                         zipf_theta, 0.01, 1.50, &zipf_theta) != 0) {
+        parse_double_arg(argc, argv, "--rmw-ratio",
+                         rmw_ratio, 0.0, 1.0, &rmw_ratio) != 0 ||
+        (key_dist == RPC_APP_KEY_DIST_ZIPF &&
+         parse_double_arg(argc, argv, "--zipf-theta",
+                          zipf_theta, 0.01, 1.50, &zipf_theta) != 0)) {
         fprintf(stderr, "client: invalid workload ratio/theta argument\n");
         return 1;
     }
-    if (fabs((read_ratio + update_ratio) - 1.0) > 1e-6) {
-        fprintf(stderr, "client: read-ratio + update-ratio must equal 1.0\n");
+    if (fabs((read_ratio + update_ratio + rmw_ratio) - 1.0) > 1e-6) {
+        fprintf(stderr,
+                "client: read-ratio + update-ratio + rmw-ratio must equal 1.0\n");
         return 1;
     }
     variable_layout = rpc_app_profile_has_variable_layout(profile.name) &&
@@ -809,16 +978,19 @@ main(int argc, char **argv)
     setlinebuf(stdout);
     setvbuf(stderr, NULL, _IONBF, 0);
     is_slow_client = (slow_client_count > 0 && node_id < slow_client_count);
+    client_request_count = is_slow_client ? slow_count_per_client : num_requests;
     send_pause_iters = is_slow_client ? slow_client_send_pause_iters : 0;
     rpc_markerf("init_begin",
-                "profile=%s,node=%d,num_clients=%d,requests=%d,key_size=%zu,value_size=%zu,max_key_size=%zu,max_value_size=%zu,record_count=%llu,read_ratio=%.3f,update_ratio=%.3f,window=%d,slow_client_count=%d,is_slow_client=%d,slow_client_send_pause_iters=%d,allow_miss=%d,variable_layout=%d",
-                profile.name, node_id, num_clients, num_requests, key_size,
+                "profile=%s,node=%d,num_clients=%d,requests=%d,base_requests=%d,key_size=%zu,value_size=%zu,max_key_size=%zu,max_value_size=%zu,record_count=%llu,read_ratio=%.3f,update_ratio=%.3f,rmw_ratio=%.3f,window=%d,slow_client_count=%d,slow_count_per_client=%d,is_slow_client=%d,slow_client_send_pause_iters=%d,allow_miss=%d,variable_layout=%d",
+                profile.name, node_id, num_clients, client_request_count,
+                num_requests, key_size,
                 value_size, max_key_size, max_value_size,
                 (unsigned long long)record_count, read_ratio,
-                update_ratio, sliding_window, slow_client_count,
-                is_slow_client, send_pause_iters, allow_miss, variable_layout);
+                update_ratio, rmw_ratio, sliding_window, slow_client_count,
+                slow_count_per_client, is_slow_client, send_pause_iters,
+                allow_miss, variable_layout);
 
-    reserve_n = (num_requests > 0) ? (size_t)num_requests : 1u;
+    reserve_n = (client_request_count > 0) ? (size_t)client_request_count : 1u;
     ops = (app_operation_t *)calloc(reserve_n, sizeof(*ops));
     request_start_ticks = (uint64_t *)calloc(reserve_n, sizeof(uint64_t));
     request_end_ticks = (uint64_t *)calloc(reserve_n, sizeof(uint64_t));
@@ -839,10 +1011,12 @@ main(int argc, char **argv)
             rpc_id_to_request_index[i] = -1;
     }
 
-    if (num_requests > 0 &&
-        build_operations(ops, (uint64_t)num_requests, profile.name,
-                         record_count, key_size, value_size, max_key_size,
-                         read_ratio, update_ratio, zipf_theta,
+    if (client_request_count > 0 &&
+        build_operations(ops, (uint64_t)client_request_count, profile.name,
+                         record_count, key_size, value_size, (uint64_t)node_id,
+                         max_key_size,
+                         read_ratio, update_ratio, rmw_ratio, key_dist,
+                         zipf_theta,
                          dataset_seed,
                          workload_seed ^ (uint64_t)(node_id + 1)) != 0) {
         fprintf(stderr, "client: build workload operations failed\n");
@@ -850,7 +1024,8 @@ main(int argc, char **argv)
         goto cleanup;
     }
     rpc_markerf("workload_ready", "profile=%s,requests=%d,record_count=%llu",
-                profile.name, num_requests, (unsigned long long)record_count);
+                profile.name, client_request_count,
+                (unsigned long long)record_count);
 
     ctx = cxl_rpc_init(CXL_BASE, CXL_SIZE);
     if (!ctx) {
@@ -883,7 +1058,7 @@ main(int argc, char **argv)
         }
     }
 
-    if (keep_running && num_requests > 0) {
+    if (keep_running && client_request_count > 0) {
         int first_req_id = send_one_request(conn,
                                             req_buf, max_request_size,
                                             &ops[sent_requests],
@@ -918,9 +1093,10 @@ main(int argc, char **argv)
 
     }
 
-    while (keep_running && rc == 0 && completed_requests < num_requests) {
+    while (keep_running && rc == 0 &&
+           completed_requests < client_request_count) {
         int inflight = sent_requests - completed_requests;
-        int can_send = (sent_requests < num_requests);
+        int can_send = (sent_requests < client_request_count);
         int should_poll = (inflight >= sliding_window) || !can_send;
 
         if (can_send && !should_poll) {
@@ -960,7 +1136,8 @@ main(int argc, char **argv)
         }
     }
 
-    if (sent_requests != num_requests || completed_requests != num_requests)
+    if (sent_requests != client_request_count ||
+        completed_requests != client_request_count)
         rc = 1;
 
 cleanup:

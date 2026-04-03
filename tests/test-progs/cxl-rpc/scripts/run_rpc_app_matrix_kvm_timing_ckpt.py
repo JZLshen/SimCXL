@@ -6,11 +6,13 @@ Run MICA-like application-path CXL RPC experiments with:
   - checkpoint reuse by hardware topology
   - raw client latency and server breakdown extraction
 
-Default experiment scope follows the current in-project application path from
-exp.txt:
+Default experiment scope follows the current documented application-path
+workload set:
   - fixed 32 clients
-  - YCSB-C 1KB KV workload
   - YCSB-A 1KB KV workload
+  - YCSB-B 1KB KV workload
+  - YCSB-C 1KB KV workload
+  - YCSB-F 1KB KV workload
   - UDB-like read-only 27B/127B KV workload
 """
 
@@ -37,10 +39,10 @@ DEFAULT_REQUESTS = 30
 DEFAULT_MQ_ENTRIES = bare_rpc.DEFAULT_MQ_ENTRIES
 DEFAULT_RESPONSE_DMA_THRESHOLD = bare_rpc.DEFAULT_RESPONSE_DMA_THRESHOLD
 DEFAULT_PREFETCH_MODE = bare_rpc.DEFAULT_PREFETCH_MODE
-DEFAULT_RECORD_COUNT = 100000
+DEFAULT_RECORD_COUNT = 10000
 DEFAULT_DATASET_SEED = 0x9B5D3A4781C26EF1
 DEFAULT_WORKLOAD_SEED = 0xC7D51A32049EF68B
-DEFAULT_PROFILES = ("ycsb_c_1k", "ycsb_a_1k", "udb_ro")
+DEFAULT_PROFILES = ("ycsb_a_1k", "ycsb_b_1k", "ycsb_c_1k", "ycsb_f_1k", "udb_ro")
 
 
 @dataclass(frozen=True)
@@ -49,8 +51,10 @@ class ProfileConfig:
     key_size: int
     value_size: int
     size_mode: str
+    key_dist: str
     read_ratio: float
     update_ratio: float
+    rmw_ratio: float
     zipf_theta: float
 
 
@@ -60,8 +64,10 @@ PROFILE_CONFIGS: Dict[str, ProfileConfig] = {
         key_size=16,
         value_size=1024,
         size_mode="fixed",
+        key_dist="zipf",
         read_ratio=1.0,
         update_ratio=0.0,
+        rmw_ratio=0.0,
         zipf_theta=0.99,
     ),
     "ycsb_1k_ro": ProfileConfig(
@@ -69,8 +75,10 @@ PROFILE_CONFIGS: Dict[str, ProfileConfig] = {
         key_size=16,
         value_size=1024,
         size_mode="fixed",
+        key_dist="zipf",
         read_ratio=1.0,
         update_ratio=0.0,
+        rmw_ratio=0.0,
         zipf_theta=0.99,
     ),
     "ycsb_a_1k": ProfileConfig(
@@ -78,8 +86,10 @@ PROFILE_CONFIGS: Dict[str, ProfileConfig] = {
         key_size=16,
         value_size=1024,
         size_mode="fixed",
+        key_dist="zipf",
         read_ratio=0.5,
         update_ratio=0.5,
+        rmw_ratio=0.0,
         zipf_theta=0.99,
     ),
     "ycsb_b_1k": ProfileConfig(
@@ -87,8 +97,21 @@ PROFILE_CONFIGS: Dict[str, ProfileConfig] = {
         key_size=16,
         value_size=1024,
         size_mode="fixed",
+        key_dist="zipf",
         read_ratio=0.95,
         update_ratio=0.05,
+        rmw_ratio=0.0,
+        zipf_theta=0.99,
+    ),
+    "ycsb_f_1k": ProfileConfig(
+        name="ycsb_f_1k",
+        key_size=16,
+        value_size=1024,
+        size_mode="fixed",
+        key_dist="zipf",
+        read_ratio=0.0,
+        update_ratio=0.0,
+        rmw_ratio=1.0,
         zipf_theta=0.99,
     ),
     "udb_ro": ProfileConfig(
@@ -96,9 +119,11 @@ PROFILE_CONFIGS: Dict[str, ProfileConfig] = {
         key_size=27,
         value_size=127,
         size_mode="variable",
+        key_dist="uniform",
         read_ratio=1.0,
         update_ratio=0.0,
-        zipf_theta=0.99,
+        rmw_ratio=0.0,
+        zipf_theta=0.0,
     ),
 }
 
@@ -112,8 +137,10 @@ class ExperimentKey:
     key_size: int
     value_size: int
     size_mode: str
+    key_dist: str
     read_ratio: float
     update_ratio: float
+    rmw_ratio: float
     zipf_theta: float
     dataset_seed: int = DEFAULT_DATASET_SEED
     workload_seed: int = DEFAULT_WORKLOAD_SEED
@@ -154,6 +181,12 @@ def parse_profiles_arg(raw: str) -> List[str]:
 def format_float_token(value: float) -> str:
     text = f"{value:.3f}".rstrip("0").rstrip(".")
     return text.replace(".", "p")
+
+
+def format_zipf_field(key_dist: str, zipf_theta: float) -> str:
+    if key_dist != "zipf":
+        return ""
+    return f"{zipf_theta:.6f}"
 
 
 def format_exp_id(key: ExperimentKey) -> str:
@@ -216,8 +249,10 @@ def build_matrix(
             key_size=profile.key_size,
             value_size=profile.value_size,
             size_mode=profile.size_mode,
+            key_dist=profile.key_dist,
             read_ratio=profile.read_ratio,
             update_ratio=profile.update_ratio,
+            rmw_ratio=profile.rmw_ratio,
             zipf_theta=profile.zipf_theta,
             dataset_seed=dataset_seed,
             workload_seed=workload_seed,
@@ -249,9 +284,11 @@ def experiment_metadata_row(key: ExperimentKey) -> Dict[str, object]:
         "key_size": key.key_size,
         "value_size": key.value_size,
         "size_mode": key.size_mode,
+        "key_dist": key.key_dist,
         "read_ratio": f"{key.read_ratio:.6f}",
         "update_ratio": f"{key.update_ratio:.6f}",
-        "zipf_theta": f"{key.zipf_theta:.6f}",
+        "rmw_ratio": f"{key.rmw_ratio:.6f}",
+        "zipf_theta": format_zipf_field(key.key_dist, key.zipf_theta),
         "dataset_seed": str(key.dataset_seed),
         "workload_seed": str(key.workload_seed),
         "mq_entries": key.mq_entries,
@@ -281,12 +318,15 @@ def profile_arg_list(key: ExperimentKey) -> List[str]:
 
 
 def workload_arg_list(key: ExperimentKey) -> List[str]:
-    return [
+    args = [
         f"--workload-seed {key.workload_seed}",
         f"--read-ratio {key.read_ratio:.6f}",
         f"--update-ratio {key.update_ratio:.6f}",
-        f"--zipf-theta {key.zipf_theta:.6f}",
+        f"--rmw-ratio {key.rmw_ratio:.6f}",
     ]
+    if key.key_dist == "zipf":
+        args.append(f"--zipf-theta {key.zipf_theta:.6f}")
+    return args
 
 
 def main() -> int:
@@ -301,6 +341,15 @@ def main() -> int:
         type=str,
         default="",
         help="Path to guest disk image. Empty uses repo_root/files/parsec.img.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="",
+        help=(
+            "Reuse this existing checkpoint for every experiment in the batch. "
+            "Caller is responsible for ensuring topology compatibility."
+        ),
     )
     parser.add_argument("--profiles", type=str, default=",".join(DEFAULT_PROFILES))
     parser.add_argument("--clients", type=int, default=DEFAULT_CLIENTS)
@@ -429,6 +478,17 @@ def main() -> int:
         if args.disk else
         (repo_root / "files" / "parsec.img").resolve()
     )
+    external_checkpoint_dir: Optional[Path] = None
+    if args.checkpoint_dir:
+        external_checkpoint_dir = bare_rpc.resolve_checkpoint_dir(
+            Path(args.checkpoint_dir).resolve()
+        )
+        if external_checkpoint_dir is None:
+            print(
+                f"[fatal] --checkpoint-dir does not resolve to a checkpoint: "
+                f"{args.checkpoint_dir}"
+            )
+            return 2
 
     experiments = build_matrix(
         profiles=profiles,
@@ -467,8 +527,10 @@ def main() -> int:
                 "key_size",
                 "value_size",
                 "size_mode",
+                "key_dist",
                 "read_ratio",
                 "update_ratio",
+                "rmw_ratio",
                 "zipf_theta",
                 "dataset_seed",
                 "workload_seed",
@@ -513,8 +575,10 @@ def main() -> int:
         "key_size",
         "value_size",
         "size_mode",
+        "key_dist",
         "read_ratio",
         "update_ratio",
+        "rmw_ratio",
         "zipf_theta",
         "dataset_seed",
         "workload_seed",
@@ -548,8 +612,10 @@ def main() -> int:
         "key_size",
         "value_size",
         "size_mode",
+        "key_dist",
         "read_ratio",
         "update_ratio",
+        "rmw_ratio",
         "zipf_theta",
         "dataset_seed",
         "workload_seed",
@@ -575,8 +641,10 @@ def main() -> int:
         "key_size",
         "value_size",
         "size_mode",
+        "key_dist",
         "read_ratio",
         "update_ratio",
+        "rmw_ratio",
         "zipf_theta",
         "dataset_seed",
         "workload_seed",
@@ -691,8 +759,6 @@ def main() -> int:
                 key.mq_entries,
                 key.cxl_extra_latency_ns,
             )
-            checkpoint_dir = checkpoint_cache.get(checkpoint_key)
-            checkpoint_failure = checkpoint_failure_cache.get(checkpoint_key)
             checkpoint_label = (
                 f"boot_{args.boot_cpu_type.lower()}"
                 f"_"
@@ -701,11 +767,19 @@ def main() -> int:
                 f"_mq_{key.mq_entries}"
                 f"_cxlp_{key.cxl_extra_latency_ns}ns"
             )
-            ckpt_outdir = (
-                batch_dir / "checkpoints" / checkpoint_label / "cxl_rpc_app_checkpoint"
-            )
+            if external_checkpoint_dir is not None:
+                checkpoint_dir = external_checkpoint_dir
+                checkpoint_failure = None
+                ckpt_outdir = external_checkpoint_dir
+            else:
+                checkpoint_dir = checkpoint_cache.get(checkpoint_key)
+                checkpoint_failure = checkpoint_failure_cache.get(checkpoint_key)
+                ckpt_outdir = (
+                    batch_dir / "checkpoints" / checkpoint_label /
+                    "cxl_rpc_app_checkpoint"
+                )
 
-            if checkpoint_dir is None:
+            if external_checkpoint_dir is None and checkpoint_dir is None:
                 if checkpoint_failure is not None:
                     failed_status, failed_rc = checkpoint_failure
                     cached_status = f"{failed_status}_cached"
@@ -950,7 +1024,10 @@ def main() -> int:
                 f"reqs/client={key.requests_per_client}, rec={key.record_count}, "
                 f"kv={key.key_size}/{key.value_size}, rr={format_float_token(key.read_ratio)}, "
                 f"ur={format_float_token(key.update_ratio)}, "
-                f"zipf={format_float_token(key.zipf_theta)}, mq={key.mq_entries}, "
+                f"rmw={format_float_token(key.rmw_ratio)}, "
+                f"dist={key.key_dist}, "
+                f"{f'zipf={format_float_token(key.zipf_theta)}, ' if key.key_dist == 'zipf' else ''}"
+                f"mq={key.mq_entries}, "
                 f"hs={key.head_sync_threshold}, "
                 f"cxl+={key.cxl_extra_latency_ns}ns, lanes={key.response_lane_count}, "
                 f"cpl={key.clients_per_dma_lane}, dmath={key.response_dma_threshold}, "

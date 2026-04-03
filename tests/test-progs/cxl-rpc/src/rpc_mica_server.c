@@ -617,10 +617,11 @@ main(int argc, char **argv)
                           &profile) != 0) {
         fprintf(stderr,
                 "server: invalid --profile "
-                "(use %s|%s|%s|%s; alias %s also accepted)\n",
+                "(use %s|%s|%s|%s|%s; alias %s also accepted)\n",
                 RPC_APP_PROFILE_YCSB_C_1K,
                 RPC_APP_PROFILE_YCSB_A_1K,
                 RPC_APP_PROFILE_YCSB_B_1K,
+                RPC_APP_PROFILE_YCSB_F_1K,
                 RPC_APP_PROFILE_UDB_RO,
                 RPC_APP_PROFILE_YCSB_1K_RO);
         return 1;
@@ -879,17 +880,19 @@ main(int argc, char **argv)
             value_ptr = key_ptr + req_hdr->key_len;
             if (req_hdr->key_len == 0 || req_hdr->key_len > max_key_size ||
                 (req_hdr->op != RPC_APP_OP_GET &&
-                 req_hdr->op != RPC_APP_OP_PUT) ||
+                 req_hdr->op != RPC_APP_OP_PUT &&
+                 req_hdr->op != RPC_APP_OP_RMW) ||
                 rpc_app_request_wire_size(req_hdr->op, req_hdr->key_len,
                                           req_hdr->value_len) != req_len) {
                 fprintf(stderr, "server: malformed application request\n");
                 rc = 1;
                 break;
             }
-            if (req_hdr->op == RPC_APP_OP_PUT &&
+            if ((req_hdr->op == RPC_APP_OP_PUT ||
+                 req_hdr->op == RPC_APP_OP_RMW) &&
                 (req_hdr->value_len == 0 ||
                  req_hdr->value_len > max_value_size)) {
-                fprintf(stderr, "server: PUT value size out of range\n");
+                fprintf(stderr, "server: PUT/RMW value size out of range\n");
                 rc = 1;
                 break;
             }
@@ -921,6 +924,26 @@ main(int argc, char **argv)
                 if (mica_store_update_value(&store, record_index,
                                             value_ptr, req_hdr->value_len) != 0) {
                     fprintf(stderr, "server: PUT update failed\n");
+                    rc = 1;
+                    break;
+                }
+            } else if (found && req_hdr->op == RPC_APP_OP_RMW) {
+                uint8_t *dst = (uint8_t *)(resp_hdr + 1);
+                const uint8_t *src =
+                    store.values + ((size_t)record_index * store.max_value_size);
+                uint32_t actual_value_len = store.value_lengths[record_index];
+
+                if (req_hdr->value_len != actual_value_len) {
+                    fprintf(stderr, "server: RMW value size mismatch\n");
+                    rc = 1;
+                    break;
+                }
+                memcpy(dst, src, actual_value_len);
+                resp_hdr->value_len = actual_value_len;
+                resp_hdr->value_checksum = store.checksums[record_index];
+                if (mica_store_update_value(&store, record_index,
+                                            value_ptr, req_hdr->value_len) != 0) {
+                    fprintf(stderr, "server: RMW update failed\n");
                     rc = 1;
                     break;
                 }

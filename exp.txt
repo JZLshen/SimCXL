@@ -64,15 +64,13 @@ shared，dedicated，当前
 
 技术分析（不需要对比shared和dedicated）：
 
-（1）w/o doorbell：也就是shared情况
+提出的几个技术的各自的impact。
+固定16个client
+测试HydraRPC（baseline）、baseline+doorbell、baseline+doorbell+dma、baseline+doorbell+dma+prefetch。就是有四个数据
 
-req64B，resp64B，1/2/4/8/16/32 client （6个实验）
+测试负载：5.1的[A]、[B]、[C]
+预期效果包括：[A] 负载下 baseline+doorbell 和 baseline+doorbell+dma性能一样，因为没有调用DMA，在response是64B情况下
 
-（2）w/o DMA：resp8B/64B/256B/1KB/4KB/8KB
-
-req64B，32 client （6个实验）
-
-（3）w/o prefetch：两方面prefetch，通知和请求数据。1/2/4/8/16/32 client（2*6=12个实验）
 
 四、Application performance （对比同参数的shared和dedicated情况）
 

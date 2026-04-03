@@ -21,6 +21,7 @@ class ExperimentMeta:
     mq_entries: int
     head_sync_threshold: int
     slow_client_count: int
+    slow_count_per_client: int
     slow_client_send_pause_iters: int
     cxl_extra_latency_ns: int
     response_lane_count: int
@@ -98,6 +99,7 @@ def read_latest_ok_experiments(experiments_csv: Path) -> list[ExperimentMeta]:
                 mq_entries=int(row["mq_entries"]),
                 head_sync_threshold=int(row["head_sync_threshold"]),
                 slow_client_count=int(row.get("slow_client_count", "0")),
+                slow_count_per_client=int(row.get("slow_count_per_client", "0")),
                 slow_client_send_pause_iters=int(
                     row.get("slow_client_send_pause_iters", "0")
                 ),
@@ -127,6 +129,7 @@ def base_row(meta: ExperimentMeta) -> dict[str, str]:
         "mq_entries": str(meta.mq_entries),
         "head_sync_threshold": str(meta.head_sync_threshold),
         "slow_client_count": str(meta.slow_client_count),
+        "slow_count_per_client": str(meta.slow_count_per_client),
         "slow_client_send_pause_iters": str(meta.slow_client_send_pause_iters),
         "cxl_extra_latency_ns": str(meta.cxl_extra_latency_ns),
         "response_lane_count": str(meta.response_lane_count),
@@ -241,6 +244,7 @@ def sort_key(
         meta.mq_entries,
         meta.head_sync_threshold,
         meta.slow_client_count,
+        meta.slow_count_per_client,
         meta.slow_client_send_pause_iters,
         meta.cxl_extra_latency_ns,
         meta.response_lane_count,
@@ -335,6 +339,7 @@ def main() -> int:
         "mq_entries",
         "head_sync_threshold",
         "slow_client_count",
+        "slow_count_per_client",
         "slow_client_send_pause_iters",
         "cxl_extra_latency_ns",
         "response_lane_count",

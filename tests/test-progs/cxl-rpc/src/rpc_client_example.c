@@ -464,6 +464,7 @@ main(int argc, char **argv)
     int node_id = parse_int_arg_range(argc, argv, "--node-id", 0,
                                       0, MAX_CLIENTS - 1);
     int slow_client_count = DEFAULT_SLOW_CLIENT_COUNT;
+    int slow_count_per_client = 0;
     int slow_client_send_pause_iters = DEFAULT_SLOW_CLIENT_SEND_PAUSE_ITERS;
 
     if (parse_required_int_arg_range(argc, argv, "--window",
@@ -483,6 +484,17 @@ main(int argc, char **argv)
         fprintf(stderr,
                 "client: invalid --slow-client-count (range 0..%d)\n",
                 MAX_CLIENTS);
+        return 1;
+    }
+
+    if (parse_required_int_arg_range(argc, argv, "--slow-count-per-client",
+                                     0,
+                                     0, INT_MAX,
+                                     &slow_count_per_client) != 0) {
+        fprintf(stderr,
+                "client: invalid --slow-count-per-client "
+                "(range 0..%d)\n",
+                INT_MAX);
         return 1;
     }
 
@@ -511,6 +523,14 @@ main(int argc, char **argv)
                 slow_client_count, num_clients);
         return 1;
     }
+    if (slow_client_count > 0 &&
+        (slow_count_per_client <= 0 || slow_count_per_client > num_requests)) {
+        fprintf(stderr,
+                "client: slow_count_per_client=%d must be in range 1..%d "
+                "when slow_client_count > 0\n",
+                slow_count_per_client, num_requests);
+        return 1;
+    }
 
     size_t request_size = DEFAULT_REQUEST_SIZE;
     if (parse_size_arg(argc, argv, "--request-size", DEFAULT_REQUEST_SIZE,
@@ -534,7 +554,8 @@ main(int argc, char **argv)
     if (parse_message_profile_arg(argc, argv, &message_profile) != 0) {
         fprintf(stderr,
                 "client: invalid --message-profile "
-                "(use fixed|google-rpc|twitter-twemcache)\n");
+                "(use fixed|uniform-1530-315|uniform-38-230; "
+                "legacy google-rpc/twitter-twemcache aliases also work)\n");
         return 1;
     }
 
@@ -555,13 +576,17 @@ main(int argc, char **argv)
     setvbuf(stderr, NULL, _IONBF, 0);
     const int is_slow_client =
         (slow_client_count > 0 && node_id < slow_client_count);
+    const int client_request_count =
+        is_slow_client ? slow_count_per_client : num_requests;
     const int send_pause_iters =
         is_slow_client ? slow_client_send_pause_iters : 0;
     rpc_markerf("init_begin",
-                "node=%d,num_clients=%d,requests=%d,request_size=%zu,response_size=%zu,request_payload_capacity=%zu,window=%d,slow_client_count=%d,is_slow_client=%d,slow_client_send_pause_iters=%d,message_profile=%s",
-                node_id, num_clients, num_requests, request_size, response_size,
+                "node=%d,num_clients=%d,requests=%d,base_requests=%d,request_size=%zu,response_size=%zu,request_payload_capacity=%zu,window=%d,slow_client_count=%d,slow_count_per_client=%d,is_slow_client=%d,slow_client_send_pause_iters=%d,message_profile=%s",
+                node_id, num_clients, client_request_count, num_requests,
+                request_size, response_size,
                 request_payload_capacity,
-                sliding_window, slow_client_count, is_slow_client,
+                sliding_window, slow_client_count, slow_count_per_client,
+                is_slow_client,
                 send_pause_iters, rpc_message_profile_name(message_profile));
 
     ctx = cxl_rpc_init(CXL_BASE, CXL_SIZE);
@@ -597,7 +622,7 @@ main(int argc, char **argv)
     }
     rpc_markerf("attach_ready", "node=%d", node_id);
 
-    size_t reserve_n = (num_requests > 0) ? (size_t)num_requests : 1;
+    size_t reserve_n = (client_request_count > 0) ? (size_t)client_request_count : 1;
     request_start_ticks = (uint64_t *)calloc(reserve_n, sizeof(uint64_t));
     request_end_ticks = (uint64_t *)calloc(reserve_n, sizeof(uint64_t));
     request_expected_response_sizes =
@@ -628,7 +653,7 @@ main(int argc, char **argv)
     if (rng_state == 0)
         rng_state = 0xA5A5A5A5u ^ (uint32_t)(node_id + 1);
 
-    if (keep_running && num_requests > 0) {
+    if (keep_running && client_request_count > 0) {
         int first_req_id = send_one_request(conn,
                                             node_id,
                                             req_payload,
@@ -667,9 +692,10 @@ main(int argc, char **argv)
 
     }
 
-    while (keep_running && rc == 0 && completed_requests < num_requests) {
+    while (keep_running && rc == 0 &&
+           completed_requests < client_request_count) {
         int inflight = sent_requests - completed_requests;
-        int can_send = (sent_requests < num_requests);
+        int can_send = (sent_requests < client_request_count);
         int should_poll = (inflight >= sliding_window) || !can_send;
 
         if (can_send && !should_poll) {
@@ -714,7 +740,8 @@ main(int argc, char **argv)
         }
     }
 
-    if (sent_requests != num_requests || completed_requests != num_requests)
+    if (sent_requests != client_request_count ||
+        completed_requests != client_request_count)
         rc = 1;
 
 cleanup:

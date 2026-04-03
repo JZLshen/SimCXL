@@ -21,8 +21,10 @@ class ExperimentMeta:
     key_size: int
     value_size: int
     size_mode: str
+    key_dist: str
     read_ratio: float
     update_ratio: float
+    rmw_ratio: float
     zipf_theta: float
     dataset_seed: int
     workload_seed: int
@@ -37,12 +39,28 @@ class ExperimentMeta:
     status: str
 
 
+def default_key_dist(profile: str) -> str:
+    return "uniform" if profile == "udb_ro" else "zipf"
+
+
+def format_zipf_field(key_dist: str, zipf_theta: float) -> str:
+    if key_dist != "zipf":
+        return ""
+    return f"{zipf_theta:.6f}"
+
+
 def read_latest_ok_experiments(experiments_csv: Path) -> list[ExperimentMeta]:
     latest_ok: dict[str, ExperimentMeta] = {}
 
     with experiments_csv.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            key_dist = row.get("key_dist", "").strip() or default_key_dist(
+                row["profile"]
+            )
+            zipf_theta = (
+                0.0 if key_dist == "uniform" else float(row.get("zipf_theta", "0.99"))
+            )
             meta = ExperimentMeta(
                 exp_id=row["exp_id"],
                 source=row["source"],
@@ -53,9 +71,11 @@ def read_latest_ok_experiments(experiments_csv: Path) -> list[ExperimentMeta]:
                 key_size=int(row["key_size"]),
                 value_size=int(row["value_size"]),
                 size_mode=row.get("size_mode", "fixed"),
+                key_dist=key_dist,
                 read_ratio=float(row["read_ratio"]),
                 update_ratio=float(row["update_ratio"]),
-                zipf_theta=float(row["zipf_theta"]),
+                rmw_ratio=float(row.get("rmw_ratio", "0.0")),
+                zipf_theta=zipf_theta,
                 dataset_seed=int(row["dataset_seed"]),
                 workload_seed=int(row["workload_seed"]),
                 mq_entries=int(row["mq_entries"]),
@@ -85,9 +105,11 @@ def base_row(meta: ExperimentMeta) -> dict[str, str]:
         "key_size": str(meta.key_size),
         "value_size": str(meta.value_size),
         "size_mode": meta.size_mode,
+        "key_dist": meta.key_dist,
         "read_ratio": f"{meta.read_ratio:.6f}",
         "update_ratio": f"{meta.update_ratio:.6f}",
-        "zipf_theta": f"{meta.zipf_theta:.6f}",
+        "rmw_ratio": f"{meta.rmw_ratio:.6f}",
+        "zipf_theta": format_zipf_field(meta.key_dist, meta.zipf_theta),
         "dataset_seed": str(meta.dataset_seed),
         "workload_seed": str(meta.workload_seed),
         "mq_entries": str(meta.mq_entries),
@@ -101,15 +123,17 @@ def base_row(meta: ExperimentMeta) -> dict[str, str]:
     }
 
 
-def sort_key(meta: ExperimentMeta) -> tuple[str, int, int, int, int, int, int, str]:
+def sort_key(meta: ExperimentMeta) -> tuple[str, str, int, int, int, int, int, int, int, str]:
     return (
         meta.profile,
+        meta.key_dist,
         meta.clients,
         meta.requests_per_client,
         meta.record_count,
         meta.mq_entries,
         meta.head_sync_threshold,
         meta.response_dma_threshold,
+        int(meta.rmw_ratio * 1000000.0),
         meta.prefetch_mode,
     )
 
@@ -198,8 +222,10 @@ def main() -> int:
         "key_size",
         "value_size",
         "size_mode",
+        "key_dist",
         "read_ratio",
         "update_ratio",
+        "rmw_ratio",
         "zipf_theta",
         "dataset_seed",
         "workload_seed",

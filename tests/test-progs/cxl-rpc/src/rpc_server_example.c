@@ -343,7 +343,8 @@ main(int argc, char **argv)
     if (parse_message_profile_arg(argc, argv, &message_profile) != 0) {
         fprintf(stderr,
                 "server: invalid --message-profile "
-                "(use fixed|google-rpc|twitter-twemcache)\n");
+                "(use fixed|uniform-1530-315|uniform-38-230; "
+                "legacy google-rpc/twitter-twemcache aliases also work)\n");
         return 1;
     }
     if (rpc_message_profile_is_distribution(message_profile)) {

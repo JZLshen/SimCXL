@@ -11,7 +11,7 @@
 #   slot 3: bare 29-42
 #   slot 4: bare 43-56
 #   slot 5: bare 57-70
-#   slot 6: bare 71-81, app 1-3
+#   slot 6: bare 71-81, app 1-5
 #
 # The script defaults to:
 #   - inject the current binaries into files/parsec.img once on this machine
@@ -189,7 +189,7 @@ case "$SLOT" in
     3) BARE_START=29; BARE_END=42; APP_START=0; APP_END=0 ;;
     4) BARE_START=43; BARE_END=56; APP_START=0; APP_END=0 ;;
     5) BARE_START=57; BARE_END=70; APP_START=0; APP_END=0 ;;
-    6) BARE_START=71; BARE_END=81; APP_START=1; APP_END=3 ;;
+    6) BARE_START=71; BARE_END=81; APP_START=1; APP_END=5 ;;
 esac
 
 HOST_SAFE="$(sanitize_token "$(hostname -s 2>/dev/null || hostname)")"
