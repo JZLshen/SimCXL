@@ -17,9 +17,9 @@ from typing import Dict, List, Optional
 
 DEFAULT_REPO_ROOT = Path("/home/wq/sh/SimCXL")
 DEFAULT_BATCH_ROOT = (
-    DEFAULT_REPO_ROOT / "output" / "rpc_current_flat_queue_20260403_222258"
+    DEFAULT_REPO_ROOT / "output" / "rpc_current_flat_queue_shared_aligned"
 )
-DEFAULT_STATE_DIR = DEFAULT_BATCH_ROOT / "queue_run_p13_20260404"
+DEFAULT_STATE_DIR = DEFAULT_BATCH_ROOT / "queue_run_p13_shared_aligned"
 
 BARE_RUNNER = (
     DEFAULT_REPO_ROOT
@@ -92,8 +92,22 @@ def load_rows(path: Path) -> List[Dict[str, str]]:
         return list(reader)
 
 
-def summary_exists(exp_dir: Path) -> bool:
-    return (exp_dir / "summary_throughput.csv").exists()
+def latest_experiment_row(exp_dir: Path) -> Optional[Dict[str, str]]:
+    experiments_path = exp_dir / "experiments.csv"
+    if not experiments_path.exists():
+        return None
+    with experiments_path.open("r", encoding="utf-8", newline="") as fp:
+        rows = list(csv.DictReader(fp))
+    if not rows:
+        return None
+    return rows[-1]
+
+
+def experiment_completed(exp_dir: Path) -> bool:
+    row = latest_experiment_row(exp_dir)
+    if row is None:
+        return False
+    return row.get("gem5_rc") == "0" and row.get("test_cmd_exit") == "0"
 
 
 def running_dirs(batch_root: Path, repo_root: Path) -> set[str]:
@@ -144,7 +158,7 @@ def prepare_tasks(batch_root: Path, repo_root: Path) -> List[Task]:
         for row in csv.DictReader(fp):
             dir_name = f"app_{row['exp_id']}"
             exp_dir = batch_root / dir_name
-            if summary_exists(exp_dir) or dir_name in active:
+            if experiment_completed(exp_dir) or dir_name in active:
                 continue
             tasks.append(
                 Task(
@@ -160,7 +174,7 @@ def prepare_tasks(batch_root: Path, repo_root: Path) -> List[Task]:
         for row in csv.DictReader(fp):
             dir_name = f"bare_{row['exp_id']}"
             exp_dir = batch_root / dir_name
-            if summary_exists(exp_dir) or dir_name in active:
+            if experiment_completed(exp_dir) or dir_name in active:
                 continue
             ckpt_dir = bare_checkpoint_dir(batch_root, row)
             if not (ckpt_dir / "m5.cpt").exists():
@@ -301,7 +315,7 @@ def worker_loop(
             return 0
 
         exp_dir = batch_root / task.dir_name
-        if summary_exists(exp_dir):
+        if experiment_completed(exp_dir):
             append_row(
                 done_path,
                 {
@@ -360,7 +374,7 @@ def worker_loop(
             "elapsed_sec": f"{elapsed:.3f}",
         }
 
-        if rc == 0 and summary_exists(exp_dir):
+        if rc == 0 and experiment_completed(exp_dir):
             result_row["status"] = "done"
             append_row(done_path, result_row, RESULT_FIELDS)
             print(

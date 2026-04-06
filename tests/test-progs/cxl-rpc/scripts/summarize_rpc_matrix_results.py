@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import statistics
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
+STEADY_DROP_VALUES = (1,)
 
 
 @dataclass(frozen=True)
@@ -48,16 +51,15 @@ class ThroughputSummary:
     last_end_tick: int
     total_span_ns: int
     overall_throughput_req_per_s: float
+    overall_throughput_kops: float
 
 
 def percentile(values: Iterable[float], p: float) -> float:
     vals = sorted(values)
     if not vals:
         return 0.0
-    if len(vals) == 1:
-        return float(vals[0])
-    index = round((len(vals) - 1) * (p / 100.0))
-    return float(vals[index])
+    rank = max(1, math.ceil((p / 100.0) * len(vals)))
+    return float(vals[min(len(vals) - 1, rank - 1)])
 
 
 def format_metric(value: float) -> str:
@@ -69,6 +71,7 @@ def metric_fields(prefix: str) -> list[str]:
         f"{prefix}_avg",
         f"{prefix}_median",
         f"{prefix}_p50",
+        f"{prefix}_p90",
         f"{prefix}_p99",
     ]
 
@@ -79,6 +82,7 @@ def compute_metrics(values: list[int], prefix: str) -> dict[str, str]:
         f"{prefix}_avg": format_metric(sum(metric_values) / len(metric_values)),
         f"{prefix}_median": format_metric(statistics.median(metric_values)),
         f"{prefix}_p50": format_metric(percentile(metric_values, 50.0)),
+        f"{prefix}_p90": format_metric(percentile(metric_values, 90.0)),
         f"{prefix}_p99": format_metric(percentile(metric_values, 99.0)),
     }
 
@@ -177,6 +181,29 @@ def read_client_latencies(ticks_csv: Path) -> dict[str, dict[tuple[int, int], in
     return by_output_dir
 
 
+def select_steady_rows(
+    rows: list[TickRow],
+    drop_first_per_client: int,
+) -> tuple[list[TickRow], int]:
+    by_node: dict[int, list[TickRow]] = {}
+    kept_rows: list[TickRow] = []
+    dropped_requests_total = 0
+
+    for row in rows:
+        by_node.setdefault(row.node_id, []).append(row)
+
+    for node_rows in by_node.values():
+        ordered = sorted(
+            node_rows,
+            key=lambda row: (row.req_index, row.start_tick, row.end_tick),
+        )
+        dropped_requests_total += min(drop_first_per_client, len(ordered))
+        kept_rows.extend(ordered[drop_first_per_client:])
+
+    kept_rows.sort(key=lambda row: (row.end_tick, row.node_id, row.req_index))
+    return kept_rows, dropped_requests_total
+
+
 def read_server_breakdowns(
     server_ticks_csv: Path,
 ) -> dict[str, dict[int, tuple[int, int, int]]]:
@@ -202,6 +229,14 @@ def read_server_breakdowns(
     return by_output_dir
 
 
+def select_steady_server_values(
+    server_map: dict[int, tuple[int, int, int]],
+    dropped_requests_total: int,
+) -> list[tuple[int, int, int]]:
+    ordered_values = [server_map[idx] for idx in sorted(server_map)]
+    return ordered_values[dropped_requests_total:]
+
+
 def write_csv(csv_path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", encoding="utf-8", newline="") as f:
@@ -219,6 +254,7 @@ def compute_throughput_summary(rows: list[TickRow]) -> ThroughputSummary:
             last_end_tick=0,
             total_span_ns=0,
             overall_throughput_req_per_s=0.0,
+            overall_throughput_kops=0.0,
         )
 
     first_start = min(row.start_tick for row in rows)
@@ -231,6 +267,7 @@ def compute_throughput_summary(rows: list[TickRow]) -> ThroughputSummary:
         last_end_tick=last_end,
         total_span_ns=total_span,
         overall_throughput_req_per_s=len(rows) * 1_000_000_000.0 / total_span,
+        overall_throughput_kops=len(rows) * 1_000_000.0 / total_span,
     )
 
 
@@ -274,23 +311,28 @@ def main() -> int:
     client_summary_csv = batch_dir / "summary_client_latency.csv"
     server_summary_csv = batch_dir / "summary_server_breakdown.csv"
     throughput_summary_csv = batch_dir / "summary_throughput.csv"
+    steady_client_summary_csv = batch_dir / "summary_client_latency_steady.csv"
+    steady_server_summary_csv = batch_dir / "summary_server_breakdown_steady.csv"
+    steady_throughput_summary_csv = batch_dir / "summary_throughput_steady.csv"
 
     if not experiments_csv.exists():
         raise FileNotFoundError(f"missing experiments.csv: {experiments_csv}")
 
     experiments = sorted(read_latest_ok_experiments(experiments_csv), key=sort_key)
-    client_latencies = read_client_latencies(ticks_csv)
     server_breakdowns = read_server_breakdowns(server_ticks_csv)
     tick_rows = read_tick_rows(ticks_csv)
 
     client_rows: list[dict[str, str]] = []
     server_rows: list[dict[str, str]] = []
     throughput_rows: list[dict[str, str]] = []
+    steady_client_rows: list[dict[str, str]] = []
+    steady_server_rows: list[dict[str, str]] = []
+    steady_throughput_rows: list[dict[str, str]] = []
 
     for meta in experiments:
-        latency_map = client_latencies.get(meta.output_dir, {})
-        if latency_map:
-            latency_values = list(latency_map.values())
+        rows = tick_rows.get(meta.output_dir, [])
+        if rows:
+            latency_values = [max(0, row.end_tick - row.start_tick) for row in rows]
             client_rows.append(
                 {
                     **base_row(meta),
@@ -313,7 +355,6 @@ def main() -> int:
                 }
             )
 
-        rows = tick_rows.get(meta.output_dir, [])
         if rows:
             throughput = compute_throughput_summary(rows)
             throughput_rows.append(
@@ -326,8 +367,68 @@ def main() -> int:
                     "overall_throughput_req_per_s": (
                         f"{throughput.overall_throughput_req_per_s:.6f}"
                     ),
+                    "overall_throughput_kops": (
+                        f"{throughput.overall_throughput_kops:.3f}"
+                    ),
                 }
             )
+
+        for drop_first_per_client in STEADY_DROP_VALUES:
+            steady_rows, dropped_requests_total = select_steady_rows(
+                rows, drop_first_per_client
+            )
+            if not steady_rows:
+                continue
+
+            steady_base = {
+                **base_row(meta),
+                "drop_first_requests_per_client": str(drop_first_per_client),
+                "dropped_requests_total": str(dropped_requests_total),
+                "steady_requests": str(len(steady_rows)),
+            }
+            steady_latency_values = [
+                max(0, row.end_tick - row.start_tick) for row in steady_rows
+            ]
+            steady_client_rows.append(
+                {
+                    **steady_base,
+                    **compute_metrics(steady_latency_values, "latency"),
+                }
+            )
+
+            steady_throughput = compute_throughput_summary(steady_rows)
+            steady_throughput_rows.append(
+                {
+                    **steady_base,
+                    "total_requests": str(steady_throughput.total_requests),
+                    "first_start_tick": str(steady_throughput.first_start_tick),
+                    "last_end_tick": str(steady_throughput.last_end_tick),
+                    "total_span_ns": str(steady_throughput.total_span_ns),
+                    "overall_throughput_req_per_s": (
+                        f"{steady_throughput.overall_throughput_req_per_s:.6f}"
+                    ),
+                    "overall_throughput_kops": (
+                        f"{steady_throughput.overall_throughput_kops:.3f}"
+                    ),
+                }
+            )
+
+            if server_map:
+                steady_server_values = select_steady_server_values(
+                    server_map, dropped_requests_total
+                )
+                if steady_server_values:
+                    poll_values = [item[0] for item in steady_server_values]
+                    execute_values = [item[1] for item in steady_server_values]
+                    response_values = [item[2] for item in steady_server_values]
+                    steady_server_rows.append(
+                        {
+                            **steady_base,
+                            **compute_metrics(poll_values, "poll"),
+                            **compute_metrics(execute_values, "execute"),
+                            **compute_metrics(response_values, "response"),
+                        }
+                    )
 
     common_fields = [
         "exp_id",
@@ -362,18 +463,52 @@ def main() -> int:
         "last_end_tick",
         "total_span_ns",
         "overall_throughput_req_per_s",
+        "overall_throughput_kops",
+    ]
+    steady_common_fields = common_fields + [
+        "drop_first_requests_per_client",
+        "dropped_requests_total",
+        "steady_requests",
+    ]
+    steady_client_fields = steady_common_fields + metric_fields("latency")
+    steady_server_fields = (
+        steady_common_fields +
+        metric_fields("poll") +
+        metric_fields("execute") +
+        metric_fields("response")
+    )
+    steady_throughput_fields = steady_common_fields + [
+        "total_requests",
+        "first_start_tick",
+        "last_end_tick",
+        "total_span_ns",
+        "overall_throughput_req_per_s",
+        "overall_throughput_kops",
     ]
 
     write_csv(client_summary_csv, client_fields, client_rows)
     write_csv(server_summary_csv, server_fields, server_rows)
     write_csv(throughput_summary_csv, throughput_fields, throughput_rows)
+    write_csv(steady_client_summary_csv, steady_client_fields, steady_client_rows)
+    write_csv(steady_server_summary_csv, steady_server_fields, steady_server_rows)
+    write_csv(
+        steady_throughput_summary_csv,
+        steady_throughput_fields,
+        steady_throughput_rows,
+    )
 
     print(f"client summary: {client_summary_csv}")
     print(f"server summary: {server_summary_csv}")
     print(f"throughput summary: {throughput_summary_csv}")
+    print(f"steady client summary: {steady_client_summary_csv}")
+    print(f"steady server summary: {steady_server_summary_csv}")
+    print(f"steady throughput summary: {steady_throughput_summary_csv}")
     print(f"client rows: {len(client_rows)}")
     print(f"server rows: {len(server_rows)}")
     print(f"throughput rows: {len(throughput_rows)}")
+    print(f"steady client rows: {len(steady_client_rows)}")
+    print(f"steady server rows: {len(steady_server_rows)}")
+    print(f"steady throughput rows: {len(steady_throughput_rows)}")
     return 0
 
 

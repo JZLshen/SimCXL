@@ -6,20 +6,22 @@ Run CXL RPC matrix experiments with:
   - reuse one checkpoint per hardware topology
   - automatic result extraction from guest writefile artifacts
 
-Default experiment matrix follows the current SimCXL scope:
+Default experiment matrix follows the current shared-aligned SimCXL scope:
   - overall:
-    three 32-client workloads:
+    client counts 1/2/4/8/16/32 for:
       fixed (64,64)
       uniform-1530-315
       uniform-38-230
   - sensitivity:
-    request size / response size / ring size / head sync /
-    request sparsity / CXL latency
+    shared-aligned public sweeps using the 32-client uniform-38-230 baseline:
+      request size / response size / ring size / request sparsity /
+      CXL latency
   - technical analysis:
-    for the same three workloads, compare:
+    SimCXL-specific comparisons and knobs:
       cpu-only + no-prefetch
-      cpu-only + current-prefetch
+      current dma + no-prefetch
       current dma + current-prefetch
+      head sync threshold
 
 DMA-lane sensitivity is intentionally excluded from this current scope.
 The matrix is deduplicated, so modes that collapse to the same runtime
@@ -48,6 +50,8 @@ DEFAULT_MQ_ENTRIES = 1024
 DEFAULT_RESPONSE_DMA_THRESHOLD = 256
 DEFAULT_PREFETCH_MODE = "full"
 DEFAULT_REQUEST_SPARSITY_SLOW_CLIENT_SEND_PAUSE_ITERS = 16384
+RUN_DISABLE_SENTINEL_ENV = "SIMCXL_RPC_RUN_DISABLE_FILE"
+RUN_DISABLE_SENTINEL_REL = "output/SIMCXL_RUNS_DISABLED"
 MESSAGE_PROFILE_FIXED = "fixed"
 MESSAGE_PROFILE_UNIFORM_1530_315 = "uniform-1530-315"
 MESSAGE_PROFILE_UNIFORM_38_230 = "uniform-38-230"
@@ -59,13 +63,21 @@ OVERALL_WORKLOADS = [
     (38, 230, MESSAGE_PROFILE_UNIFORM_38_230),
 ]
 SENSITIVITY_REQUEST_SIZES = [8, 64, 256, 1024, 4096, 8192]
-SENSITIVITY_RESPONSE_SIZES = [8, 64, 256, 1024, 4096, 8192]
-SENSITIVITY_MQ_ENTRIES = [16, 32, 64, 128, 256, 512, 1024]
-SENSITIVITY_HEAD_SYNC_THRESHOLDS = [8, 16, 32, 64, 128, 256, 512]
+SENSITIVITY_RESPONSE_SIZES = [8, 256, 1024, 4096, 8192]
+SENSITIVITY_MQ_ENTRIES = [16, 32, 64, 128, 256, 512]
+TECH_HEAD_SYNC_THRESHOLDS = [8, 16, 32, 64, 128, 256, 512]
 SENSITIVITY_REQUEST_SPARSITY_SLOW_CLIENT_COUNTS = [4, 8, 16, 20, 24, 28]
-SENSITIVITY_REQUEST_SPARSITY_SLOW_REQUEST_COUNTS = [8, 15]
+SENSITIVITY_REQUEST_SPARSITY_SLOW_REQUEST_COUNTS = [0, 8, 15]
 SENSITIVITY_CXL_LATENCIES_NS = [100, 200, 300]
-TECH_DISABLE_DMA_THRESHOLD = 8193
+TECH_DISABLE_DMA_THRESHOLD = 10000
+UNIFORM_1530_315_REQ_MIN = 765
+UNIFORM_1530_315_REQ_MAX = 2295
+UNIFORM_1530_315_RESP_MIN = 158
+UNIFORM_1530_315_RESP_MAX = 472
+UNIFORM_38_230_REQ_MIN = 19
+UNIFORM_38_230_REQ_MAX = 57
+UNIFORM_38_230_RESP_MIN = 115
+UNIFORM_38_230_RESP_MAX = 345
 OBSOLETE_REQUEST_SPARSITY_EXP_IDS = {
     "req64_resp64_c4_r30_slow1_sp16384",
     "req64_resp64_c4_r30_slow2_sp16384",
@@ -91,6 +103,10 @@ class ExperimentKey:
     response_size: int
     clients: int
     requests_per_client: int
+    request_min_size: int = 0
+    request_max_size: int = 0
+    response_min_size: int = 0
+    response_max_size: int = 0
     mq_entries: int = DEFAULT_MQ_ENTRIES
     head_sync_threshold: int = 0
     cxl_extra_latency_ns: int = 0
@@ -122,6 +138,29 @@ def resolve_repo_root(cli_repo_root: Optional[str]) -> Path:
     return Path(__file__).resolve().parents[4]
 
 
+def resolve_run_disable_sentinel(repo_root: Path) -> Path:
+    override = os.environ.get(RUN_DISABLE_SENTINEL_ENV, "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return (repo_root / RUN_DISABLE_SENTINEL_REL).resolve()
+
+
+def read_run_disable_reason(repo_root: Path) -> Optional[str]:
+    sentinel = resolve_run_disable_sentinel(repo_root)
+    if not sentinel.exists():
+        return None
+    try:
+        text = sentinel.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return str(sentinel)
+    if not text:
+        return str(sentinel)
+    first_line = text.splitlines()[0].strip()
+    if not first_line:
+        return str(sentinel)
+    return f"{sentinel}: {first_line}"
+
+
 def ceil_div(numer: int, denom: int) -> int:
     return (numer + denom - 1) // denom
 
@@ -150,9 +189,14 @@ def cpu_only_dma_threshold(message_profile: str,
 
 
 def format_exp_id(key: ExperimentKey) -> str:
+    def size_tag(prefix: str, base: int, min_size: int, max_size: int) -> str:
+        if min_size > 0 and max_size > 0 and min_size != max_size:
+            return f"{prefix}u{min_size}-{max_size}"
+        return f"{prefix}{base}"
+
     parts = [
-        f"req{key.request_size}",
-        f"resp{key.response_size}",
+        size_tag("req", key.request_size, key.request_min_size, key.request_max_size),
+        size_tag("resp", key.response_size, key.response_min_size, key.response_max_size),
         f"c{key.clients}",
         f"r{key.requests_per_client}",
     ]
@@ -172,8 +216,7 @@ def format_exp_id(key: ExperimentKey) -> str:
         parts.append(f"mprof{key.message_profile.replace('-', '_')}")
     if key.slow_client_count > 0:
         parts.append(f"slow{key.slow_client_count}")
-        if key.slow_count_per_client > 0:
-            parts.append(f"sq{key.slow_count_per_client}")
+        parts.append(f"sq{key.slow_count_per_client}")
         if key.slow_client_send_pause_iters > 0:
             parts.append(f"sp{key.slow_client_send_pause_iters}")
     return "_".join(parts)
@@ -184,11 +227,7 @@ def expected_total_requests(key: ExperimentKey) -> int:
     if slow_clients <= 0:
         return key.clients * key.requests_per_client
 
-    slow_requests = (
-        key.slow_count_per_client
-        if key.slow_count_per_client > 0
-        else key.requests_per_client
-    )
+    slow_requests = key.slow_count_per_client
     fast_clients = key.clients - slow_clients
     return (fast_clients * key.requests_per_client) + (slow_clients * slow_requests)
 
@@ -237,7 +276,7 @@ def build_matrix(requests_per_client: int,
                                                   response_dma_threshold)
         for source, tech_prefetch_mode, tech_dma_threshold in (
             ("technical_cpu_only_no_prefetch", "none", no_dma_threshold),
-            ("technical_cpu_only_with_prefetch", prefetch_mode, no_dma_threshold),
+            ("technical_dma_no_prefetch", "none", response_dma_threshold),
             ("technical_dma_with_prefetch", prefetch_mode, response_dma_threshold),
         ):
             add_experiment(
@@ -259,7 +298,9 @@ def build_matrix(requests_per_client: int,
         add_experiment(
             ExperimentKey(
                 request_size=request_size,
-                response_size=64,
+                response_size=230,
+                response_min_size=UNIFORM_38_230_RESP_MIN,
+                response_max_size=UNIFORM_38_230_RESP_MAX,
                 clients=CURRENT_CLIENTS,
                 requests_per_client=requests_per_client,
                 head_sync_threshold=default_hs,
@@ -274,7 +315,9 @@ def build_matrix(requests_per_client: int,
     for response_size in SENSITIVITY_RESPONSE_SIZES:
         add_experiment(
             ExperimentKey(
-                request_size=64,
+                request_size=38,
+                request_min_size=UNIFORM_38_230_REQ_MIN,
+                request_max_size=UNIFORM_38_230_REQ_MAX,
                 response_size=response_size,
                 clients=CURRENT_CLIENTS,
                 requests_per_client=requests_per_client,
@@ -290,8 +333,12 @@ def build_matrix(requests_per_client: int,
     for mq_entries in SENSITIVITY_MQ_ENTRIES:
         add_experiment(
             ExperimentKey(
-                request_size=64,
-                response_size=64,
+                request_size=38,
+                response_size=230,
+                request_min_size=UNIFORM_38_230_REQ_MIN,
+                request_max_size=UNIFORM_38_230_REQ_MAX,
+                response_min_size=UNIFORM_38_230_RESP_MIN,
+                response_max_size=UNIFORM_38_230_RESP_MAX,
                 clients=CURRENT_CLIENTS,
                 requests_per_client=requests_per_client,
                 mq_entries=mq_entries,
@@ -304,7 +351,7 @@ def build_matrix(requests_per_client: int,
             "sensitivity_mq_entries",
         )
 
-    for head_sync_threshold in SENSITIVITY_HEAD_SYNC_THRESHOLDS:
+    for head_sync_threshold in TECH_HEAD_SYNC_THRESHOLDS:
         add_experiment(
             ExperimentKey(
                 request_size=64,
@@ -318,15 +365,19 @@ def build_matrix(requests_per_client: int,
                 prefetch_mode=prefetch_mode,
                 message_profile=MESSAGE_PROFILE_FIXED,
             ),
-            "sensitivity_head_sync",
+            "technical_head_sync",
         )
 
     for slow_client_count in SENSITIVITY_REQUEST_SPARSITY_SLOW_CLIENT_COUNTS:
         for slow_count_per_client in SENSITIVITY_REQUEST_SPARSITY_SLOW_REQUEST_COUNTS:
             add_experiment(
                 ExperimentKey(
-                    request_size=64,
-                    response_size=64,
+                    request_size=38,
+                    response_size=230,
+                    request_min_size=UNIFORM_38_230_REQ_MIN,
+                    request_max_size=UNIFORM_38_230_REQ_MAX,
+                    response_min_size=UNIFORM_38_230_RESP_MIN,
+                    response_max_size=UNIFORM_38_230_RESP_MAX,
                     clients=CURRENT_CLIENTS,
                     requests_per_client=requests_per_client,
                     mq_entries=DEFAULT_MQ_ENTRIES,
@@ -339,7 +390,10 @@ def build_matrix(requests_per_client: int,
                     slow_count_per_client=slow_count_per_client,
                     slow_client_send_pause_iters=(
                         request_sparsity_slow_client_send_pause_iters
-                        if slow_client_count > 0 else 0
+                        if (slow_client_count > 0 and
+                            slow_count_per_client > 0 and
+                            slow_count_per_client < requests_per_client)
+                        else 0
                     ),
                 ),
                 "sensitivity_request_sparsity",
@@ -348,8 +402,12 @@ def build_matrix(requests_per_client: int,
     for cxl_extra_latency_ns in SENSITIVITY_CXL_LATENCIES_NS:
         add_experiment(
             ExperimentKey(
-                request_size=64,
-                response_size=64,
+                request_size=38,
+                response_size=230,
+                request_min_size=UNIFORM_38_230_REQ_MIN,
+                request_max_size=UNIFORM_38_230_REQ_MAX,
+                response_min_size=UNIFORM_38_230_RESP_MIN,
+                response_max_size=UNIFORM_38_230_RESP_MAX,
                 clients=CURRENT_CLIENTS,
                 requests_per_client=requests_per_client,
                 mq_entries=DEFAULT_MQ_ENTRIES,
@@ -716,6 +774,10 @@ def experiment_metadata_row(key: ExperimentKey) -> Dict[str, object]:
     return {
         "request_size": key.request_size,
         "response_size": key.response_size,
+        "request_min_size": key.request_min_size,
+        "request_max_size": key.request_max_size,
+        "response_min_size": key.response_min_size,
+        "response_max_size": key.response_max_size,
         "clients": key.clients,
         "requests_per_client": key.requests_per_client,
         "mq_entries": key.mq_entries,
@@ -849,6 +911,17 @@ def main() -> int:
         return 0
 
     repo_root = resolve_repo_root(args.repo_root)
+    disable_reason = read_run_disable_reason(repo_root)
+    if disable_reason is not None:
+        if args.only_exp_id:
+            print(
+                "[skip] SimCXL experiments are disabled by sentinel for "
+                f"exp_id={args.only_exp_id}: {disable_reason}"
+            )
+        else:
+            print(f"[skip] SimCXL experiments are disabled by sentinel: {disable_reason}")
+        return 0
+
     output_base = (repo_root / args.output_base).resolve()
     batch_name = args.batch_name or f"rpc_matrix_kvm_timing_ckpt_{now_tag()}"
     batch_dir = output_base / batch_name
@@ -931,6 +1004,10 @@ def main() -> int:
                 "source",
                 "request_size",
                 "response_size",
+                "request_min_size",
+                "request_max_size",
+                "response_min_size",
+                "response_max_size",
                 "clients",
                 "requests_per_client",
                 "mq_entries",
@@ -954,6 +1031,10 @@ def main() -> int:
                     "source": exp.source,
                     "request_size": exp.key.request_size,
                     "response_size": exp.key.response_size,
+                    "request_min_size": exp.key.request_min_size,
+                    "request_max_size": exp.key.request_max_size,
+                    "response_min_size": exp.key.response_min_size,
+                    "response_max_size": exp.key.response_max_size,
                     "clients": exp.key.clients,
                     "requests_per_client": exp.key.requests_per_client,
                     "mq_entries": exp.key.mq_entries,
@@ -993,6 +1074,10 @@ def main() -> int:
         "source",
         "request_size",
         "response_size",
+        "request_min_size",
+        "request_max_size",
+        "response_min_size",
+        "response_max_size",
         "clients",
         "requests_per_client",
         "mq_entries",
@@ -1024,6 +1109,10 @@ def main() -> int:
         "exp_id",
         "request_size",
         "response_size",
+        "request_min_size",
+        "request_max_size",
+        "response_min_size",
+        "response_max_size",
         "clients",
         "requests_per_client",
         "mq_entries",
@@ -1047,6 +1136,10 @@ def main() -> int:
         "exp_id",
         "request_size",
         "response_size",
+        "request_min_size",
+        "request_max_size",
+        "response_min_size",
+        "response_max_size",
         "clients",
         "requests_per_client",
         "mq_entries",
@@ -1352,6 +1445,7 @@ def main() -> int:
 
             server_args_parts = [
                 "--silent",
+                f"--request-size {key.request_size}",
                 f"--response-size {key.response_size}",
                 f"--mq-entries {key.mq_entries}",
                 f"--head-sync-threshold {key.head_sync_threshold}",
@@ -1360,6 +1454,14 @@ def main() -> int:
                 f"--prefetch-mode {key.prefetch_mode}",
                 f"--message-profile {key.message_profile}",
             ]
+            if key.request_min_size > 0:
+                server_args_parts.append(f"--req-min-bytes {key.request_min_size}")
+            if key.request_max_size > 0:
+                server_args_parts.append(f"--req-max-bytes {key.request_max_size}")
+            if key.response_min_size > 0:
+                server_args_parts.append(f"--resp-min-bytes {key.response_min_size}")
+            if key.response_max_size > 0:
+                server_args_parts.append(f"--resp-max-bytes {key.response_max_size}")
             server_args = " ".join(server_args_parts)
             test_cmd = (
                 f"CXL_RPC_CLIENT_COUNT={key.clients} "
@@ -1377,6 +1479,14 @@ def main() -> int:
                 f"--message-profile {key.message_profile} "
                 f"--silent"
             )
+            if key.request_min_size > 0:
+                test_cmd += f" --req-min-bytes {key.request_min_size}"
+            if key.request_max_size > 0:
+                test_cmd += f" --req-max-bytes {key.request_max_size}"
+            if key.response_min_size > 0:
+                test_cmd += f" --resp-min-bytes {key.response_min_size}"
+            if key.response_max_size > 0:
+                test_cmd += f" --resp-max-bytes {key.response_max_size}"
             if key.slow_client_count > 0:
                 test_cmd += (
                     f" --slow-client-count {key.slow_client_count} "
@@ -1423,7 +1533,8 @@ def main() -> int:
             start_time = time.time()
             print(
                 f"[run {idx}/{len(experiments)}] {exp.exp_id} "
-                f"(req={key.request_size}, resp={key.response_size}, "
+                f"(req={key.request_size}[{key.request_min_size},{key.request_max_size}], "
+                f"resp={key.response_size}[{key.response_min_size},{key.response_max_size}], "
                 f"clients={key.clients}, reqs/client={key.requests_per_client}, "
                 f"mq={key.mq_entries}, hs={key.head_sync_threshold}, "
                 f"slow={key.slow_client_count}, "

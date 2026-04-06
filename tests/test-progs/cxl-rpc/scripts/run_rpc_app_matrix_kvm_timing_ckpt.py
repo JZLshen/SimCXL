@@ -459,6 +459,20 @@ def main() -> int:
         return 2
 
     repo_root = bare_rpc.resolve_repo_root(args.repo_root)
+    disable_reason = bare_rpc.read_run_disable_reason(repo_root)
+    if disable_reason is not None:
+        if args.only_exp_id:
+            print(
+                "[skip] SimCXL app experiments are disabled by sentinel for "
+                f"exp_id={args.only_exp_id}: {disable_reason}"
+            )
+        else:
+            print(
+                "[skip] SimCXL app experiments are disabled by sentinel: "
+                f"{disable_reason}"
+            )
+        return 0
+
     output_base = (repo_root / args.output_base).resolve()
     batch_name = args.batch_name or f"rpc_app_matrix_kvm_timing_ckpt_{bare_rpc.now_tag()}"
     batch_dir = output_base / batch_name

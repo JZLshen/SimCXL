@@ -34,6 +34,7 @@
 
 #include "cxl_rpc.h"
 #include "cxl_rpc_layout.h"
+#include "rpc_first_round_barrier.h"
 #include "rpc_message_profile.h"
 
 #define DEFAULT_NUM_REQUESTS 20
@@ -238,6 +239,24 @@ parse_size_arg(int argc, char **argv, const char *flag, size_t default_val,
 }
 
 static int
+first_round_barrier_participants(int num_clients,
+                                 int num_requests,
+                                 int slow_client_count,
+                                 int slow_count_per_client)
+{
+    if (num_clients <= 0 || num_requests <= 0)
+        return 0;
+
+    if (slow_client_count <= 0 || slow_count_per_client > 0)
+        return num_clients;
+
+    if (slow_client_count >= num_clients)
+        return 0;
+
+    return num_clients - slow_client_count;
+}
+
+static int
 parse_message_profile_arg(int argc, char **argv,
                           rpc_message_profile_t *out_profile)
 {
@@ -267,6 +286,29 @@ spin_pause_iters(int poll_pause_iters)
         __asm__ __volatile__("pause" ::: "memory");
 }
 
+static inline int
+scale_sparse_send_pause_iters(int base_pause_iters,
+                              int request_count,
+                              int client_request_count)
+{
+    uint64_t total_pause_iters = 0;
+
+    if (base_pause_iters <= 0 ||
+        request_count <= 1 ||
+        client_request_count <= 1 ||
+        client_request_count >= request_count) {
+        return base_pause_iters;
+    }
+
+    // Keep the sparse-client issue span aligned with the baseline
+    // request-count schedule. Fewer requests therefore implies more
+    // application-side think time before each send.
+    total_pause_iters =
+        (uint64_t)(request_count - 1) * (uint64_t)base_pause_iters;
+    return (int)((total_pause_iters + (uint64_t)(client_request_count - 2)) /
+                 (uint64_t)(client_request_count - 1));
+}
+
 static int
 send_one_request(cxl_connection_t *conn,
                  int node_id,
@@ -274,6 +316,8 @@ send_one_request(cxl_connection_t *conn,
                  size_t fixed_request_size,
                  size_t fixed_response_size,
                  rpc_message_profile_t message_profile,
+                 const rpc_length_plan_t *request_length_plan,
+                 const rpc_length_plan_t *response_length_plan,
                  uint32_t *rng_state,
                  int *rpc_id_to_request_index,
                  size_t *request_expected_response_sizes,
@@ -291,19 +335,27 @@ send_one_request(cxl_connection_t *conn,
     size_t expected_response_size = fixed_response_size;
     const uint32_t lhs = next_random_u32(rng_state);
     const uint32_t rhs = next_random_u32(rng_state);
+    const int use_profiled_header =
+        rpc_runtime_uses_profiled_header(message_profile,
+                                        request_length_plan,
+                                        response_length_plan);
 
-    if (rpc_message_profile_is_distribution(message_profile)) {
+    if (use_profiled_header) {
         rpc_profiled_request_t profiled_req = {
             .lhs = lhs,
             .rhs = rhs,
             .op_index = (uint32_t)sent_requests,
         };
-        if (rpc_message_profile_sample_sizes(message_profile,
-                                             (uint16_t)node_id,
-                                             (uint32_t)sent_requests,
-                                             &request_size,
-                                             &expected_response_size) != 0) {
-            fprintf(stderr, "client: sample request profile failed\n");
+        if (rpc_runtime_sample_sizes(message_profile,
+                                     (uint16_t)node_id,
+                                     (uint32_t)sent_requests,
+                                     request_length_plan,
+                                     response_length_plan,
+                                     fixed_request_size,
+                                     fixed_response_size,
+                                     &request_size,
+                                     &expected_response_size) != 0) {
+            fprintf(stderr, "client: sample request sizing failed\n");
             return -1;
         }
         if (request_size < sizeof(profiled_req)) {
@@ -524,9 +576,9 @@ main(int argc, char **argv)
         return 1;
     }
     if (slow_client_count > 0 &&
-        (slow_count_per_client <= 0 || slow_count_per_client > num_requests)) {
+        (slow_count_per_client < 0 || slow_count_per_client > num_requests)) {
         fprintf(stderr,
-                "client: slow_count_per_client=%d must be in range 1..%d "
+                "client: slow_count_per_client=%d must be in range 0..%d "
                 "when slow_client_count > 0\n",
                 slow_count_per_client, num_requests);
         return 1;
@@ -559,10 +611,37 @@ main(int argc, char **argv)
         return 1;
     }
 
-    size_t request_payload_capacity = request_size;
-    if (rpc_message_profile_is_distribution(message_profile)) {
-        request_payload_capacity =
-            rpc_message_profile_max_request_size(message_profile);
+    rpc_length_plan_t request_length_plan = {0};
+    rpc_length_plan_t response_length_plan = {0};
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--req-min-bytes") == 0) {
+            request_length_plan.min_size = strtoull(argv[i + 1], NULL, 0);
+        } else if (strcmp(argv[i], "--req-max-bytes") == 0) {
+            request_length_plan.max_size = strtoull(argv[i + 1], NULL, 0);
+        } else if (strcmp(argv[i], "--resp-min-bytes") == 0) {
+            response_length_plan.min_size = strtoull(argv[i + 1], NULL, 0);
+        } else if (strcmp(argv[i], "--resp-max-bytes") == 0) {
+            response_length_plan.max_size = strtoull(argv[i + 1], NULL, 0);
+        }
+    }
+    if (rpc_length_plan_has_bounds(&request_length_plan) &&
+        request_length_plan.max_size < request_length_plan.min_size) {
+        fprintf(stderr, "client: req-min-bytes must be <= req-max-bytes\n");
+        return 1;
+    }
+    if (rpc_length_plan_has_bounds(&response_length_plan) &&
+        response_length_plan.max_size < response_length_plan.min_size) {
+        fprintf(stderr, "client: resp-min-bytes must be <= resp-max-bytes\n");
+        return 1;
+    }
+
+    size_t request_payload_capacity =
+        rpc_runtime_max_request_size(message_profile,
+                                     &request_length_plan,
+                                     request_size);
+    if (rpc_runtime_uses_profiled_header(message_profile,
+                                         &request_length_plan,
+                                         &response_length_plan)) {
         if (request_payload_capacity < sizeof(rpc_profiled_request_t) ||
             request_payload_capacity > MAX_REQUEST_SIZE) {
             fprintf(stderr, "client: invalid profiled request capacity\n");
@@ -578,8 +657,17 @@ main(int argc, char **argv)
         (slow_client_count > 0 && node_id < slow_client_count);
     const int client_request_count =
         is_slow_client ? slow_count_per_client : num_requests;
+    const int barrier_participant_count =
+        first_round_barrier_participants(num_clients,
+                                         num_requests,
+                                         slow_client_count,
+                                         slow_count_per_client);
     const int send_pause_iters =
-        is_slow_client ? slow_client_send_pause_iters : 0;
+        is_slow_client
+            ? scale_sparse_send_pause_iters(slow_client_send_pause_iters,
+                                            num_requests,
+                                            client_request_count)
+            : 0;
     rpc_markerf("init_begin",
                 "node=%d,num_clients=%d,requests=%d,base_requests=%d,request_size=%zu,response_size=%zu,request_payload_capacity=%zu,window=%d,slow_client_count=%d,slow_count_per_client=%d,is_slow_client=%d,slow_client_send_pause_iters=%d,message_profile=%s",
                 node_id, num_clients, client_request_count, num_requests,
@@ -660,6 +748,8 @@ main(int argc, char **argv)
                                             request_size,
                                             response_size,
                                             message_profile,
+                                            &request_length_plan,
+                                            &response_length_plan,
                                             &rng_state,
                                             rpc_id_to_request_index,
                                             request_expected_response_sizes,
@@ -690,6 +780,24 @@ main(int argc, char **argv)
             spin_pause_iters(poll_pause_iters);
         }
 
+        if (completed_requests > 0 && barrier_participant_count > 1) {
+            rpc_markerf("first_response_barrier_enter",
+                        "node=%d,participants=%d,completed=%d",
+                        node_id, barrier_participant_count,
+                        completed_requests);
+            if (rpc_wait_for_first_round_barrier(barrier_participant_count,
+                                                 node_id,
+                                                 &keep_running,
+                                                 poll_pause_iters) != 0) {
+                rc = 1;
+                goto cleanup;
+            }
+            rpc_markerf("first_response_barrier_exit",
+                        "node=%d,participants=%d,completed=%d",
+                        node_id, barrier_participant_count,
+                        completed_requests);
+        }
+
     }
 
     while (keep_running && rc == 0 &&
@@ -711,6 +819,8 @@ main(int argc, char **argv)
                                           request_size,
                                           response_size,
                                           message_profile,
+                                          &request_length_plan,
+                                          &response_length_plan,
                                           &rng_state,
                                           rpc_id_to_request_index,
                                           request_expected_response_sizes,

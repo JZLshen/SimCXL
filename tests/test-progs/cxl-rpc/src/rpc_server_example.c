@@ -37,10 +37,13 @@
 
 #define DEFAULT_MAX_REQUESTS 0
 #define DEFAULT_IDLE_PAUSE_ITERS 0
+#define DEFAULT_REQUEST_SIZE 64
 #define DEFAULT_RESPONSE_SIZE 16
 #define DEFAULT_MQ_ENTRIES METADATA_Q_ENTRIES
 #define DEFAULT_CLIENTS_PER_DMA_LANE 1
+#define MIN_REQUEST_SIZE 8
 #define MIN_RESPONSE_SIZE 8
+#define MAX_REQUEST_SIZE (256u * 1024u)
 #define MAX_RESPONSE_SIZE (RESPONSE_DATA_BYTES - 8ULL)
 
 typedef struct __attribute__((packed)) {
@@ -313,10 +316,19 @@ main(int argc, char **argv)
     cxl_request_rx_prefetch_mode_t prefetch_mode =
         CXL_REQUEST_RX_PREFETCH_FULL;
     rpc_message_profile_t message_profile = RPC_MESSAGE_PROFILE_FIXED;
+    rpc_length_plan_t request_length_plan = {0};
+    rpc_length_plan_t response_length_plan = {0};
+    size_t request_size = DEFAULT_REQUEST_SIZE;
     size_t response_size = DEFAULT_RESPONSE_SIZE;
     size_t max_runtime_response_size = DEFAULT_RESPONSE_SIZE;
     size_t response_dma_threshold =
         (size_t)CXL_RESPONSE_DMA_PAYLOAD_THRESHOLD_DEFAULT;
+    if (parse_size_arg(argc, argv, "--request-size", DEFAULT_REQUEST_SIZE,
+                       MIN_REQUEST_SIZE, MAX_REQUEST_SIZE,
+                       &request_size) != 0) {
+        fprintf(stderr, "server: invalid --request-size (range 8B..256KB)\n");
+        return 1;
+    }
     if (parse_size_arg(argc, argv, "--response-size", DEFAULT_RESPONSE_SIZE,
                        MIN_RESPONSE_SIZE, MAX_RESPONSE_SIZE,
                        &response_size) != 0) {
@@ -347,16 +359,39 @@ main(int argc, char **argv)
                 "legacy google-rpc/twitter-twemcache aliases also work)\n");
         return 1;
     }
-    if (rpc_message_profile_is_distribution(message_profile)) {
-        max_runtime_response_size =
-            rpc_message_profile_max_response_size(message_profile);
+    for (int i = 1; i + 1 < argc; i++) {
+        if (strcmp(argv[i], "--req-min-bytes") == 0) {
+            request_length_plan.min_size = strtoull(argv[i + 1], NULL, 0);
+        } else if (strcmp(argv[i], "--req-max-bytes") == 0) {
+            request_length_plan.max_size = strtoull(argv[i + 1], NULL, 0);
+        } else if (strcmp(argv[i], "--resp-min-bytes") == 0) {
+            response_length_plan.min_size = strtoull(argv[i + 1], NULL, 0);
+        } else if (strcmp(argv[i], "--resp-max-bytes") == 0) {
+            response_length_plan.max_size = strtoull(argv[i + 1], NULL, 0);
+        }
+    }
+    if (rpc_length_plan_has_bounds(&request_length_plan) &&
+        request_length_plan.max_size < request_length_plan.min_size) {
+        fprintf(stderr, "server: req-min-bytes must be <= req-max-bytes\n");
+        return 1;
+    }
+    if (rpc_length_plan_has_bounds(&response_length_plan) &&
+        response_length_plan.max_size < response_length_plan.min_size) {
+        fprintf(stderr, "server: resp-min-bytes must be <= resp-max-bytes\n");
+        return 1;
+    }
+    max_runtime_response_size =
+        rpc_runtime_max_response_size(message_profile,
+                                      &response_length_plan,
+                                      response_size);
+    if (rpc_runtime_uses_profiled_header(message_profile,
+                                         &request_length_plan,
+                                         &response_length_plan)) {
         if (max_runtime_response_size < sizeof(add_response_t) ||
             max_runtime_response_size > MAX_RESPONSE_SIZE) {
             fprintf(stderr, "server: invalid profiled response capacity\n");
             return 1;
         }
-    } else {
-        max_runtime_response_size = response_size;
     }
 
     signal(SIGINT, signal_handler);
@@ -530,7 +565,9 @@ main(int argc, char **argv)
             uint32_t lhs = 0;
             uint32_t rhs = 0;
             size_t current_response_size = response_size;
-            if (rpc_message_profile_is_distribution(message_profile)) {
+            if (rpc_runtime_uses_profiled_header(message_profile,
+                                                &request_length_plan,
+                                                &response_length_plan)) {
                 const volatile rpc_profiled_request_t *req_view =
                     (const volatile rpc_profiled_request_t *)req_data_view;
                 size_t expected_req_size = 0;
@@ -540,12 +577,16 @@ main(int argc, char **argv)
                     rc = 1;
                     break;
                 }
-                if (rpc_message_profile_sample_sizes(message_profile,
-                                                     node_id,
-                                                     req_view->op_index,
-                                                     &expected_req_size,
-                                                     &current_response_size) != 0) {
-                    fprintf(stderr, "server: sample request profile failed\n");
+                if (rpc_runtime_sample_sizes(message_profile,
+                                             node_id,
+                                             req_view->op_index,
+                                             &request_length_plan,
+                                             &response_length_plan,
+                                             request_size,
+                                             response_size,
+                                             &expected_req_size,
+                                             &current_response_size) != 0) {
+                    fprintf(stderr, "server: sample request sizing failed\n");
                     rc = 1;
                     break;
                 }

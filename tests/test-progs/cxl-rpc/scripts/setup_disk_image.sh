@@ -248,6 +248,7 @@ DEBUG_LIVE="${CXL_RPC_DEBUG_LIVE:-0}"
 HOST_STATUS_FILE="${CXL_RPC_HOST_STATUS_FILE:-rpc_status.txt}"
 HOST_SERVER_FILE="${CXL_RPC_HOST_SERVER_FILE:-rpc_server_runtime.log}"
 HOST_CLIENT_FILE_PREFIX="${CXL_RPC_HOST_CLIENT_FILE_PREFIX:-rpc_client_runtime}"
+FIRST_ROUND_BARRIER_FILE="${CXL_RPC_FIRST_ROUND_BARRIER_FILE:-${RUNTIME_DIR}/cxl_rpc_first_round_barrier_${$}.bin}"
 
 if [ "${CXL_RPC_MARKERS:-0}" != "0" ] && [ "$DEBUG_LIVE" = "0" ]; then
     DEBUG_LIVE=1
@@ -277,6 +278,13 @@ if ! mkdir -p "$RUNTIME_DIR"; then
     echo "ERROR: failed to create runtime dir: $RUNTIME_DIR"
     exit 2
 fi
+
+rm -f "$FIRST_ROUND_BARRIER_FILE"
+if ! dd if=/dev/zero of="$FIRST_ROUND_BARRIER_FILE" bs=16 count=1 status=none; then
+    echo "ERROR: failed to initialize first-round barrier file: $FIRST_ROUND_BARRIER_FILE"
+    exit 2
+fi
+export CXL_RPC_FIRST_ROUND_BARRIER_FILE="$FIRST_ROUND_BARRIER_FILE"
 
 if [ "$PIN_CORES" != "0" ]; then
     if ! command -v taskset >/dev/null 2>&1; then
@@ -527,6 +535,7 @@ fi
 if [ "$overall_rc" -ne 0 ] || [ "$SERVER_RC" -ne 0 ]; then
     echo "rpc_test_failed rc=${overall_rc} server_rc=${SERVER_RC}" >&2
 fi
+rm -f "$FIRST_ROUND_BARRIER_FILE"
 exit "$overall_rc"
 UNIFIED_HELPER_SCRIPT
 sudo chmod +x "${MOUNT_POINT}${DEST_DIR}/run_rpc_server_clients.sh"

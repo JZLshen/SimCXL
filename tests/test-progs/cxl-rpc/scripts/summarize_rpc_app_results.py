@@ -157,23 +157,28 @@ def main() -> int:
     client_summary_csv = batch_dir / "summary_client_latency.csv"
     server_summary_csv = batch_dir / "summary_server_breakdown.csv"
     throughput_summary_csv = batch_dir / "summary_throughput.csv"
+    steady_client_summary_csv = batch_dir / "summary_client_latency_steady.csv"
+    steady_server_summary_csv = batch_dir / "summary_server_breakdown_steady.csv"
+    steady_throughput_summary_csv = batch_dir / "summary_throughput_steady.csv"
 
     if not experiments_csv.exists():
         raise FileNotFoundError(f"missing experiments.csv: {experiments_csv}")
 
     experiments = sorted(read_latest_ok_experiments(experiments_csv), key=sort_key)
-    client_latencies = bare_summary.read_client_latencies(ticks_csv)
     server_breakdowns = bare_summary.read_server_breakdowns(server_ticks_csv)
     tick_rows = bare_summary.read_tick_rows(ticks_csv)
 
     client_rows: list[dict[str, str]] = []
     server_rows: list[dict[str, str]] = []
     throughput_rows: list[dict[str, str]] = []
+    steady_client_rows: list[dict[str, str]] = []
+    steady_server_rows: list[dict[str, str]] = []
+    steady_throughput_rows: list[dict[str, str]] = []
 
     for meta in experiments:
-        latency_map = client_latencies.get(meta.output_dir, {})
-        if latency_map:
-            latency_values = list(latency_map.values())
+        rows = tick_rows.get(meta.output_dir, [])
+        if rows:
+            latency_values = [max(0, row.end_tick - row.start_tick) for row in rows]
             client_rows.append(
                 {
                     **base_row(meta),
@@ -196,7 +201,6 @@ def main() -> int:
                 }
             )
 
-        rows = tick_rows.get(meta.output_dir, [])
         if rows:
             throughput = bare_summary.compute_throughput_summary(rows)
             throughput_rows.append(
@@ -209,8 +213,70 @@ def main() -> int:
                     "overall_throughput_req_per_s": (
                         f"{throughput.overall_throughput_req_per_s:.6f}"
                     ),
+                    "overall_throughput_kops": (
+                        f"{throughput.overall_throughput_kops:.3f}"
+                    ),
                 }
             )
+
+        for drop_first_per_client in bare_summary.STEADY_DROP_VALUES:
+            steady_rows, dropped_requests_total = bare_summary.select_steady_rows(
+                rows,
+                drop_first_per_client,
+            )
+            if not steady_rows:
+                continue
+
+            steady_base = {
+                **base_row(meta),
+                "drop_first_requests_per_client": str(drop_first_per_client),
+                "dropped_requests_total": str(dropped_requests_total),
+                "steady_requests": str(len(steady_rows)),
+            }
+            steady_latency_values = [
+                max(0, row.end_tick - row.start_tick) for row in steady_rows
+            ]
+            steady_client_rows.append(
+                {
+                    **steady_base,
+                    **bare_summary.compute_metrics(steady_latency_values, "latency"),
+                }
+            )
+
+            steady_throughput = bare_summary.compute_throughput_summary(steady_rows)
+            steady_throughput_rows.append(
+                {
+                    **steady_base,
+                    "total_requests": str(steady_throughput.total_requests),
+                    "first_start_tick": str(steady_throughput.first_start_tick),
+                    "last_end_tick": str(steady_throughput.last_end_tick),
+                    "total_span_ns": str(steady_throughput.total_span_ns),
+                    "overall_throughput_req_per_s": (
+                        f"{steady_throughput.overall_throughput_req_per_s:.6f}"
+                    ),
+                    "overall_throughput_kops": (
+                        f"{steady_throughput.overall_throughput_kops:.3f}"
+                    ),
+                }
+            )
+
+            if server_map:
+                steady_server_values = bare_summary.select_steady_server_values(
+                    server_map,
+                    dropped_requests_total,
+                )
+                if steady_server_values:
+                    poll_values = [item[0] for item in steady_server_values]
+                    execute_values = [item[1] for item in steady_server_values]
+                    response_values = [item[2] for item in steady_server_values]
+                    steady_server_rows.append(
+                        {
+                            **steady_base,
+                            **bare_summary.compute_metrics(poll_values, "poll"),
+                            **bare_summary.compute_metrics(execute_values, "execute"),
+                            **bare_summary.compute_metrics(response_values, "response"),
+                        }
+                    )
 
     common_fields = [
         "exp_id",
@@ -251,19 +317,60 @@ def main() -> int:
         "last_end_tick",
         "total_span_ns",
         "overall_throughput_req_per_s",
+        "overall_throughput_kops",
+    ]
+    steady_common_fields = common_fields + [
+        "drop_first_requests_per_client",
+        "dropped_requests_total",
+        "steady_requests",
+    ]
+    steady_client_fields = steady_common_fields + bare_summary.metric_fields("latency")
+    steady_server_fields = (
+        steady_common_fields +
+        bare_summary.metric_fields("poll") +
+        bare_summary.metric_fields("execute") +
+        bare_summary.metric_fields("response")
+    )
+    steady_throughput_fields = steady_common_fields + [
+        "total_requests",
+        "first_start_tick",
+        "last_end_tick",
+        "total_span_ns",
+        "overall_throughput_req_per_s",
+        "overall_throughput_kops",
     ]
 
     bare_summary.write_csv(client_summary_csv, client_fields, client_rows)
     bare_summary.write_csv(server_summary_csv, server_fields, server_rows)
-    bare_summary.write_csv(throughput_summary_csv, throughput_fields,
-                           throughput_rows)
+    bare_summary.write_csv(throughput_summary_csv, throughput_fields, throughput_rows)
+    bare_summary.write_csv(
+        steady_client_summary_csv,
+        steady_client_fields,
+        steady_client_rows,
+    )
+    bare_summary.write_csv(
+        steady_server_summary_csv,
+        steady_server_fields,
+        steady_server_rows,
+    )
+    bare_summary.write_csv(
+        steady_throughput_summary_csv,
+        steady_throughput_fields,
+        steady_throughput_rows,
+    )
 
     print(f"client summary: {client_summary_csv}")
     print(f"server summary: {server_summary_csv}")
     print(f"throughput summary: {throughput_summary_csv}")
+    print(f"steady client summary: {steady_client_summary_csv}")
+    print(f"steady server summary: {steady_server_summary_csv}")
+    print(f"steady throughput summary: {steady_throughput_summary_csv}")
     print(f"client rows: {len(client_rows)}")
     print(f"server rows: {len(server_rows)}")
     print(f"throughput rows: {len(throughput_rows)}")
+    print(f"steady client rows: {len(steady_client_rows)}")
+    print(f"steady server rows: {len(steady_server_rows)}")
+    print(f"steady throughput rows: {len(steady_throughput_rows)}")
     return 0
 
 

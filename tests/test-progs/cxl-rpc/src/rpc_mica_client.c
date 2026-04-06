@@ -37,6 +37,7 @@
 
 #include "cxl_rpc.h"
 #include "cxl_rpc_layout.h"
+#include "rpc_first_round_barrier.h"
 #include "rpc_mica_common.h"
 
 #define DEFAULT_NUM_REQUESTS 20
@@ -270,6 +271,24 @@ parse_size_literal(const char *s, size_t min_val, size_t max_val, size_t *out)
 }
 
 static int
+first_round_barrier_participants(int num_clients,
+                                 int num_requests,
+                                 int slow_client_count,
+                                 int slow_count_per_client)
+{
+    if (num_clients <= 0 || num_requests <= 0)
+        return 0;
+
+    if (slow_client_count <= 0 || slow_count_per_client > 0)
+        return num_clients;
+
+    if (slow_client_count >= num_clients)
+        return 0;
+
+    return num_clients - slow_client_count;
+}
+
+static int
 parse_size_arg(int argc, char **argv, const char *flag, size_t default_val,
                size_t min_val, size_t max_val, size_t *out)
 {
@@ -346,6 +365,29 @@ spin_pause_iters(int poll_pause_iters)
     int i;
     for (i = 0; i < poll_pause_iters; i++)
         __asm__ __volatile__("pause" ::: "memory");
+}
+
+static inline int
+scale_sparse_send_pause_iters(int base_pause_iters,
+                              int request_count,
+                              int client_request_count)
+{
+    uint64_t total_pause_iters = 0;
+
+    if (base_pause_iters <= 0 ||
+        request_count <= 1 ||
+        client_request_count <= 1 ||
+        client_request_count >= request_count) {
+        return base_pause_iters;
+    }
+
+    // Keep the sparse-client issue span aligned with the baseline
+    // request-count schedule. Fewer requests therefore implies more
+    // application-side think time before each send.
+    total_pause_iters =
+        (uint64_t)(request_count - 1) * (uint64_t)base_pause_iters;
+    return (int)((total_pause_iters + (uint64_t)(client_request_count - 2)) /
+                 (uint64_t)(client_request_count - 1));
 }
 
 static void
@@ -834,6 +876,7 @@ main(int argc, char **argv)
     int variable_layout = 0;
     int is_slow_client;
     int client_request_count;
+    int barrier_participant_count;
     int send_pause_iters;
 
     if (parse_profile_arg(argc, argv, RPC_APP_PROFILE_YCSB_C_1K,
@@ -901,9 +944,9 @@ main(int argc, char **argv)
         return 1;
     }
     if (slow_client_count > 0 &&
-        (slow_count_per_client <= 0 || slow_count_per_client > num_requests)) {
+        (slow_count_per_client < 0 || slow_count_per_client > num_requests)) {
         fprintf(stderr,
-                "client: slow_count_per_client=%d must be in range 1..%d "
+                "client: slow_count_per_client=%d must be in range 0..%d "
                 "when slow_client_count > 0\n",
                 slow_count_per_client, num_requests);
         return 1;
@@ -979,7 +1022,16 @@ main(int argc, char **argv)
     setvbuf(stderr, NULL, _IONBF, 0);
     is_slow_client = (slow_client_count > 0 && node_id < slow_client_count);
     client_request_count = is_slow_client ? slow_count_per_client : num_requests;
-    send_pause_iters = is_slow_client ? slow_client_send_pause_iters : 0;
+    barrier_participant_count =
+        first_round_barrier_participants(num_clients,
+                                         num_requests,
+                                         slow_client_count,
+                                         slow_count_per_client);
+    send_pause_iters = is_slow_client
+        ? scale_sparse_send_pause_iters(slow_client_send_pause_iters,
+                                        num_requests,
+                                        client_request_count)
+        : 0;
     rpc_markerf("init_begin",
                 "profile=%s,node=%d,num_clients=%d,requests=%d,base_requests=%d,key_size=%zu,value_size=%zu,max_key_size=%zu,max_value_size=%zu,record_count=%llu,read_ratio=%.3f,update_ratio=%.3f,rmw_ratio=%.3f,window=%d,slow_client_count=%d,slow_count_per_client=%d,is_slow_client=%d,slow_client_send_pause_iters=%d,allow_miss=%d,variable_layout=%d",
                 profile.name, node_id, num_clients, client_request_count,
@@ -1089,6 +1141,24 @@ main(int argc, char **argv)
             if (completed_requests > 0)
                 break;
             spin_pause_iters(poll_pause_iters);
+        }
+
+        if (completed_requests > 0 && barrier_participant_count > 1) {
+            rpc_markerf("first_response_barrier_enter",
+                        "node=%d,participants=%d,completed=%d",
+                        node_id, barrier_participant_count,
+                        completed_requests);
+            if (rpc_wait_for_first_round_barrier(barrier_participant_count,
+                                                 node_id,
+                                                 &keep_running,
+                                                 poll_pause_iters) != 0) {
+                rc = 1;
+                goto cleanup;
+            }
+            rpc_markerf("first_response_barrier_exit",
+                        "node=%d,participants=%d,completed=%d",
+                        node_id, barrier_participant_count,
+                        completed_requests);
         }
 
     }
