@@ -1116,6 +1116,15 @@ def main() -> int:
     )
     parser.add_argument("--requests", type=int, default=30)
     parser.add_argument(
+        "--client-window",
+        type=int,
+        default=0,
+        help=(
+            "Override guest client sliding window. "
+            "0 keeps the client binary default."
+        ),
+    )
+    parser.add_argument(
         "--response-dma-threshold",
         type=int,
         default=DEFAULT_RESPONSE_DMA_THRESHOLD,
@@ -1238,6 +1247,9 @@ def main() -> int:
         return 2
     if args.response_dma_threshold < 1:
         print("[fatal] --response-dma-threshold must be >= 1")
+        return 2
+    if args.client_window < 0:
+        print("[fatal] --client-window must be >= 0")
         return 2
     if args.prefetch_mode not in {"full", "no-request", "none"}:
         print("[fatal] --prefetch-mode must be one of: full, no-request, none")
@@ -1853,6 +1865,8 @@ def main() -> int:
                     *app_profile_arg_list(key),
                     *app_workload_arg_list(key),
                 ]
+                if args.client_window > 0:
+                    client_args_parts.append(f"--window {args.client_window}")
                 client_args = " ".join(client_args_parts)
                 test_cmd = (
                     f"CXL_RPC_CLIENT_COUNT={key.clients} "
@@ -1912,6 +1926,8 @@ def main() -> int:
                     f"--message-profile {key.message_profile} "
                     f"--silent"
                 )
+                if args.client_window > 0:
+                    test_cmd += f" --window {args.client_window}"
                 if key.request_min_size > 0:
                     test_cmd += f" --req-min-bytes {key.request_min_size}"
                 if key.request_max_size > 0:
