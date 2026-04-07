@@ -9,14 +9,14 @@ Usage:
 Options:
   --root-outdir <dir>      Root output directory.
                            Default: output/rpc_current_flat_queue_<timestamp>
-  --checkpoint-dir <dir>   Existing checkpoint directory to reuse.
-                           Used for the default 32-client app/current topology.
+  --checkpoint-dir <dir>   Existing checkpoint directory to reuse, or a
+                           checkpoint root containing topology subdirs.
   --max-procs <N>          Concurrent gem5 jobs for the SimCXL current set.
                            Default: 12
   --disk <path>            Guest disk image. Default: repo-local files/parsec.img
   --skip-build             Reuse existing gem5 binary and injected guest binaries.
   --skip-inject            Reuse the current disk image contents.
-  --skip-bare              Skip bare-RPC current experiments.
+  --skip-bare              Skip non-application current experiments.
   --skip-app               Skip application-path current experiments.
   --force-rerun            Forward to per-experiment runners.
   --continue-on-failure    Record failing experiment wrappers and keep going.
@@ -26,27 +26,24 @@ Options:
   --help                   Show this message.
 
 Current SimCXL set:
-  - bare current scope:
-      overall + sensitivity + technical-analysis points
+  - unified current scope from run_rpc_matrix_kvm_timing_ckpt.py:
+      overall + application + sensitivity + technical-analysis points
       DMA-lane sensitivity excluded
-  - app current scope:  ycsb_a_1k / ycsb_b_1k / ycsb_c_1k / ycsb_f_1k / udb_ro
 
-Default total tasks from this launcher: 65
-  - bare: 60
-  - app: 5
+Default total tasks from this launcher follow the unified matrix plan.
 EOF
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 BARE_RUNNER="$REPO_ROOT/tests/test-progs/cxl-rpc/scripts/run_rpc_matrix_kvm_timing_ckpt.py"
-APP_RUNNER="$REPO_ROOT/tests/test-progs/cxl-rpc/scripts/run_rpc_app_matrix_kvm_timing_ckpt.py"
 INJECT_SCRIPT="$REPO_ROOT/tests/test-progs/cxl-rpc/scripts/setup_disk_image.sh"
 GEM5_BIN="$REPO_ROOT/build/X86/gem5.opt"
 SAVE_CKPT_CFG="$REPO_ROOT/configs/example/gem5_library/x86-cxl-rpc-save-checkpoint.py"
 
 ROOT_OUTDIR=""
 CHECKPOINT_DIR=""
+CHECKPOINT_ROOT=""
 MAX_PROCS=12
 DISK="$REPO_ROOT/files/parsec.img"
 SKIP_BUILD=0
@@ -154,6 +151,13 @@ topology_label() {
         "$clients" "$lanes" "$mq_entries" "$cxl_extra_latency_ns"
 }
 
+base_topology_label() {
+    local clients="$1"
+    local lanes="$2"
+    topology_label "$clients" "$lanes" \
+        "$DEFAULT_TOPOLOGY_MQ" "$DEFAULT_TOPOLOGY_CXLP"
+}
+
 build_topology_checkpoint() {
     local clients="$1"
     local lanes="$2"
@@ -238,7 +242,7 @@ register_topology_row() {
     TOPOLOGY_ROWS+=("$row")
 }
 
-emit_bare_plan_tsv() {
+emit_matrix_plan_tsv() {
     local plan_csv="$1"
     python3 - "$plan_csv" <<'PY'
 import csv
@@ -250,6 +254,7 @@ with open(sys.argv[1], encoding="utf-8", newline="") as fp:
             "\t".join(
                 [
                     row["exp_id"],
+                    row["workload_kind"],
                     row["clients"],
                     row["response_lane_count"],
                     row["mq_entries"],
@@ -257,18 +262,6 @@ with open(sys.argv[1], encoding="utf-8", newline="") as fp:
                 ]
             )
         )
-PY
-}
-
-emit_app_plan_tsv() {
-    local plan_csv="$1"
-    python3 - "$plan_csv" <<'PY'
-import csv
-import sys
-
-with open(sys.argv[1], encoding="utf-8", newline="") as fp:
-    for row in csv.DictReader(fp):
-        print(row["exp_id"])
 PY
 }
 
@@ -344,7 +337,6 @@ done
 [[ "$CHECKPOINT_HANDOFF_DEADLINE_SIM_SECONDS" =~ ^[0-9]+$ ]] || \
     usage_die "--checkpoint-handoff-deadline-sim-seconds must be >= 0"
 [[ -f "$BARE_RUNNER" ]] || usage_die "bare runner not found: $BARE_RUNNER"
-[[ -f "$APP_RUNNER" ]] || usage_die "app runner not found: $APP_RUNNER"
 [[ -f "$INJECT_SCRIPT" ]] || usage_die "inject script not found: $INJECT_SCRIPT"
 [[ -f "$SAVE_CKPT_CFG" ]] || usage_die "checkpoint config not found: $SAVE_CKPT_CFG"
 [[ -f "$DISK" ]] || usage_die "disk image not found: $DISK"
@@ -376,78 +368,62 @@ if [[ "$SKIP_INJECT" -eq 0 ]]; then
 fi
 
 if [[ -n "$CHECKPOINT_DIR" ]]; then
-    if ! CHECKPOINT_DIR="$(resolve_checkpoint_dir "$CHECKPOINT_DIR")"; then
-        usage_die "--checkpoint-dir does not resolve to a checkpoint: $CHECKPOINT_DIR"
+    if [[ -d "$CHECKPOINT_DIR" ]] && \
+       find "$CHECKPOINT_DIR" -mindepth 1 -maxdepth 1 -type d -name 'clients_*' \
+           | grep -q .; then
+        CHECKPOINT_ROOT="$(cd "$CHECKPOINT_DIR" && pwd)"
+        CHECKPOINT_DIR=""
+    elif ! CHECKPOINT_DIR="$(resolve_checkpoint_dir "$CHECKPOINT_DIR")"; then
+        usage_die "--checkpoint-dir does not resolve to a checkpoint or checkpoint root: $CHECKPOINT_DIR"
     fi
 fi
 
 PLAN_ROOT="$ROOT_OUTDIR/plans"
 mkdir -p "$PLAN_ROOT"
 
-if [[ "$SKIP_BARE" -eq 0 ]]; then
-    run_cmd python3 "$BARE_RUNNER" \
-        --repo-root "$REPO_ROOT" \
-        --output-base "$PLAN_ROOT" \
-        --batch-name plan_bare \
-        --skip-inject \
-        --allow-concurrent-runs \
-        --inter-experiment-sleep-sec 0 \
-        --dry-run >/dev/null
-fi
+run_cmd python3 "$BARE_RUNNER" \
+    --repo-root "$REPO_ROOT" \
+    --output-base "$PLAN_ROOT" \
+    --batch-name plan_matrix \
+    --skip-inject \
+    --allow-concurrent-runs \
+    --inter-experiment-sleep-sec 0 \
+    --dry-run >/dev/null
 
-if [[ "$SKIP_APP" -eq 0 ]]; then
-    run_cmd python3 "$APP_RUNNER" \
-        --repo-root "$REPO_ROOT" \
-        --output-base "$PLAN_ROOT" \
-        --skip-inject \
-        --allow-concurrent-runs \
-        --inter-experiment-sleep-sec 0 \
-        --batch-name plan_app \
-        --dry-run >/dev/null
-fi
-
-readarray -t BARE_PLAN_ROWS < <(
-    if [[ "$SKIP_BARE" -eq 0 ]]; then
-        emit_bare_plan_tsv "$PLAN_ROOT/plan_bare/plan.csv"
-    fi
-)
-
-readarray -t APP_EXP_IDS < <(
-    if [[ "$SKIP_APP" -eq 0 ]]; then
-        emit_app_plan_tsv "$PLAN_ROOT/plan_app/plan.csv"
-    fi
+readarray -t MATRIX_PLAN_ROWS < <(
+    emit_matrix_plan_tsv "$PLAN_ROOT/plan_matrix/plan.csv"
 )
 
 DEFAULT_APP_CHECKPOINT=""
-if [[ "$SKIP_BARE" -eq 0 ]]; then
-    for row in "${BARE_PLAN_ROWS[@]}"; do
-        [[ -n "$row" ]] || continue
-        IFS=$'\t' read -r _exp_id clients lanes mq_entries cxl_extra_latency_ns <<<"$row"
-        preferred=""
-        if [[ "$clients" -eq "$DEFAULT_TOPOLOGY_CLIENTS" && \
-              "$lanes" -eq "$DEFAULT_TOPOLOGY_LANES" && \
-              "$mq_entries" -eq "$DEFAULT_TOPOLOGY_MQ" && \
-              "$cxl_extra_latency_ns" -eq "$DEFAULT_TOPOLOGY_CXLP" && \
-              -n "$CHECKPOINT_DIR" ]]; then
-            preferred="$CHECKPOINT_DIR"
-        fi
-        register_topology_row \
-            "$clients" "$lanes" "$mq_entries" "$cxl_extra_latency_ns" "$preferred"
-    done
-fi
-
-if [[ "$SKIP_APP" -eq 0 ]]; then
+for row in "${MATRIX_PLAN_ROWS[@]}"; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\t' read -r _exp_id workload_kind clients lanes mq_entries cxl_extra_latency_ns <<<"$row"
+    if [[ "$workload_kind" == "application" && "$SKIP_APP" -eq 1 ]]; then
+        continue
+    fi
+    if [[ "$workload_kind" != "application" && "$SKIP_BARE" -eq 1 ]]; then
+        continue
+    fi
+    label="$(topology_label "$clients" "$lanes" "$mq_entries" "$cxl_extra_latency_ns")"
     preferred=""
-    if [[ -n "$CHECKPOINT_DIR" ]]; then
+    if [[ -n "$CHECKPOINT_ROOT" ]] && \
+       resolved="$(resolve_checkpoint_dir "$CHECKPOINT_ROOT/$label" 2>/dev/null)"; then
+        preferred="$resolved"
+    elif [[ -n "$CHECKPOINT_ROOT" ]]; then
+        base_label="$(base_topology_label "$clients" "$lanes")"
+        if resolved="$(resolve_checkpoint_dir "$CHECKPOINT_ROOT/$base_label" 2>/dev/null)"; then
+            preferred="$resolved"
+        fi
+    elif [[ "$clients" -eq "$DEFAULT_TOPOLOGY_CLIENTS" && \
+          "$lanes" -eq "$DEFAULT_TOPOLOGY_LANES" && \
+          "$mq_entries" -eq "$DEFAULT_TOPOLOGY_MQ" && \
+          "$cxl_extra_latency_ns" -eq "$DEFAULT_TOPOLOGY_CXLP" && \
+          -n "$CHECKPOINT_DIR" ]]; then
         preferred="$CHECKPOINT_DIR"
     fi
     register_topology_row \
-        "$DEFAULT_TOPOLOGY_CLIENTS" \
-        "$DEFAULT_TOPOLOGY_LANES" \
-        "$DEFAULT_TOPOLOGY_MQ" \
-        "$DEFAULT_TOPOLOGY_CXLP" \
-        "$preferred"
-fi
+        "$clients" "$lanes" "$mq_entries" "$cxl_extra_latency_ns" "$preferred"
+done
 
 for row in "${TOPOLOGY_ROWS[@]}"; do
     [[ -n "$row" ]] || continue
@@ -489,7 +465,7 @@ for row in "${TOPOLOGY_ROWS[@]}"; do
 done
 
 DEFAULT_APP_CHECKPOINT="${CHECKPOINT_BY_LABEL[$DEFAULT_TOPOLOGY_LABEL]:-}"
-if [[ "$SKIP_APP" -eq 0 && -z "$DEFAULT_APP_CHECKPOINT" ]]; then
+if [[ -z "$DEFAULT_APP_CHECKPOINT" ]]; then
     usage_die "failed to resolve default app checkpoint"
 fi
 
@@ -508,25 +484,47 @@ echo "ROOT_OUTDIR=$ROOT_OUTDIR"
 echo "DISK=$DISK"
 echo "DEFAULT_APP_CHECKPOINT=$DEFAULT_APP_CHECKPOINT"
 echo "MAX_PROCS=$MAX_PROCS"
-echo "BARE_TASKS=${#BARE_PLAN_ROWS[@]}"
-echo "APP_TASKS=${#APP_EXP_IDS[@]}"
-
-for row in "${BARE_PLAN_ROWS[@]}"; do
+bare_task_count=0
+app_task_count=0
+for row in "${MATRIX_PLAN_ROWS[@]}"; do
     [[ -n "$row" ]] || continue
-    IFS=$'\t' read -r exp_id clients lanes mq_entries cxl_extra_latency_ns <<<"$row"
+    IFS=$'\t' read -r _exp_id workload_kind _clients _lanes _mq_entries _cxl_extra_latency_ns <<<"$row"
+    if [[ "$workload_kind" == "application" ]]; then
+        if [[ "$SKIP_APP" -eq 0 ]]; then
+            app_task_count=$((app_task_count + 1))
+        fi
+    else
+        if [[ "$SKIP_BARE" -eq 0 ]]; then
+            bare_task_count=$((bare_task_count + 1))
+        fi
+    fi
+done
+echo "BARE_TASKS=$bare_task_count"
+echo "APP_TASKS=$app_task_count"
+echo "TOTAL_TASKS=$((bare_task_count + app_task_count))"
+
+for row in "${MATRIX_PLAN_ROWS[@]}"; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\t' read -r exp_id workload_kind clients lanes mq_entries cxl_extra_latency_ns <<<"$row"
+    if [[ "$workload_kind" == "application" && "$SKIP_APP" -eq 1 ]]; then
+        continue
+    fi
+    if [[ "$workload_kind" != "application" && "$SKIP_BARE" -eq 1 ]]; then
+        continue
+    fi
     label="$(topology_label "$clients" "$lanes" "$mq_entries" "$cxl_extra_latency_ns")"
     checkpoint_for_exp="${CHECKPOINT_BY_LABEL[$label]:-}"
     if [[ -z "$checkpoint_for_exp" ]]; then
         ANY_FAILURES=1
-        printf '[%s] skip bare %s due to missing checkpoint for %s\n' \
-            "$(date '+%F %T')" "$exp_id" "$label"
+        printf '[%s] skip %s %s due to missing checkpoint for %s\n' \
+            "$(date '+%F %T')" "$workload_kind" "$exp_id" "$label"
         continue
     fi
-    bare_cmd=(
+    runner_cmd=(
         python3 "$BARE_RUNNER"
         --repo-root "$REPO_ROOT"
         --output-base "$ROOT_OUTDIR"
-        --batch-name "bare_${exp_id}"
+        --batch-name "$([[ "$workload_kind" == "application" ]] && printf 'app_%s' "$exp_id" || printf 'bare_%s' "$exp_id")"
         --checkpoint-dir "$checkpoint_for_exp"
         --skip-inject
         --allow-concurrent-runs
@@ -536,38 +534,13 @@ for row in "${BARE_PLAN_ROWS[@]}"; do
         bare_cmd+=(--copy-engine-channels "$COPY_ENGINE_CHANNELS")
     fi
     if [[ "$CHECKPOINT_HANDOFF_DEADLINE_SIM_SECONDS" -gt 0 ]]; then
-        bare_cmd+=(--checkpoint-handoff-deadline-sim-seconds
-                   "$CHECKPOINT_HANDOFF_DEADLINE_SIM_SECONDS")
+        runner_cmd+=(--checkpoint-handoff-deadline-sim-seconds
+                     "$CHECKPOINT_HANDOFF_DEADLINE_SIM_SECONDS")
     fi
     if [[ "$FORCE_RERUN" -eq 1 ]]; then
-        bare_cmd+=(--force-rerun)
+        runner_cmd+=(--force-rerun)
     fi
-    submit_runner bare "$exp_id" "${bare_cmd[@]}"
-done
-
-for exp_id in "${APP_EXP_IDS[@]}"; do
-    [[ -n "$exp_id" ]] || continue
-    app_cmd=(
-        python3 "$APP_RUNNER"
-        --repo-root "$REPO_ROOT"
-        --output-base "$ROOT_OUTDIR"
-        --batch-name "app_${exp_id}"
-        --checkpoint-dir "$DEFAULT_APP_CHECKPOINT"
-        --skip-inject
-        --allow-concurrent-runs
-        --inter-experiment-sleep-sec 0
-    )
-    if [[ "$COPY_ENGINE_CHANNELS" -gt 0 ]]; then
-        app_cmd+=(--copy-engine-channels "$COPY_ENGINE_CHANNELS")
-    fi
-    if [[ "$CHECKPOINT_HANDOFF_DEADLINE_SIM_SECONDS" -gt 0 ]]; then
-        app_cmd+=(--checkpoint-handoff-deadline-sim-seconds
-                  "$CHECKPOINT_HANDOFF_DEADLINE_SIM_SECONDS")
-    fi
-    if [[ "$FORCE_RERUN" -eq 1 ]]; then
-        app_cmd+=(--force-rerun)
-    fi
-    submit_runner app "$exp_id" "${app_cmd[@]}"
+    submit_runner "$workload_kind" "$exp_id" "${runner_cmd[@]}"
 done
 
 wait_for_all_background

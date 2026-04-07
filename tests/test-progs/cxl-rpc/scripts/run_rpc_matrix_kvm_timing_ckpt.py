@@ -12,13 +12,28 @@ Default experiment matrix follows the current shared-aligned SimCXL scope:
       fixed (64,64)
       uniform-1530-315
       uniform-38-230
+  - application:
+    shared-aligned 32-client KV/YCSB workloads:
+      ycsb_a_1k
+      ycsb_b_1k
+      ycsb_c_1k
+      ycsb_d_1k
+      udb_a
+      udb_b
+      udb_c
+      udb_d
   - sensitivity:
-    shared-aligned public sweeps using the 32-client uniform-38-230 baseline:
-      request size / response size / ring size / request sparsity /
-      CXL latency
+    shared-aligned public sweeps:
+      request size / response size / ring size / CXL latency use the
+      32-client uniform-38-230 baseline;
+      request sparsity uses the 16-client uniform-38-230 baseline
+  - motivation sparsity:
+    shared-aligned 16-client req64/resp64 sparse points;
+    `100%` density reuses the c16 req64/resp64 baseline
   - technical analysis:
     SimCXL-specific comparisons and knobs:
       cpu-only + no-prefetch
+      cpu-only + current-prefetch
       current dma + no-prefetch
       current dma + current-prefetch
       head sync threshold
@@ -52,10 +67,26 @@ DEFAULT_PREFETCH_MODE = "full"
 DEFAULT_REQUEST_SPARSITY_SLOW_CLIENT_SEND_PAUSE_ITERS = 16384
 RUN_DISABLE_SENTINEL_ENV = "SIMCXL_RPC_RUN_DISABLE_FILE"
 RUN_DISABLE_SENTINEL_REL = "output/SIMCXL_RUNS_DISABLED"
+WORKLOAD_KIND_BARE_RPC = "bare_rpc"
+WORKLOAD_KIND_APPLICATION = "application"
 MESSAGE_PROFILE_FIXED = "fixed"
 MESSAGE_PROFILE_UNIFORM_1530_315 = "uniform-1530-315"
 MESSAGE_PROFILE_UNIFORM_38_230 = "uniform-38-230"
 CURRENT_CLIENTS = 32
+APPLICATION_CLIENTS = 32
+APPLICATION_RECORD_COUNT = 10000
+APPLICATION_DATASET_SEED = 0x9B5D3A4781C26EF1
+APPLICATION_WORKLOAD_SEED = 0xC7D51A32049EF68B
+APPLICATION_PROFILES = (
+    "ycsb_a_1k",
+    "ycsb_b_1k",
+    "ycsb_c_1k",
+    "ycsb_d_1k",
+    "udb_a",
+    "udb_b",
+    "udb_c",
+    "udb_d",
+)
 OVERALL_CLIENT_COUNTS = [1, 2, 4, 8, 16, 32]
 OVERALL_WORKLOADS = [
     (64, 64, MESSAGE_PROFILE_FIXED),
@@ -63,12 +94,13 @@ OVERALL_WORKLOADS = [
     (38, 230, MESSAGE_PROFILE_UNIFORM_38_230),
 ]
 SENSITIVITY_REQUEST_SIZES = [8, 64, 256, 1024, 4096, 8192]
-SENSITIVITY_RESPONSE_SIZES = [8, 256, 1024, 4096, 8192]
+SENSITIVITY_RESPONSE_SIZES = [8, 64, 256, 1024, 4096, 8192]
 SENSITIVITY_MQ_ENTRIES = [16, 32, 64, 128, 256, 512]
 TECH_HEAD_SYNC_THRESHOLDS = [8, 16, 32, 64, 128, 256, 512]
-SENSITIVITY_REQUEST_SPARSITY_SLOW_CLIENT_COUNTS = [4, 8, 16, 20, 24, 28]
+SENSITIVITY_REQUEST_SPARSITY_CLIENTS = 16
+SENSITIVITY_REQUEST_SPARSITY_SLOW_CLIENT_COUNTS = [1, 2, 4, 8]
 SENSITIVITY_REQUEST_SPARSITY_SLOW_REQUEST_COUNTS = [0, 8, 15]
-SENSITIVITY_CXL_LATENCIES_NS = [100, 200, 300]
+SENSITIVITY_CXL_LATENCIES_NS = [100, 200, 300, 400, 500, 600]
 TECH_DISABLE_DMA_THRESHOLD = 10000
 UNIFORM_1530_315_REQ_MIN = 765
 UNIFORM_1530_315_REQ_MAX = 2295
@@ -98,6 +130,120 @@ OBSOLETE_REQUEST_SPARSITY_EXP_IDS = {
 
 
 @dataclass(frozen=True)
+class ApplicationProfileConfig:
+    name: str
+    key_size: int
+    value_size: int
+    size_mode: str
+    key_dist: str
+    read_ratio: float
+    update_ratio: float
+    rmw_ratio: float
+    insert_ratio: float
+    zipf_theta: float
+
+
+APPLICATION_PROFILE_CONFIGS: Dict[str, ApplicationProfileConfig] = {
+    "ycsb_c_1k": ApplicationProfileConfig(
+        name="ycsb_c_1k",
+        key_size=16,
+        value_size=1024,
+        size_mode="fixed",
+        key_dist="zipf",
+        read_ratio=1.0,
+        update_ratio=0.0,
+        rmw_ratio=0.0,
+        insert_ratio=0.0,
+        zipf_theta=0.99,
+    ),
+    "ycsb_a_1k": ApplicationProfileConfig(
+        name="ycsb_a_1k",
+        key_size=16,
+        value_size=1024,
+        size_mode="fixed",
+        key_dist="zipf",
+        read_ratio=0.5,
+        update_ratio=0.5,
+        rmw_ratio=0.0,
+        insert_ratio=0.0,
+        zipf_theta=0.99,
+    ),
+    "ycsb_b_1k": ApplicationProfileConfig(
+        name="ycsb_b_1k",
+        key_size=16,
+        value_size=1024,
+        size_mode="fixed",
+        key_dist="zipf",
+        read_ratio=0.95,
+        update_ratio=0.05,
+        rmw_ratio=0.0,
+        insert_ratio=0.0,
+        zipf_theta=0.99,
+    ),
+    "ycsb_d_1k": ApplicationProfileConfig(
+        name="ycsb_d_1k",
+        key_size=16,
+        value_size=1024,
+        size_mode="fixed",
+        key_dist="latest",
+        read_ratio=0.95,
+        update_ratio=0.0,
+        rmw_ratio=0.0,
+        insert_ratio=0.05,
+        zipf_theta=0.0,
+    ),
+    "udb_a": ApplicationProfileConfig(
+        name="udb_a",
+        key_size=27,
+        value_size=127,
+        size_mode="variable",
+        key_dist="zipf",
+        read_ratio=0.5,
+        update_ratio=0.5,
+        rmw_ratio=0.0,
+        insert_ratio=0.0,
+        zipf_theta=0.99,
+    ),
+    "udb_b": ApplicationProfileConfig(
+        name="udb_b",
+        key_size=27,
+        value_size=127,
+        size_mode="variable",
+        key_dist="zipf",
+        read_ratio=0.95,
+        update_ratio=0.05,
+        rmw_ratio=0.0,
+        insert_ratio=0.0,
+        zipf_theta=0.99,
+    ),
+    "udb_c": ApplicationProfileConfig(
+        name="udb_c",
+        key_size=27,
+        value_size=127,
+        size_mode="variable",
+        key_dist="zipf",
+        read_ratio=1.0,
+        update_ratio=0.0,
+        rmw_ratio=0.0,
+        insert_ratio=0.0,
+        zipf_theta=0.99,
+    ),
+    "udb_d": ApplicationProfileConfig(
+        name="udb_d",
+        key_size=27,
+        value_size=127,
+        size_mode="variable",
+        key_dist="latest",
+        read_ratio=0.95,
+        update_ratio=0.0,
+        rmw_ratio=0.0,
+        insert_ratio=0.05,
+        zipf_theta=0.0,
+    ),
+}
+
+
+@dataclass(frozen=True)
 class ExperimentKey:
     request_size: int
     response_size: int
@@ -118,6 +264,20 @@ class ExperimentKey:
     slow_client_count: int = 0
     slow_count_per_client: int = 0
     slow_client_send_pause_iters: int = 0
+    workload_kind: str = WORKLOAD_KIND_BARE_RPC
+    app_profile: str = ""
+    record_count: int = 0
+    key_size: int = 0
+    value_size: int = 0
+    size_mode: str = ""
+    key_dist: str = ""
+    read_ratio: float = 0.0
+    update_ratio: float = 0.0
+    rmw_ratio: float = 0.0
+    insert_ratio: float = 0.0
+    zipf_theta: float = 0.0
+    dataset_seed: int = 0
+    workload_seed: int = 0
 
 
 @dataclass
@@ -189,6 +349,31 @@ def cpu_only_dma_threshold(message_profile: str,
 
 
 def format_exp_id(key: ExperimentKey) -> str:
+    if key.workload_kind == WORKLOAD_KIND_APPLICATION:
+        parts = [
+            key.app_profile,
+            f"c{key.clients}",
+            f"r{key.requests_per_client}",
+            f"rec{key.record_count}",
+        ]
+        if key.mq_entries != DEFAULT_MQ_ENTRIES:
+            parts.append(f"mq{key.mq_entries}")
+        if key.head_sync_threshold != default_head_sync_threshold(key.mq_entries):
+            parts.append(f"hs{key.head_sync_threshold}")
+        if key.cxl_extra_latency_ns > 0:
+            parts.append(f"cxlp{key.cxl_extra_latency_ns}ns")
+        if key.clients_per_dma_lane != 1:
+            parts.append(f"cpl{key.clients_per_dma_lane}")
+        if key.response_dma_threshold != DEFAULT_RESPONSE_DMA_THRESHOLD:
+            parts.append(f"dmath{key.response_dma_threshold}")
+        if key.prefetch_mode != DEFAULT_PREFETCH_MODE:
+            parts.append(f"pf{key.prefetch_mode.replace('-', '_')}")
+        if key.dataset_seed != APPLICATION_DATASET_SEED:
+            parts.append(f"dseed{key.dataset_seed:x}")
+        if key.workload_seed != APPLICATION_WORKLOAD_SEED:
+            parts.append(f"wseed{key.workload_seed:x}")
+        return "_".join(parts)
+
     def size_tag(prefix: str, base: int, min_size: int, max_size: int) -> str:
         if min_size > 0 and max_size > 0 and min_size != max_size:
             return f"{prefix}u{min_size}-{max_size}"
@@ -232,6 +417,16 @@ def expected_total_requests(key: ExperimentKey) -> int:
     return (fast_clients * key.requests_per_client) + (slow_clients * slow_requests)
 
 
+def format_zipf_field(key_dist: str, zipf_theta: float) -> str:
+    if key_dist != "zipf":
+        return ""
+    return f"{zipf_theta:.6f}"
+
+
+def is_application_experiment(key: ExperimentKey) -> bool:
+    return key.workload_kind == WORKLOAD_KIND_APPLICATION
+
+
 def build_matrix(requests_per_client: int,
                  response_dma_threshold: int,
                  prefetch_mode: str,
@@ -270,12 +465,43 @@ def build_matrix(requests_per_client: int,
                 "overall",
             )
 
+    for profile_name in APPLICATION_PROFILES:
+        profile = APPLICATION_PROFILE_CONFIGS[profile_name]
+        add_experiment(
+            ExperimentKey(
+                request_size=profile.key_size,
+                response_size=profile.value_size,
+                clients=APPLICATION_CLIENTS,
+                requests_per_client=requests_per_client,
+                head_sync_threshold=default_hs,
+                response_lane_count=APPLICATION_CLIENTS,
+                response_dma_threshold=response_dma_threshold,
+                prefetch_mode=prefetch_mode,
+                workload_kind=WORKLOAD_KIND_APPLICATION,
+                app_profile=profile.name,
+                record_count=APPLICATION_RECORD_COUNT,
+                key_size=profile.key_size,
+                value_size=profile.value_size,
+                size_mode=profile.size_mode,
+                key_dist=profile.key_dist,
+                read_ratio=profile.read_ratio,
+                update_ratio=profile.update_ratio,
+                rmw_ratio=profile.rmw_ratio,
+                insert_ratio=profile.insert_ratio,
+                zipf_theta=profile.zipf_theta,
+                dataset_seed=APPLICATION_DATASET_SEED,
+                workload_seed=APPLICATION_WORKLOAD_SEED,
+            ),
+            "application",
+        )
+
     for request_size, response_size, message_profile in OVERALL_WORKLOADS:
         no_dma_threshold = cpu_only_dma_threshold(message_profile,
                                                   response_size,
                                                   response_dma_threshold)
         for source, tech_prefetch_mode, tech_dma_threshold in (
             ("technical_cpu_only_no_prefetch", "none", no_dma_threshold),
+            ("technical_cpu_only_with_prefetch", prefetch_mode, no_dma_threshold),
             ("technical_dma_no_prefetch", "none", response_dma_threshold),
             ("technical_dma_with_prefetch", prefetch_mode, response_dma_threshold),
         ):
@@ -292,6 +518,33 @@ def build_matrix(requests_per_client: int,
                     message_profile=message_profile,
                 ),
                 source,
+            )
+
+    # `100%` sparse density is canonicalized to the overall c16 req64/resp64 point.
+    for slow_client_count in SENSITIVITY_REQUEST_SPARSITY_SLOW_CLIENT_COUNTS:
+        for slow_count_per_client in SENSITIVITY_REQUEST_SPARSITY_SLOW_REQUEST_COUNTS:
+            add_experiment(
+                ExperimentKey(
+                    request_size=64,
+                    response_size=64,
+                    clients=SENSITIVITY_REQUEST_SPARSITY_CLIENTS,
+                    requests_per_client=requests_per_client,
+                    head_sync_threshold=default_hs,
+                    response_lane_count=SENSITIVITY_REQUEST_SPARSITY_CLIENTS,
+                    response_dma_threshold=response_dma_threshold,
+                    prefetch_mode=prefetch_mode,
+                    message_profile=MESSAGE_PROFILE_FIXED,
+                    slow_client_count=slow_client_count,
+                    slow_count_per_client=slow_count_per_client,
+                    slow_client_send_pause_iters=(
+                        request_sparsity_slow_client_send_pause_iters
+                        if (slow_client_count > 0 and
+                            slow_count_per_client > 0 and
+                            slow_count_per_client < requests_per_client)
+                        else 0
+                    ),
+                ),
+                "motivation_request_sparsity",
             )
 
     for request_size in SENSITIVITY_REQUEST_SIZES:
@@ -368,6 +621,7 @@ def build_matrix(requests_per_client: int,
             "technical_head_sync",
         )
 
+    # `100%` sparse density is canonicalized to the overall c16 req38/resp230 point.
     for slow_client_count in SENSITIVITY_REQUEST_SPARSITY_SLOW_CLIENT_COUNTS:
         for slow_count_per_client in SENSITIVITY_REQUEST_SPARSITY_SLOW_REQUEST_COUNTS:
             add_experiment(
@@ -378,11 +632,11 @@ def build_matrix(requests_per_client: int,
                     request_max_size=UNIFORM_38_230_REQ_MAX,
                     response_min_size=UNIFORM_38_230_RESP_MIN,
                     response_max_size=UNIFORM_38_230_RESP_MAX,
-                    clients=CURRENT_CLIENTS,
+                    clients=SENSITIVITY_REQUEST_SPARSITY_CLIENTS,
                     requests_per_client=requests_per_client,
                     mq_entries=DEFAULT_MQ_ENTRIES,
                     head_sync_threshold=default_hs,
-                    response_lane_count=CURRENT_CLIENTS,
+                    response_lane_count=SENSITIVITY_REQUEST_SPARSITY_CLIENTS,
                     response_dma_threshold=response_dma_threshold,
                     prefetch_mode=prefetch_mode,
                     message_profile=MESSAGE_PROFILE_FIXED,
@@ -771,7 +1025,9 @@ def append_row(csv_path: Path, row: dict, fieldnames: List[str]) -> None:
 
 
 def experiment_metadata_row(key: ExperimentKey) -> Dict[str, object]:
+    is_app = is_application_experiment(key)
     return {
+        "workload_kind": key.workload_kind,
         "request_size": key.request_size,
         "response_size": key.response_size,
         "request_min_size": key.request_min_size,
@@ -790,8 +1046,50 @@ def experiment_metadata_row(key: ExperimentKey) -> Dict[str, object]:
         "clients_per_dma_lane": key.clients_per_dma_lane,
         "response_dma_threshold": key.response_dma_threshold,
         "prefetch_mode": key.prefetch_mode,
-        "message_profile": key.message_profile,
+        "message_profile": "" if is_app else key.message_profile,
+        "app_profile": key.app_profile if is_app else "",
+        "record_count": key.record_count if is_app else "",
+        "key_size": key.key_size if is_app else "",
+        "value_size": key.value_size if is_app else "",
+        "size_mode": key.size_mode if is_app else "",
+        "key_dist": key.key_dist if is_app else "",
+        "read_ratio": f"{key.read_ratio:.6f}" if is_app else "",
+        "update_ratio": f"{key.update_ratio:.6f}" if is_app else "",
+        "rmw_ratio": f"{key.rmw_ratio:.6f}" if is_app else "",
+        "insert_ratio": f"{key.insert_ratio:.6f}" if is_app else "",
+        "zipf_theta": format_zipf_field(key.key_dist, key.zipf_theta) if is_app else "",
+        "dataset_seed": str(key.dataset_seed) if is_app else "",
+        "workload_seed": str(key.workload_seed) if is_app else "",
     }
+
+
+def app_profile_arg_list(key: ExperimentKey) -> List[str]:
+    args = [
+        f"--profile {key.app_profile}",
+        f"--record-count {key.record_count}",
+        f"--dataset-seed {key.dataset_seed}",
+    ]
+    if key.size_mode == "fixed":
+        args.extend(
+            [
+                f"--key-size {key.key_size}",
+                f"--value-size {key.value_size}",
+            ]
+        )
+    return args
+
+
+def app_workload_arg_list(key: ExperimentKey) -> List[str]:
+    args = [
+        f"--workload-seed {key.workload_seed}",
+        f"--read-ratio {key.read_ratio:.6f}",
+        f"--update-ratio {key.update_ratio:.6f}",
+        f"--rmw-ratio {key.rmw_ratio:.6f}",
+        f"--insert-ratio {key.insert_ratio:.6f}",
+    ]
+    if key.key_dist == "zipf":
+        args.append(f"--zipf-theta {key.zipf_theta:.6f}")
+    return args
 
 
 def main() -> int:
@@ -1002,6 +1300,7 @@ def main() -> int:
             fieldnames=[
                 "exp_id",
                 "source",
+                "workload_kind",
                 "request_size",
                 "response_size",
                 "request_min_size",
@@ -1021,6 +1320,19 @@ def main() -> int:
                 "response_dma_threshold",
                 "prefetch_mode",
                 "message_profile",
+                "app_profile",
+                "record_count",
+                "key_size",
+                "value_size",
+                "size_mode",
+                "key_dist",
+                "read_ratio",
+                "update_ratio",
+                "rmw_ratio",
+                "insert_ratio",
+                "zipf_theta",
+                "dataset_seed",
+                "workload_seed",
             ],
         )
         writer.writeheader()
@@ -1029,6 +1341,7 @@ def main() -> int:
                 {
                     "exp_id": exp.exp_id,
                     "source": exp.source,
+                    "workload_kind": exp.key.workload_kind,
                     "request_size": exp.key.request_size,
                     "response_size": exp.key.response_size,
                     "request_min_size": exp.key.request_min_size,
@@ -1049,7 +1362,44 @@ def main() -> int:
                     "clients_per_dma_lane": exp.key.clients_per_dma_lane,
                     "response_dma_threshold": exp.key.response_dma_threshold,
                     "prefetch_mode": exp.key.prefetch_mode,
-                    "message_profile": exp.key.message_profile,
+                    "message_profile": (
+                        "" if is_application_experiment(exp.key)
+                        else exp.key.message_profile
+                    ),
+                    "app_profile": exp.key.app_profile,
+                    "record_count": exp.key.record_count if exp.key.record_count > 0 else "",
+                    "key_size": exp.key.key_size if exp.key.key_size > 0 else "",
+                    "value_size": exp.key.value_size if exp.key.value_size > 0 else "",
+                    "size_mode": exp.key.size_mode,
+                    "key_dist": exp.key.key_dist,
+                    "read_ratio": (
+                        f"{exp.key.read_ratio:.6f}"
+                        if is_application_experiment(exp.key) else ""
+                    ),
+                    "update_ratio": (
+                        f"{exp.key.update_ratio:.6f}"
+                        if is_application_experiment(exp.key) else ""
+                    ),
+                    "rmw_ratio": (
+                        f"{exp.key.rmw_ratio:.6f}"
+                        if is_application_experiment(exp.key) else ""
+                    ),
+                    "insert_ratio": (
+                        f"{exp.key.insert_ratio:.6f}"
+                        if is_application_experiment(exp.key) else ""
+                    ),
+                    "zipf_theta": (
+                        format_zipf_field(exp.key.key_dist, exp.key.zipf_theta)
+                        if is_application_experiment(exp.key) else ""
+                    ),
+                    "dataset_seed": (
+                        str(exp.key.dataset_seed)
+                        if is_application_experiment(exp.key) else ""
+                    ),
+                    "workload_seed": (
+                        str(exp.key.workload_seed)
+                        if is_application_experiment(exp.key) else ""
+                    ),
                 }
             )
 
@@ -1072,6 +1422,7 @@ def main() -> int:
     exp_fields = [
         "exp_id",
         "source",
+        "workload_kind",
         "request_size",
         "response_size",
         "request_min_size",
@@ -1091,6 +1442,19 @@ def main() -> int:
         "response_dma_threshold",
         "prefetch_mode",
         "message_profile",
+        "app_profile",
+        "record_count",
+        "key_size",
+        "value_size",
+        "size_mode",
+        "key_dist",
+        "read_ratio",
+        "update_ratio",
+        "rmw_ratio",
+        "insert_ratio",
+        "zipf_theta",
+        "dataset_seed",
+        "workload_seed",
         "checkpoint_dir",
         "num_cpus",
         "output_dir",
@@ -1107,6 +1471,7 @@ def main() -> int:
     ]
     tick_fields = [
         "exp_id",
+        "workload_kind",
         "request_size",
         "response_size",
         "request_min_size",
@@ -1126,6 +1491,19 @@ def main() -> int:
         "response_dma_threshold",
         "prefetch_mode",
         "message_profile",
+        "app_profile",
+        "record_count",
+        "key_size",
+        "value_size",
+        "size_mode",
+        "key_dist",
+        "read_ratio",
+        "update_ratio",
+        "rmw_ratio",
+        "insert_ratio",
+        "zipf_theta",
+        "dataset_seed",
+        "workload_seed",
         "node_id",
         "req_index",
         "start_tick",
@@ -1134,6 +1512,7 @@ def main() -> int:
     ]
     server_tick_fields = [
         "exp_id",
+        "workload_kind",
         "request_size",
         "response_size",
         "request_min_size",
@@ -1153,6 +1532,19 @@ def main() -> int:
         "response_dma_threshold",
         "prefetch_mode",
         "message_profile",
+        "app_profile",
+        "record_count",
+        "key_size",
+        "value_size",
+        "size_mode",
+        "key_dist",
+        "read_ratio",
+        "update_ratio",
+        "rmw_ratio",
+        "insert_ratio",
+        "zipf_theta",
+        "dataset_seed",
+        "workload_seed",
         "server_req_index",
         "poll_tick",
         "execute_tick",
@@ -1443,56 +1835,104 @@ def main() -> int:
 
                     checkpoint_cache[checkpoint_key] = checkpoint_dir
 
-            server_args_parts = [
-                "--silent",
-                f"--request-size {key.request_size}",
-                f"--response-size {key.response_size}",
-                f"--mq-entries {key.mq_entries}",
-                f"--head-sync-threshold {key.head_sync_threshold}",
-                f"--response-dma-threshold {key.response_dma_threshold}",
-                f"--clients-per-dma-lane {key.clients_per_dma_lane}",
-                f"--prefetch-mode {key.prefetch_mode}",
-                f"--message-profile {key.message_profile}",
-            ]
-            if key.request_min_size > 0:
-                server_args_parts.append(f"--req-min-bytes {key.request_min_size}")
-            if key.request_max_size > 0:
-                server_args_parts.append(f"--req-max-bytes {key.request_max_size}")
-            if key.response_min_size > 0:
-                server_args_parts.append(f"--resp-min-bytes {key.response_min_size}")
-            if key.response_max_size > 0:
-                server_args_parts.append(f"--resp-max-bytes {key.response_max_size}")
-            server_args = " ".join(server_args_parts)
-            test_cmd = (
-                f"CXL_RPC_CLIENT_COUNT={key.clients} "
-                f"CXL_RPC_CLIENT_TIMEOUT_SEC=0 "
-                f"CXL_RPC_SERVER_READY_TIMEOUT_SEC=0 "
-                f"CXL_RPC_PIN_CORES=1 "
-                f"CXL_RPC_SERVER_CORE=0 "
-                f"CXL_RPC_CLIENT_CORE_BASE=1 "
-                f"CXL_RPC_SERVER_ARGS={shlex.quote(server_args)} "
-                f"bash /home/test_code/run_rpc_server_clients.sh "
-                f"/home/test_code/rpc_server_example /home/test_code/rpc_client_example "
-                f"--requests {key.requests_per_client} "
-                f"--request-size {key.request_size} "
-                f"--response-size {key.response_size} "
-                f"--message-profile {key.message_profile} "
-                f"--silent"
-            )
-            if key.request_min_size > 0:
-                test_cmd += f" --req-min-bytes {key.request_min_size}"
-            if key.request_max_size > 0:
-                test_cmd += f" --req-max-bytes {key.request_max_size}"
-            if key.response_min_size > 0:
-                test_cmd += f" --resp-min-bytes {key.response_min_size}"
-            if key.response_max_size > 0:
-                test_cmd += f" --resp-max-bytes {key.response_max_size}"
-            if key.slow_client_count > 0:
-                test_cmd += (
-                    f" --slow-client-count {key.slow_client_count} "
-                    f"--slow-count-per-client {key.slow_count_per_client} "
-                    f"--slow-client-send-pause-iters "
-                    f"{key.slow_client_send_pause_iters}"
+            if is_application_experiment(key):
+                server_args_parts = [
+                    "--silent",
+                    *app_profile_arg_list(key),
+                    f"--mq-entries {key.mq_entries}",
+                    f"--head-sync-threshold {key.head_sync_threshold}",
+                    f"--response-dma-threshold {key.response_dma_threshold}",
+                    f"--clients-per-dma-lane {key.clients_per_dma_lane}",
+                    f"--prefetch-mode {key.prefetch_mode}",
+                ]
+                server_args = " ".join(server_args_parts)
+
+                client_args_parts = [
+                    f"--requests {key.requests_per_client}",
+                    "--silent",
+                    *app_profile_arg_list(key),
+                    *app_workload_arg_list(key),
+                ]
+                client_args = " ".join(client_args_parts)
+                test_cmd = (
+                    f"CXL_RPC_CLIENT_COUNT={key.clients} "
+                    f"CXL_RPC_CLIENT_TIMEOUT_SEC=0 "
+                    f"CXL_RPC_SERVER_READY_TIMEOUT_SEC=0 "
+                    f"CXL_RPC_PIN_CORES=1 "
+                    f"CXL_RPC_SERVER_CORE=0 "
+                    f"CXL_RPC_CLIENT_CORE_BASE=1 "
+                    f"CXL_RPC_SERVER_ARGS={shlex.quote(server_args)} "
+                    f"bash /home/test_code/run_rpc_server_clients.sh "
+                    f"/home/test_code/rpc_mica_server /home/test_code/rpc_mica_client "
+                    f"{client_args}"
+                )
+                workload_desc = (
+                    f"kind=application, profile={key.app_profile}, "
+                    f"rec={key.record_count}, key={key.key_size}, "
+                    f"value={key.value_size}, rr={format_float_token(key.read_ratio)}, "
+                    f"ur={format_float_token(key.update_ratio)}, "
+                    f"rmw={format_float_token(key.rmw_ratio)}, "
+                    f"ins={format_float_token(key.insert_ratio)}, "
+                    f"dist={key.key_dist}"
+                )
+            else:
+                server_args_parts = [
+                    "--silent",
+                    f"--request-size {key.request_size}",
+                    f"--response-size {key.response_size}",
+                    f"--mq-entries {key.mq_entries}",
+                    f"--head-sync-threshold {key.head_sync_threshold}",
+                    f"--response-dma-threshold {key.response_dma_threshold}",
+                    f"--clients-per-dma-lane {key.clients_per_dma_lane}",
+                    f"--prefetch-mode {key.prefetch_mode}",
+                    f"--message-profile {key.message_profile}",
+                ]
+                if key.request_min_size > 0:
+                    server_args_parts.append(f"--req-min-bytes {key.request_min_size}")
+                if key.request_max_size > 0:
+                    server_args_parts.append(f"--req-max-bytes {key.request_max_size}")
+                if key.response_min_size > 0:
+                    server_args_parts.append(f"--resp-min-bytes {key.response_min_size}")
+                if key.response_max_size > 0:
+                    server_args_parts.append(f"--resp-max-bytes {key.response_max_size}")
+                server_args = " ".join(server_args_parts)
+                test_cmd = (
+                    f"CXL_RPC_CLIENT_COUNT={key.clients} "
+                    f"CXL_RPC_CLIENT_TIMEOUT_SEC=0 "
+                    f"CXL_RPC_SERVER_READY_TIMEOUT_SEC=0 "
+                    f"CXL_RPC_PIN_CORES=1 "
+                    f"CXL_RPC_SERVER_CORE=0 "
+                    f"CXL_RPC_CLIENT_CORE_BASE=1 "
+                    f"CXL_RPC_SERVER_ARGS={shlex.quote(server_args)} "
+                    f"bash /home/test_code/run_rpc_server_clients.sh "
+                    f"/home/test_code/rpc_server_example /home/test_code/rpc_client_example "
+                    f"--requests {key.requests_per_client} "
+                    f"--request-size {key.request_size} "
+                    f"--response-size {key.response_size} "
+                    f"--message-profile {key.message_profile} "
+                    f"--silent"
+                )
+                if key.request_min_size > 0:
+                    test_cmd += f" --req-min-bytes {key.request_min_size}"
+                if key.request_max_size > 0:
+                    test_cmd += f" --req-max-bytes {key.request_max_size}"
+                if key.response_min_size > 0:
+                    test_cmd += f" --resp-min-bytes {key.response_min_size}"
+                if key.response_max_size > 0:
+                    test_cmd += f" --resp-max-bytes {key.response_max_size}"
+                if key.slow_client_count > 0:
+                    test_cmd += (
+                        f" --slow-client-count {key.slow_client_count} "
+                        f"--slow-count-per-client {key.slow_count_per_client} "
+                        f"--slow-client-send-pause-iters "
+                        f"{key.slow_client_send_pause_iters}"
+                    )
+                workload_desc = (
+                    f"kind=bare_rpc, req={key.request_size}"
+                    f"[{key.request_min_size},{key.request_max_size}], "
+                    f"resp={key.response_size}"
+                    f"[{key.response_min_size},{key.response_max_size}], "
+                    f"profile={key.message_profile}"
                 )
 
             gem5_cmd = kvm_cmd_prefix + [
@@ -1533,8 +1973,7 @@ def main() -> int:
             start_time = time.time()
             print(
                 f"[run {idx}/{len(experiments)}] {exp.exp_id} "
-                f"(req={key.request_size}[{key.request_min_size},{key.request_max_size}], "
-                f"resp={key.response_size}[{key.response_min_size},{key.response_max_size}], "
+                f"({workload_desc}, "
                 f"clients={key.clients}, reqs/client={key.requests_per_client}, "
                 f"mq={key.mq_entries}, hs={key.head_sync_threshold}, "
                 f"slow={key.slow_client_count}, "
@@ -1542,8 +1981,7 @@ def main() -> int:
                 f"slow_pause={key.slow_client_send_pause_iters}, "
                 f"cxl+={key.cxl_extra_latency_ns}ns, lanes={key.response_lane_count}, "
                 f"cpl={key.clients_per_dma_lane}, dmath={key.response_dma_threshold}, "
-                f"pf={key.prefetch_mode}, profile={key.message_profile}, "
-                f"cpus={required_cpus})"
+                f"pf={key.prefetch_mode}, cpus={required_cpus})"
             )
 
             if args.dry_run:

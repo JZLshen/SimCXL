@@ -42,7 +42,16 @@ DEFAULT_PREFETCH_MODE = bare_rpc.DEFAULT_PREFETCH_MODE
 DEFAULT_RECORD_COUNT = 10000
 DEFAULT_DATASET_SEED = 0x9B5D3A4781C26EF1
 DEFAULT_WORKLOAD_SEED = 0xC7D51A32049EF68B
-DEFAULT_PROFILES = ("ycsb_a_1k", "ycsb_b_1k", "ycsb_c_1k", "ycsb_f_1k", "udb_ro")
+DEFAULT_PROFILES = (
+    "ycsb_a_1k",
+    "ycsb_b_1k",
+    "ycsb_c_1k",
+    "ycsb_d_1k",
+    "udb_a",
+    "udb_b",
+    "udb_c",
+    "udb_d",
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +64,7 @@ class ProfileConfig:
     read_ratio: float
     update_ratio: float
     rmw_ratio: float
+    insert_ratio: float
     zipf_theta: float
 
 
@@ -68,17 +78,7 @@ PROFILE_CONFIGS: Dict[str, ProfileConfig] = {
         read_ratio=1.0,
         update_ratio=0.0,
         rmw_ratio=0.0,
-        zipf_theta=0.99,
-    ),
-    "ycsb_1k_ro": ProfileConfig(
-        name="ycsb_c_1k",
-        key_size=16,
-        value_size=1024,
-        size_mode="fixed",
-        key_dist="zipf",
-        read_ratio=1.0,
-        update_ratio=0.0,
-        rmw_ratio=0.0,
+        insert_ratio=0.0,
         zipf_theta=0.99,
     ),
     "ycsb_a_1k": ProfileConfig(
@@ -90,6 +90,7 @@ PROFILE_CONFIGS: Dict[str, ProfileConfig] = {
         read_ratio=0.5,
         update_ratio=0.5,
         rmw_ratio=0.0,
+        insert_ratio=0.0,
         zipf_theta=0.99,
     ),
     "ycsb_b_1k": ProfileConfig(
@@ -101,28 +102,67 @@ PROFILE_CONFIGS: Dict[str, ProfileConfig] = {
         read_ratio=0.95,
         update_ratio=0.05,
         rmw_ratio=0.0,
+        insert_ratio=0.0,
         zipf_theta=0.99,
     ),
-    "ycsb_f_1k": ProfileConfig(
-        name="ycsb_f_1k",
+    "ycsb_d_1k": ProfileConfig(
+        name="ycsb_d_1k",
         key_size=16,
         value_size=1024,
         size_mode="fixed",
-        key_dist="zipf",
-        read_ratio=0.0,
+        key_dist="latest",
+        read_ratio=0.95,
         update_ratio=0.0,
-        rmw_ratio=1.0,
-        zipf_theta=0.99,
+        rmw_ratio=0.0,
+        insert_ratio=0.05,
+        zipf_theta=0.0,
     ),
-    "udb_ro": ProfileConfig(
-        name="udb_ro",
+    "udb_a": ProfileConfig(
+        name="udb_a",
         key_size=27,
         value_size=127,
         size_mode="variable",
-        key_dist="uniform",
+        key_dist="zipf",
+        read_ratio=0.5,
+        update_ratio=0.5,
+        rmw_ratio=0.0,
+        insert_ratio=0.0,
+        zipf_theta=0.99,
+    ),
+    "udb_b": ProfileConfig(
+        name="udb_b",
+        key_size=27,
+        value_size=127,
+        size_mode="variable",
+        key_dist="zipf",
+        read_ratio=0.95,
+        update_ratio=0.05,
+        rmw_ratio=0.0,
+        insert_ratio=0.0,
+        zipf_theta=0.99,
+    ),
+    "udb_c": ProfileConfig(
+        name="udb_c",
+        key_size=27,
+        value_size=127,
+        size_mode="variable",
+        key_dist="zipf",
         read_ratio=1.0,
         update_ratio=0.0,
         rmw_ratio=0.0,
+        insert_ratio=0.0,
+        zipf_theta=0.99,
+    ),
+    "udb_d": ProfileConfig(
+        name="udb_d",
+        key_size=27,
+        value_size=127,
+        size_mode="variable",
+        key_dist="latest",
+        read_ratio=0.95,
+        update_ratio=0.0,
+        rmw_ratio=0.0,
+        insert_ratio=0.05,
         zipf_theta=0.0,
     ),
 }
@@ -141,6 +181,7 @@ class ExperimentKey:
     read_ratio: float
     update_ratio: float
     rmw_ratio: float
+    insert_ratio: float
     zipf_theta: float
     dataset_seed: int = DEFAULT_DATASET_SEED
     workload_seed: int = DEFAULT_WORKLOAD_SEED
@@ -253,6 +294,7 @@ def build_matrix(
             read_ratio=profile.read_ratio,
             update_ratio=profile.update_ratio,
             rmw_ratio=profile.rmw_ratio,
+            insert_ratio=profile.insert_ratio,
             zipf_theta=profile.zipf_theta,
             dataset_seed=dataset_seed,
             workload_seed=workload_seed,
@@ -288,6 +330,7 @@ def experiment_metadata_row(key: ExperimentKey) -> Dict[str, object]:
         "read_ratio": f"{key.read_ratio:.6f}",
         "update_ratio": f"{key.update_ratio:.6f}",
         "rmw_ratio": f"{key.rmw_ratio:.6f}",
+        "insert_ratio": f"{key.insert_ratio:.6f}",
         "zipf_theta": format_zipf_field(key.key_dist, key.zipf_theta),
         "dataset_seed": str(key.dataset_seed),
         "workload_seed": str(key.workload_seed),
@@ -323,6 +366,7 @@ def workload_arg_list(key: ExperimentKey) -> List[str]:
         f"--read-ratio {key.read_ratio:.6f}",
         f"--update-ratio {key.update_ratio:.6f}",
         f"--rmw-ratio {key.rmw_ratio:.6f}",
+        f"--insert-ratio {key.insert_ratio:.6f}",
     ]
     if key.key_dist == "zipf":
         args.append(f"--zipf-theta {key.zipf_theta:.6f}")
@@ -545,6 +589,7 @@ def main() -> int:
                 "read_ratio",
                 "update_ratio",
                 "rmw_ratio",
+                "insert_ratio",
                 "zipf_theta",
                 "dataset_seed",
                 "workload_seed",
@@ -593,6 +638,7 @@ def main() -> int:
         "read_ratio",
         "update_ratio",
         "rmw_ratio",
+        "insert_ratio",
         "zipf_theta",
         "dataset_seed",
         "workload_seed",
@@ -630,6 +676,7 @@ def main() -> int:
         "read_ratio",
         "update_ratio",
         "rmw_ratio",
+        "insert_ratio",
         "zipf_theta",
         "dataset_seed",
         "workload_seed",
@@ -659,6 +706,7 @@ def main() -> int:
         "read_ratio",
         "update_ratio",
         "rmw_ratio",
+        "insert_ratio",
         "zipf_theta",
         "dataset_seed",
         "workload_seed",
@@ -1039,6 +1087,7 @@ def main() -> int:
                 f"kv={key.key_size}/{key.value_size}, rr={format_float_token(key.read_ratio)}, "
                 f"ur={format_float_token(key.update_ratio)}, "
                 f"rmw={format_float_token(key.rmw_ratio)}, "
+                f"ins={format_float_token(key.insert_ratio)}, "
                 f"dist={key.key_dist}, "
                 f"{f'zipf={format_float_token(key.zipf_theta)}, ' if key.key_dist == 'zipf' else ''}"
                 f"mq={key.mq_entries}, "

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import fcntl
+import importlib.util
 import json
 import os
 import subprocess
@@ -29,6 +30,7 @@ APP_RUNNER = (
     DEFAULT_REPO_ROOT
     / "tests/test-progs/cxl-rpc/scripts/run_rpc_app_matrix_kvm_timing_ckpt.py"
 )
+LEGACY_PLAN = Path("plans/plan_matrix/plan.csv")
 
 QUEUE_FIELDS = ["kind", "exp_id", "dir_name", "checkpoint_dir"]
 RESULT_FIELDS = [
@@ -132,6 +134,132 @@ def running_dirs(batch_root: Path, repo_root: Path) -> set[str]:
     return active
 
 
+def normalize_exp_dir_name(dir_name: str) -> str:
+    if dir_name.startswith("bare_"):
+        return dir_name[5:]
+    if dir_name.startswith("app_"):
+        return dir_name[4:]
+    return dir_name
+
+
+def load_python_module(module_name: str, module_path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load module spec: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def build_checkpoint_index(repo_root: Path) -> Dict[str, List[Path]]:
+    output_root = repo_root / "output"
+    index: Dict[str, List[Path]] = {}
+    if not output_root.exists():
+        return index
+
+    for checkpoints_dir in output_root.glob("*/checkpoints"):
+        if not checkpoints_dir.is_dir():
+            continue
+        for ckpt_dir in checkpoints_dir.iterdir():
+            if not ckpt_dir.is_dir():
+                continue
+            if not (ckpt_dir / "m5.cpt").exists():
+                continue
+            index.setdefault(ckpt_dir.name, []).append(ckpt_dir.resolve())
+
+    for candidates in index.values():
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return index
+
+
+def resolve_checkpoint_dir(
+    repo_root: Path,
+    batch_root: Path,
+    ckpt_dir_name: str,
+    checkpoint_index: Dict[str, List[Path]],
+) -> Path:
+    batch_candidate = (batch_root / "checkpoints" / ckpt_dir_name).resolve()
+    if (batch_candidate / "m5.cpt").exists():
+        return batch_candidate
+
+    candidates = checkpoint_index.get(ckpt_dir_name, [])
+    if candidates:
+        return candidates[0]
+
+    raise RuntimeError(
+        f"missing checkpoint for topology {ckpt_dir_name}; "
+        f"searched batch_root={batch_root} and repo_root/output"
+    )
+
+
+def prepare_legacy_matrix_tasks(
+    batch_root: Path,
+    repo_root: Path,
+    active: set[str],
+) -> List[Task]:
+    matrix_mod = load_python_module(
+        "simcxl_legacy_matrix_queue",
+        BARE_RUNNER,
+    )
+    experiments = matrix_mod.build_matrix(
+        requests_per_client=30,
+        response_dma_threshold=matrix_mod.DEFAULT_RESPONSE_DMA_THRESHOLD,
+        prefetch_mode=matrix_mod.DEFAULT_PREFETCH_MODE,
+        request_sparsity_slow_client_send_pause_iters=(
+            matrix_mod.DEFAULT_REQUEST_SPARSITY_SLOW_CLIENT_SEND_PAUSE_ITERS
+        ),
+    )
+
+    checkpoint_index = build_checkpoint_index(repo_root)
+    active_ids = {normalize_exp_dir_name(name) for name in active}
+
+    existing_dirs: Dict[str, str] = {}
+    for exp_dir in batch_root.iterdir():
+        if not exp_dir.is_dir() or exp_dir.name == "plans":
+            continue
+        existing_dirs[normalize_exp_dir_name(exp_dir.name)] = exp_dir.name
+
+    tasks: List[Task] = []
+    for exp in experiments:
+        kind = (
+            "app"
+            if exp.key.workload_kind == matrix_mod.WORKLOAD_KIND_APPLICATION
+            else "bare"
+        )
+        dir_name = existing_dirs.get(exp.exp_id)
+        if dir_name is None:
+            prefix = "app_" if kind == "app" else "bare_"
+            dir_name = f"{prefix}{exp.exp_id}"
+
+        exp_dir = batch_root / dir_name
+        if experiment_completed(exp_dir) or exp.exp_id in active_ids:
+            continue
+
+        ckpt_dir_name = (
+            f"clients_{exp.key.clients}"
+            f"_lanes_{exp.key.response_lane_count}"
+            f"_mq_{exp.key.mq_entries}"
+            f"_cxlp_{exp.key.cxl_extra_latency_ns}ns"
+        )
+        checkpoint_dir = resolve_checkpoint_dir(
+            repo_root=repo_root,
+            batch_root=batch_root,
+            ckpt_dir_name=ckpt_dir_name,
+            checkpoint_index=checkpoint_index,
+        )
+        tasks.append(
+            Task(
+                kind=kind,
+                exp_id=exp.exp_id,
+                dir_name=dir_name,
+                checkpoint_dir=str(checkpoint_dir),
+            )
+        )
+
+    return tasks
+
+
 def bare_checkpoint_dir(batch_root: Path, row: Dict[str, str]) -> Path:
     return batch_root / "checkpoints" / (
         f"clients_{row['clients']}"
@@ -147,13 +275,18 @@ def app_checkpoint_dir(batch_root: Path) -> Path:
 
 def prepare_tasks(batch_root: Path, repo_root: Path) -> List[Task]:
     active = running_dirs(batch_root, repo_root)
+    app_plan = batch_root / "plans" / "plan_app" / "plan.csv"
+    bare_plan = batch_root / "plans" / "plan_bare" / "plan.csv"
+    legacy_plan = batch_root / LEGACY_PLAN
+    if legacy_plan.exists():
+        return prepare_legacy_matrix_tasks(batch_root, repo_root, active)
+
     tasks: List[Task] = []
 
     app_ckpt = app_checkpoint_dir(batch_root)
     if not (app_ckpt / "m5.cpt").exists():
         raise RuntimeError(f"missing app checkpoint: {app_ckpt}")
 
-    app_plan = batch_root / "plans" / "plan_app" / "plan.csv"
     with app_plan.open("r", encoding="utf-8", newline="") as fp:
         for row in csv.DictReader(fp):
             dir_name = f"app_{row['exp_id']}"
@@ -169,7 +302,6 @@ def prepare_tasks(batch_root: Path, repo_root: Path) -> List[Task]:
                 )
             )
 
-    bare_plan = batch_root / "plans" / "plan_bare" / "plan.csv"
     with bare_plan.open("r", encoding="utf-8", newline="") as fp:
         for row in csv.DictReader(fp):
             dir_name = f"bare_{row['exp_id']}"

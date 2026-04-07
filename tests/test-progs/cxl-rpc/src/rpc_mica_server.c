@@ -14,6 +14,7 @@
 
 #define _GNU_SOURCE
 #include <ctype.h>
+#include <math.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -71,6 +72,7 @@ typedef struct {
     uint32_t *versions;
     mica_bucket_t *buckets;
     size_t record_count;
+    size_t preload_count;
     size_t key_size;
     size_t value_size;
     size_t max_key_size;
@@ -101,6 +103,22 @@ static inline uint64_t
 current_tick(void)
 {
     return m5_rpns();
+}
+
+static uint64_t
+total_insert_count(uint64_t total_request_count, double insert_ratio)
+{
+    long long rounded;
+
+    if (total_request_count == 0 || insert_ratio <= 0.0)
+        return 0;
+
+    rounded = llround(insert_ratio * (double)total_request_count);
+    if (rounded < 0)
+        rounded = 0;
+    if ((uint64_t)rounded > total_request_count)
+        rounded = (long long)total_request_count;
+    return (uint64_t)rounded;
 }
 
 static int
@@ -189,6 +207,28 @@ parse_u64_arg(int argc, char **argv, const char *flag, uint64_t default_val,
             unsigned long long v = strtoull(argv[i + 1], &end, 0);
             if (end && *end == '\0' && v >= min_val && v <= max_val) {
                 *out = (uint64_t)v;
+                return 0;
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int
+parse_double_arg(int argc, char **argv, const char *flag, double default_val,
+                 double min_val, double max_val, double *out)
+{
+    if (!out)
+        return -1;
+    *out = default_val;
+
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], flag) == 0) {
+            char *end = NULL;
+            double v = strtod(argv[i + 1], &end);
+            if (end && *end == '\0' && v >= min_val && v <= max_val) {
+                *out = v;
                 return 0;
             }
             return -1;
@@ -340,14 +380,15 @@ mica_tag_from_hash(uint64_t hash)
 
 static int
 mica_store_init(mica_store_t *store, const char *profile_name,
-                size_t record_count, size_t key_size,
+                size_t record_count, size_t preload_count, size_t key_size,
                 size_t value_size, size_t max_key_size,
                 size_t max_value_size, uint64_t dataset_seed)
 {
     size_t bucket_count;
 
-    if (!store || !profile_name || record_count == 0 || key_size == 0 ||
-        value_size == 0 || max_key_size < key_size ||
+    if (!store || !profile_name || record_count == 0 || preload_count == 0 ||
+        preload_count > record_count || key_size == 0 || value_size == 0 ||
+        max_key_size < key_size ||
         max_value_size < value_size) {
         return -1;
     }
@@ -355,6 +396,7 @@ mica_store_init(mica_store_t *store, const char *profile_name,
     memset(store, 0, sizeof(*store));
     store->profile_name = profile_name;
     store->record_count = record_count;
+    store->preload_count = preload_count;
     store->key_size = key_size;
     store->value_size = value_size;
     store->max_key_size = max_key_size;
@@ -406,7 +448,7 @@ mica_store_destroy(mica_store_t *store)
 }
 
 static int
-mica_store_insert_preloaded(mica_store_t *store, size_t record_index)
+mica_store_insert_index(mica_store_t *store, size_t record_index)
 {
     uint64_t hash;
     uint16_t tag;
@@ -414,8 +456,11 @@ mica_store_insert_preloaded(mica_store_t *store, size_t record_index)
     size_t probe;
     const uint8_t *key;
 
-    if (!store || record_index >= store->record_count)
+    if (!store || record_index >= store->record_count ||
+        store->key_lengths[record_index] == 0 ||
+        store->value_lengths[record_index] == 0) {
         return -1;
+    }
 
     key = store->keys + (record_index * store->max_key_size);
     hash = store->hashes[record_index];
@@ -458,7 +503,7 @@ mica_store_preload(mica_store_t *store)
     if (!store)
         return -1;
 
-    for (record_index = 0; record_index < store->record_count; record_index++) {
+    for (record_index = 0; record_index < store->preload_count; record_index++) {
         uint8_t *key = store->keys + (record_index * store->max_key_size);
         uint8_t *value = store->values + (record_index * store->max_value_size);
         size_t key_len = 0;
@@ -485,10 +530,47 @@ mica_store_preload(mica_store_t *store)
         store->checksums[record_index] =
             rpc_app_checksum_bytes(value, value_len);
 
-        if (mica_store_insert_preloaded(store, record_index) != 0)
+        if (mica_store_insert_index(store, record_index) != 0)
             return -1;
     }
 
+    return 0;
+}
+
+static int
+mica_store_insert_value(mica_store_t *store, uint32_t record_index,
+                        const uint8_t *key, size_t key_len, uint64_t key_hash,
+                        const uint8_t *value, size_t value_len)
+{
+    uint8_t *dst_key;
+    uint8_t *dst_value;
+
+    if (!store || !key || !value || record_index >= store->record_count ||
+        key_len == 0 || key_len > store->max_key_size ||
+        value_len == 0 || value_len > store->max_value_size ||
+        store->key_lengths[record_index] != 0 ||
+        store->value_lengths[record_index] != 0) {
+        return -1;
+    }
+
+    dst_key = store->keys + ((size_t)record_index * store->max_key_size);
+    dst_value = store->values + ((size_t)record_index * store->max_value_size);
+    memcpy(dst_key, key, key_len);
+    memcpy(dst_value, value, value_len);
+    store->key_lengths[record_index] = (uint16_t)key_len;
+    store->value_lengths[record_index] = (uint32_t)value_len;
+    store->hashes[record_index] = key_hash;
+    store->checksums[record_index] =
+        rpc_app_checksum_bytes(dst_value, value_len);
+    store->versions[record_index] = 0;
+    if (mica_store_insert_index(store, record_index) != 0) {
+        store->key_lengths[record_index] = 0;
+        store->value_lengths[record_index] = 0;
+        store->hashes[record_index] = 0;
+        store->checksums[record_index] = 0;
+        store->versions[record_index] = 0;
+        return -1;
+    }
     return 0;
 }
 
@@ -607,6 +689,7 @@ main(int argc, char **argv)
         (size_t)CXL_RESPONSE_DMA_PAYLOAD_THRESHOLD_DEFAULT;
     uint64_t record_count = RPC_APP_DEFAULT_RECORD_COUNT;
     uint64_t dataset_seed = RPC_APP_DEFAULT_DATASET_SEED;
+    double insert_ratio = 0.0;
     int key_size_overridden = has_flag(argc, argv, "--key-size");
     int value_size_overridden = has_flag(argc, argv, "--value-size");
     int variable_layout = 0;
@@ -617,18 +700,22 @@ main(int argc, char **argv)
                           &profile) != 0) {
         fprintf(stderr,
                 "server: invalid --profile "
-                "(use %s|%s|%s|%s|%s; alias %s also accepted)\n",
+                "(use %s|%s|%s|%s|%s|%s|%s|%s; alias %s also accepted)\n",
                 RPC_APP_PROFILE_YCSB_C_1K,
                 RPC_APP_PROFILE_YCSB_A_1K,
                 RPC_APP_PROFILE_YCSB_B_1K,
-                RPC_APP_PROFILE_YCSB_F_1K,
-                RPC_APP_PROFILE_UDB_RO,
+                RPC_APP_PROFILE_YCSB_D_1K,
+                RPC_APP_PROFILE_UDB_A,
+                RPC_APP_PROFILE_UDB_B,
+                RPC_APP_PROFILE_UDB_C,
+                RPC_APP_PROFILE_UDB_D,
                 RPC_APP_PROFILE_YCSB_1K_RO);
         return 1;
     }
 
     key_size = profile.key_size;
     value_size = profile.value_size;
+    insert_ratio = profile.insert_ratio;
     if (parse_size_arg(argc, argv, "--key-size", key_size,
                        1u, RPC_APP_MAX_KEY_SIZE, &key_size) != 0) {
         fprintf(stderr,
@@ -675,6 +762,11 @@ main(int argc, char **argv)
         fprintf(stderr, "server: invalid --dataset-seed\n");
         return 1;
     }
+    if (parse_double_arg(argc, argv, "--insert-ratio",
+                         insert_ratio, 0.0, 1.0, &insert_ratio) != 0) {
+        fprintf(stderr, "server: invalid --insert-ratio\n");
+        return 1;
+    }
     variable_layout = rpc_app_profile_has_variable_layout(profile.name) &&
                       !key_size_overridden && !value_size_overridden;
     max_key_size = variable_layout ?
@@ -698,10 +790,10 @@ main(int argc, char **argv)
     setlinebuf(stdout);
     setvbuf(stderr, NULL, _IONBF, 0);
     rpc_markerf("init_begin",
-                "profile=%s,num_clients=%d,max_requests=%d,key_size=%zu,value_size=%zu,max_key_size=%zu,max_value_size=%zu,record_count=%llu,mq_entries=%d,head_sync_threshold=%d,response_dma_threshold=%zu,clients_per_dma_lane=%d,prefetch_mode=%s,variable_layout=%d",
+                "profile=%s,num_clients=%d,max_requests=%d,key_size=%zu,value_size=%zu,max_key_size=%zu,max_value_size=%zu,record_count=%llu,insert_ratio=%.3f,mq_entries=%d,head_sync_threshold=%d,response_dma_threshold=%zu,clients_per_dma_lane=%d,prefetch_mode=%s,variable_layout=%d",
                 profile.name, num_clients, max_requests, key_size, value_size,
                 max_key_size, max_value_size,
-                (unsigned long long)record_count, mq_entries,
+                (unsigned long long)record_count, insert_ratio, mq_entries,
                 head_sync_threshold, response_dma_threshold,
                 clients_per_dma_lane,
                 request_rx_prefetch_mode_name(prefetch_mode),
@@ -709,13 +801,30 @@ main(int argc, char **argv)
 
     rpc_markerf("preload_begin", "profile=%s,record_count=%llu",
                 profile.name, (unsigned long long)record_count);
-    if (mica_store_init(&store, profile.name, (size_t)record_count,
-                        key_size, value_size, max_key_size, max_value_size,
-                        dataset_seed) != 0 ||
-        mica_store_preload(&store) != 0) {
-        fprintf(stderr, "server: preload KV initialization failed\n");
-        rc = 1;
-        goto cleanup;
+    {
+        uint64_t insert_count = total_insert_count(
+            (uint64_t)num_clients * (uint64_t)max_requests,
+            insert_ratio);
+        size_t preload_count = (size_t)record_count;
+
+        if (profile.key_dist == RPC_APP_KEY_DIST_LATEST) {
+            if (insert_count == 0 || insert_count >= record_count) {
+                fprintf(stderr, "server: invalid latest workload preload sizing\n");
+                rc = 1;
+                goto cleanup;
+            }
+            preload_count = (size_t)(record_count - insert_count);
+        }
+
+        if (mica_store_init(&store, profile.name, (size_t)record_count,
+                            preload_count,
+                            key_size, value_size, max_key_size, max_value_size,
+                            dataset_seed) != 0 ||
+            mica_store_preload(&store) != 0) {
+            fprintf(stderr, "server: preload KV initialization failed\n");
+            rc = 1;
+            goto cleanup;
+        }
     }
     rpc_markerf("preload_done", "profile=%s,record_count=%llu,buckets=%zu",
                 profile.name, (unsigned long long)record_count,
@@ -881,7 +990,8 @@ main(int argc, char **argv)
             if (req_hdr->key_len == 0 || req_hdr->key_len > max_key_size ||
                 (req_hdr->op != RPC_APP_OP_GET &&
                  req_hdr->op != RPC_APP_OP_PUT &&
-                 req_hdr->op != RPC_APP_OP_RMW) ||
+                 req_hdr->op != RPC_APP_OP_RMW &&
+                 req_hdr->op != RPC_APP_OP_INSERT) ||
                 rpc_app_request_wire_size(req_hdr->op, req_hdr->key_len,
                                           req_hdr->value_len) != req_len) {
                 fprintf(stderr, "server: malformed application request\n");
@@ -889,10 +999,11 @@ main(int argc, char **argv)
                 break;
             }
             if ((req_hdr->op == RPC_APP_OP_PUT ||
-                 req_hdr->op == RPC_APP_OP_RMW) &&
+                 req_hdr->op == RPC_APP_OP_RMW ||
+                 req_hdr->op == RPC_APP_OP_INSERT) &&
                 (req_hdr->value_len == 0 ||
                  req_hdr->value_len > max_value_size)) {
-                fprintf(stderr, "server: PUT/RMW value size out of range\n");
+                fprintf(stderr, "server: PUT/RMW/INSERT value size out of range\n");
                 rc = 1;
                 break;
             }
@@ -947,6 +1058,32 @@ main(int argc, char **argv)
                     rc = 1;
                     break;
                 }
+            } else if (!found && req_hdr->op == RPC_APP_OP_INSERT) {
+                uint64_t key_id = 0;
+
+                if (req_hdr->key_len < sizeof(uint64_t)) {
+                    fprintf(stderr, "server: INSERT key too short\n");
+                    rc = 1;
+                    break;
+                }
+                memcpy(&key_id, key_ptr, sizeof(key_id));
+                if (key_id >= store.record_count) {
+                    fprintf(stderr, "server: INSERT key id out of range\n");
+                    rc = 1;
+                    break;
+                }
+                if (mica_store_insert_value(&store,
+                                            (uint32_t)key_id,
+                                            key_ptr,
+                                            req_hdr->key_len,
+                                            req_hdr->key_hash,
+                                            value_ptr,
+                                            req_hdr->value_len) != 0) {
+                    fprintf(stderr, "server: INSERT failed\n");
+                    rc = 1;
+                    break;
+                }
+                resp_hdr->status = RPC_APP_STATUS_OK;
             }
             exec_end_tick = current_tick();
 

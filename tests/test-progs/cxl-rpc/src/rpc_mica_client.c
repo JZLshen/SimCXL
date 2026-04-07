@@ -289,6 +289,29 @@ first_round_barrier_participants(int num_clients,
 }
 
 static int
+client_is_selected_evenly(int client_id,
+                          int client_count,
+                          int selected_client_count)
+{
+    int selected_index;
+
+    if (selected_client_count <= 0)
+        return 0;
+
+    if (selected_client_count >= client_count)
+        return 1;
+
+    for (selected_index = 0;
+         selected_index < selected_client_count;
+         selected_index++) {
+        if ((selected_index * client_count) / selected_client_count == client_id)
+            return 1;
+    }
+
+    return 0;
+}
+
+static int
 parse_size_arg(int argc, char **argv, const char *flag, size_t default_val,
                size_t min_val, size_t max_val, size_t *out)
 {
@@ -464,6 +487,80 @@ uses_fixed_uniform_plan(const char *profile_name, rpc_app_key_dist_t key_dist)
            rpc_app_profile_has_variable_layout(profile_name);
 }
 
+static int
+uses_latest_plan(rpc_app_key_dist_t key_dist)
+{
+    return key_dist == RPC_APP_KEY_DIST_LATEST;
+}
+
+static uint64_t
+total_insert_count(uint64_t total_request_count, double insert_ratio)
+{
+    long long rounded;
+
+    if (total_request_count == 0 || insert_ratio <= 0.0)
+        return 0;
+
+    rounded = llround(insert_ratio * (double)total_request_count);
+    if (rounded < 0)
+        rounded = 0;
+    if ((uint64_t)rounded > total_request_count)
+        rounded = (long long)total_request_count;
+    return (uint64_t)rounded;
+}
+
+static uint64_t
+insert_count_before(uint64_t slot_index,
+                    uint64_t total_request_count,
+                    uint64_t insert_count)
+{
+    if (total_request_count == 0 || insert_count == 0)
+        return 0;
+
+    return ((slot_index + 1u) * insert_count) / total_request_count;
+}
+
+static int
+is_insert_slot(uint64_t slot_index,
+               uint64_t total_request_count,
+               uint64_t insert_count)
+{
+    if (total_request_count == 0 || insert_count == 0)
+        return 0;
+
+    return insert_count_before(slot_index + 1u,
+                               total_request_count,
+                               insert_count) >
+           insert_count_before(slot_index,
+                               total_request_count,
+                               insert_count);
+}
+
+static int
+sample_latest_key_id(uint64_t preload_count,
+                     uint64_t inserted_count,
+                     uint64_t *rng_state,
+                     uint64_t *out_key_id)
+{
+    uint64_t available_count;
+    uint64_t latest_window;
+    uint64_t latest_start;
+
+    if (!out_key_id)
+        return -1;
+
+    available_count = preload_count + inserted_count;
+    if (available_count == 0)
+        return -1;
+
+    latest_window = available_count;
+    if (latest_window > 128u)
+        latest_window = 128u;
+    latest_start = available_count - latest_window;
+    *out_key_id = latest_start + (next_random_u64(rng_state) % latest_window);
+    return 0;
+}
+
 static uint64_t
 fixed_uniform_plan_slot(uint64_t client_id, uint64_t req_index)
 {
@@ -549,10 +646,14 @@ find_fixed_uniform_key_id(const app_operation_t *ops,
 static int
 build_operations(app_operation_t *ops, uint64_t num_requests,
                  const char *profile_name,
-                 uint64_t record_count, size_t key_size, size_t value_size,
+                 uint64_t record_count,
+                 uint64_t client_count,
+                 uint64_t request_count_per_client,
+                 size_t key_size, size_t value_size,
                  uint64_t client_id,
                  size_t max_key_size,
                  double read_ratio, double update_ratio, double rmw_ratio,
+                 double insert_ratio,
                  rpc_app_key_dist_t key_dist,
                  double zipf_theta,
                  uint64_t dataset_seed, uint64_t workload_seed)
@@ -560,6 +661,10 @@ build_operations(app_operation_t *ops, uint64_t num_requests,
     double *cdf = NULL;
     uint8_t *key_buf = NULL;
     uint64_t rng_state = workload_seed;
+    uint64_t total_request_count = client_count * request_count_per_client;
+    uint64_t insert_count = total_insert_count(total_request_count,
+                                               insert_ratio);
+    uint64_t preload_count = record_count;
     uint64_t req_index;
 
     if (!ops || !profile_name || num_requests == 0 || record_count == 0 ||
@@ -567,8 +672,17 @@ build_operations(app_operation_t *ops, uint64_t num_requests,
         return -1;
     }
     if (read_ratio < 0.0 || update_ratio < 0.0 || rmw_ratio < 0.0 ||
-        fabs((read_ratio + update_ratio + rmw_ratio) - 1.0) > 1e-6) {
+        insert_ratio < 0.0 ||
+        fabs((read_ratio + update_ratio + rmw_ratio + insert_ratio) - 1.0) >
+            1e-6) {
         return -1;
+    }
+    if (uses_latest_plan(key_dist)) {
+        if (total_request_count == 0 || insert_count == 0 ||
+            insert_count >= record_count) {
+            return -1;
+        }
+        preload_count = record_count - insert_count;
     }
 
     key_buf = (uint8_t *)malloc(max_key_size);
@@ -588,7 +702,25 @@ build_operations(app_operation_t *ops, uint64_t num_requests,
         uint64_t key_hash;
         double selector;
 
-        if (uses_fixed_uniform_plan(profile_name, key_dist)) {
+        if (uses_latest_plan(key_dist)) {
+            uint64_t global_slot = req_index * client_count + client_id;
+            uint64_t inserts_before = insert_count_before(global_slot,
+                                                          total_request_count,
+                                                          insert_count);
+
+            if (is_insert_slot(global_slot,
+                               total_request_count,
+                               insert_count)) {
+                key_id = preload_count + inserts_before;
+            } else if (sample_latest_key_id(preload_count,
+                                            inserts_before,
+                                            &rng_state,
+                                            &key_id) != 0) {
+                free(key_buf);
+                free(cdf);
+                return -1;
+            }
+        } else if (uses_fixed_uniform_plan(profile_name, key_dist)) {
             uint64_t plan_slot = fixed_uniform_plan_slot(client_id, req_index);
 
             if (find_fixed_uniform_key_id(ops,
@@ -624,7 +756,17 @@ build_operations(app_operation_t *ops, uint64_t num_requests,
         key_hash = rpc_app_hash_bytes(key_buf, record_key_len);
         selector = next_random_double(&rng_state);
 
-        if (selector < read_ratio) {
+        if (uses_latest_plan(key_dist)) {
+            uint64_t global_slot = req_index * client_count + client_id;
+
+            if (is_insert_slot(global_slot,
+                               total_request_count,
+                               insert_count)) {
+                ops[req_index].op = RPC_APP_OP_INSERT;
+            } else {
+                ops[req_index].op = RPC_APP_OP_GET;
+            }
+        } else if (selector < read_ratio) {
             ops[req_index].op = RPC_APP_OP_GET;
         } else if (selector < (read_ratio + update_ratio)) {
             ops[req_index].op = RPC_APP_OP_PUT;
@@ -667,7 +809,8 @@ send_one_request(cxl_connection_t *conn,
     req_len = rpc_app_request_wire_size(
         op->op,
         op->key_len,
-        (op->op == RPC_APP_OP_PUT || op->op == RPC_APP_OP_RMW) ?
+        (op->op == RPC_APP_OP_PUT || op->op == RPC_APP_OP_RMW ||
+         op->op == RPC_APP_OP_INSERT) ?
             op->value_len :
             0u);
     if (req_len > req_buf_size)
@@ -679,7 +822,8 @@ send_one_request(cxl_connection_t *conn,
     hdr->key_len = (uint8_t)op->key_len;
     hdr->reserved0 = 0;
     hdr->value_len = (uint32_t)(
-        (op->op == RPC_APP_OP_PUT || op->op == RPC_APP_OP_RMW) ?
+        (op->op == RPC_APP_OP_PUT || op->op == RPC_APP_OP_RMW ||
+         op->op == RPC_APP_OP_INSERT) ?
             op->value_len :
             0u
     );
@@ -687,7 +831,8 @@ send_one_request(cxl_connection_t *conn,
 
     key_ptr = (uint8_t *)(hdr + 1);
     rpc_app_fill_key(key_ptr, op->key_len, dataset_seed, op->key_id);
-    if (op->op == RPC_APP_OP_PUT || op->op == RPC_APP_OP_RMW) {
+    if (op->op == RPC_APP_OP_PUT || op->op == RPC_APP_OP_RMW ||
+        op->op == RPC_APP_OP_INSERT) {
         rpc_app_fill_value(key_ptr + op->key_len,
                            op->value_len, op->value_seed);
     }
@@ -855,6 +1000,7 @@ main(int argc, char **argv)
     double read_ratio = 0.0;
     double update_ratio = 0.0;
     double rmw_ratio = 0.0;
+    double insert_ratio = 0.0;
     rpc_app_key_dist_t key_dist = RPC_APP_KEY_DIST_ZIPF;
     double zipf_theta = 0.0;
     size_t reserve_n;
@@ -883,12 +1029,15 @@ main(int argc, char **argv)
                           &profile) != 0) {
         fprintf(stderr,
                 "client: invalid --profile "
-                "(use %s|%s|%s|%s|%s; alias %s also accepted)\n",
+                "(use %s|%s|%s|%s|%s|%s|%s|%s; alias %s also accepted)\n",
                 RPC_APP_PROFILE_YCSB_C_1K,
                 RPC_APP_PROFILE_YCSB_A_1K,
                 RPC_APP_PROFILE_YCSB_B_1K,
-                RPC_APP_PROFILE_YCSB_F_1K,
-                RPC_APP_PROFILE_UDB_RO,
+                RPC_APP_PROFILE_YCSB_D_1K,
+                RPC_APP_PROFILE_UDB_A,
+                RPC_APP_PROFILE_UDB_B,
+                RPC_APP_PROFILE_UDB_C,
+                RPC_APP_PROFILE_UDB_D,
                 RPC_APP_PROFILE_YCSB_1K_RO);
         return 1;
     }
@@ -897,6 +1046,7 @@ main(int argc, char **argv)
     read_ratio = profile.read_ratio;
     update_ratio = profile.update_ratio;
     rmw_ratio = profile.rmw_ratio;
+    insert_ratio = profile.insert_ratio;
     key_dist = profile.key_dist;
     zipf_theta = profile.zipf_theta;
 
@@ -990,15 +1140,17 @@ main(int argc, char **argv)
                          update_ratio, 0.0, 1.0, &update_ratio) != 0 ||
         parse_double_arg(argc, argv, "--rmw-ratio",
                          rmw_ratio, 0.0, 1.0, &rmw_ratio) != 0 ||
+        parse_double_arg(argc, argv, "--insert-ratio",
+                         insert_ratio, 0.0, 1.0, &insert_ratio) != 0 ||
         (key_dist == RPC_APP_KEY_DIST_ZIPF &&
          parse_double_arg(argc, argv, "--zipf-theta",
                           zipf_theta, 0.01, 1.50, &zipf_theta) != 0)) {
         fprintf(stderr, "client: invalid workload ratio/theta argument\n");
         return 1;
     }
-    if (fabs((read_ratio + update_ratio + rmw_ratio) - 1.0) > 1e-6) {
+    if (fabs((read_ratio + update_ratio + rmw_ratio + insert_ratio) - 1.0) > 1e-6) {
         fprintf(stderr,
-                "client: read-ratio + update-ratio + rmw-ratio must equal 1.0\n");
+                "client: read-ratio + update-ratio + rmw-ratio + insert-ratio must equal 1.0\n");
         return 1;
     }
     variable_layout = rpc_app_profile_has_variable_layout(profile.name) &&
@@ -1020,7 +1172,8 @@ main(int argc, char **argv)
     signal(SIGTERM, signal_handler);
     setlinebuf(stdout);
     setvbuf(stderr, NULL, _IONBF, 0);
-    is_slow_client = (slow_client_count > 0 && node_id < slow_client_count);
+    is_slow_client =
+        client_is_selected_evenly(node_id, num_clients, slow_client_count);
     client_request_count = is_slow_client ? slow_count_per_client : num_requests;
     barrier_participant_count =
         first_round_barrier_participants(num_clients,
@@ -1033,12 +1186,13 @@ main(int argc, char **argv)
                                         client_request_count)
         : 0;
     rpc_markerf("init_begin",
-                "profile=%s,node=%d,num_clients=%d,requests=%d,base_requests=%d,key_size=%zu,value_size=%zu,max_key_size=%zu,max_value_size=%zu,record_count=%llu,read_ratio=%.3f,update_ratio=%.3f,rmw_ratio=%.3f,window=%d,slow_client_count=%d,slow_count_per_client=%d,is_slow_client=%d,slow_client_send_pause_iters=%d,allow_miss=%d,variable_layout=%d",
+                "profile=%s,node=%d,num_clients=%d,requests=%d,base_requests=%d,key_size=%zu,value_size=%zu,max_key_size=%zu,max_value_size=%zu,record_count=%llu,read_ratio=%.3f,update_ratio=%.3f,rmw_ratio=%.3f,insert_ratio=%.3f,window=%d,slow_client_count=%d,slow_count_per_client=%d,is_slow_client=%d,slow_client_send_pause_iters=%d,allow_miss=%d,variable_layout=%d",
                 profile.name, node_id, num_clients, client_request_count,
                 num_requests, key_size,
                 value_size, max_key_size, max_value_size,
                 (unsigned long long)record_count, read_ratio,
-                update_ratio, rmw_ratio, sliding_window, slow_client_count,
+                update_ratio, rmw_ratio, insert_ratio,
+                sliding_window, slow_client_count,
                 slow_count_per_client, is_slow_client, send_pause_iters,
                 allow_miss, variable_layout);
 
@@ -1065,9 +1219,13 @@ main(int argc, char **argv)
 
     if (client_request_count > 0 &&
         build_operations(ops, (uint64_t)client_request_count, profile.name,
-                         record_count, key_size, value_size, (uint64_t)node_id,
+                         record_count,
+                         (uint64_t)num_clients,
+                         (uint64_t)num_requests,
+                         key_size, value_size, (uint64_t)node_id,
                          max_key_size,
-                         read_ratio, update_ratio, rmw_ratio, key_dist,
+                         read_ratio, update_ratio, rmw_ratio, insert_ratio,
+                         key_dist,
                          zipf_theta,
                          dataset_seed,
                          workload_seed ^ (uint64_t)(node_id + 1)) != 0) {

@@ -257,6 +257,29 @@ first_round_barrier_participants(int num_clients,
 }
 
 static int
+client_is_selected_evenly(int client_id,
+                          int client_count,
+                          int selected_client_count)
+{
+    int selected_index;
+
+    if (selected_client_count <= 0)
+        return 0;
+
+    if (selected_client_count >= client_count)
+        return 1;
+
+    for (selected_index = 0;
+         selected_index < selected_client_count;
+         selected_index++) {
+        if ((selected_index * client_count) / selected_client_count == client_id)
+            return 1;
+    }
+
+    return 0;
+}
+
+static int
 parse_message_profile_arg(int argc, char **argv,
                           rpc_message_profile_t *out_profile)
 {
@@ -654,7 +677,7 @@ main(int argc, char **argv)
     setlinebuf(stdout);
     setvbuf(stderr, NULL, _IONBF, 0);
     const int is_slow_client =
-        (slow_client_count > 0 && node_id < slow_client_count);
+        client_is_selected_evenly(node_id, num_clients, slow_client_count);
     const int client_request_count =
         is_slow_client ? slow_count_per_client : num_requests;
     const int barrier_participant_count =

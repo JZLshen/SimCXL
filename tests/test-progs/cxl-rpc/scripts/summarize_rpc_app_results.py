@@ -25,6 +25,7 @@ class ExperimentMeta:
     read_ratio: float
     update_ratio: float
     rmw_ratio: float
+    insert_ratio: float
     zipf_theta: float
     dataset_seed: int
     workload_seed: int
@@ -40,7 +41,9 @@ class ExperimentMeta:
 
 
 def default_key_dist(profile: str) -> str:
-    return "uniform" if profile == "udb_ro" else "zipf"
+    if profile in {"ycsb_d_1k", "udb_d"}:
+        return "latest"
+    return "zipf"
 
 
 def format_zipf_field(key_dist: str, zipf_theta: float) -> str:
@@ -59,7 +62,9 @@ def read_latest_ok_experiments(experiments_csv: Path) -> list[ExperimentMeta]:
                 row["profile"]
             )
             zipf_theta = (
-                0.0 if key_dist == "uniform" else float(row.get("zipf_theta", "0.99"))
+                0.0
+                if key_dist != "zipf"
+                else float(row.get("zipf_theta", "0.99"))
             )
             meta = ExperimentMeta(
                 exp_id=row["exp_id"],
@@ -75,6 +80,7 @@ def read_latest_ok_experiments(experiments_csv: Path) -> list[ExperimentMeta]:
                 read_ratio=float(row["read_ratio"]),
                 update_ratio=float(row["update_ratio"]),
                 rmw_ratio=float(row.get("rmw_ratio", "0.0")),
+                insert_ratio=float(row.get("insert_ratio", "0.0")),
                 zipf_theta=zipf_theta,
                 dataset_seed=int(row["dataset_seed"]),
                 workload_seed=int(row["workload_seed"]),
@@ -109,6 +115,7 @@ def base_row(meta: ExperimentMeta) -> dict[str, str]:
         "read_ratio": f"{meta.read_ratio:.6f}",
         "update_ratio": f"{meta.update_ratio:.6f}",
         "rmw_ratio": f"{meta.rmw_ratio:.6f}",
+        "insert_ratio": f"{meta.insert_ratio:.6f}",
         "zipf_theta": format_zipf_field(meta.key_dist, meta.zipf_theta),
         "dataset_seed": str(meta.dataset_seed),
         "workload_seed": str(meta.workload_seed),
@@ -123,7 +130,7 @@ def base_row(meta: ExperimentMeta) -> dict[str, str]:
     }
 
 
-def sort_key(meta: ExperimentMeta) -> tuple[str, str, int, int, int, int, int, int, int, str]:
+def sort_key(meta: ExperimentMeta) -> tuple[str, str, int, int, int, int, int, int, int, int, str]:
     return (
         meta.profile,
         meta.key_dist,
@@ -134,6 +141,7 @@ def sort_key(meta: ExperimentMeta) -> tuple[str, str, int, int, int, int, int, i
         meta.head_sync_threshold,
         meta.response_dma_threshold,
         int(meta.rmw_ratio * 1000000.0),
+        int(meta.insert_ratio * 1000000.0),
         meta.prefetch_mode,
     )
 
@@ -292,6 +300,7 @@ def main() -> int:
         "read_ratio",
         "update_ratio",
         "rmw_ratio",
+        "insert_ratio",
         "zipf_theta",
         "dataset_seed",
         "workload_seed",
